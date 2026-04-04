@@ -893,6 +893,45 @@ def supports_eagle3(
 
 
 @runtime_checkable
+class SupportsReFT(Protocol):
+    """The interface required for models that support ReFT adapter inference.
+
+    ReFT (Representation Fine-Tuning) adapters apply activation-space deltas
+    at specified decoder layers during prefill.  Models that implement this
+    protocol can receive ReFT adapter state from the trainer and apply it
+    during generation without class-level monkey patching.
+    """
+
+    supports_reft: ClassVar[Literal[True]] = True
+    """A flag indicating this model supports ReFT adapter inference."""
+
+    def load_reft_state(self, state: "dict[int, dict]") -> None:
+        """Load per-layer adapter state dicts into the vLLM model.
+
+        Args:
+            state: Mapping from layer index (int) to adapter ``state_dict``.
+                   Passed from ``LLM.sync_reft_state()``.
+        """
+        ...
+
+
+@overload
+def supports_reft(model: type[object]) -> TypeIs[type[SupportsReFT]]:
+    ...
+
+
+@overload
+def supports_reft(model: object) -> TypeIs[SupportsReFT]:
+    ...
+
+
+def supports_reft(
+    model: Union[type[object], object],
+) -> Union[TypeIs[type[SupportsReFT]], TypeIs[SupportsReFT]]:
+    return isinstance(model, SupportsReFT)
+
+
+@runtime_checkable
 class SupportsMRoPE(Protocol):
     """The interface required for all models that support M-RoPE."""
 

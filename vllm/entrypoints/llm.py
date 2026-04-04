@@ -476,6 +476,46 @@ class LLM:
             modality_lora_path,
         )
 
+    def sync_reft_state(self, state: "dict[int, dict]") -> None:
+        """Sync ReFT adapter weights to all vLLM workers.
+
+        Call this once after ``LLM(...)`` returns and after every optimizer
+        step in GRPO training to keep vLLM's adapter weights on-policy.
+
+        Args:
+            state: Per-layer adapter state dicts as returned by
+                   ``export_vllm_reft_state(hf_model)`` from
+                   ``adaptors/injection.py``.  Keys are integer layer
+                   indices; values are ``adapter.state_dict()`` mappings.
+
+        Example::
+
+            import vllm.reft as vllm_reft
+            from adaptors.injection import export_vllm_reft_state
+
+            vllm_reft.set_reft_spec(reft_spec)
+            llm = LLM(model=model_name, ...)
+            vllm_reft.clear_reft_spec()
+
+            llm.sync_reft_state(export_vllm_reft_state(hf_model))
+        """
+        self.collective_rpc("sync_reft_state", kwargs={"state": state})
+
+    def get_internal_model(self) -> Optional[nn.Module]:
+        """Return the PyTorch model object inside the (in-process) vLLM engine.
+
+        Works in single-process and in-process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
+        modes.  Returns ``None`` for out-of-process multi-GPU setups where the
+        model lives in a separate process.
+
+        Primarily useful for direct weight loading or debugging.  Prefer
+        ``sync_reft_state()`` for production weight sync.
+        """
+        results = self.apply_model(lambda m: m)
+        if results:
+            return results[0]
+        return None
+
     def collective_rpc(self,
                        method: Union[str, Callable[..., _R]],
                        timeout: Optional[float] = None,

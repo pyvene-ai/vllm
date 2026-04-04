@@ -68,6 +68,20 @@ class WorkerBase:
         """Apply a function on the model inside this worker."""
         return fn(self.get_model())
 
+    def sync_reft_state(self, state: dict) -> None:
+        """Load ReFT adapter state into the model managed by this worker.
+
+        Routed from ``LLM.sync_reft_state()`` → ``ExecutorBase`` →
+        ``collective_rpc("sync_reft_state", kwargs={"state": state})``.
+
+        Args:
+            state: Mapping from layer index (int) → adapter ``state_dict``
+                   as returned by ``export_vllm_reft_state(hf_model)``.
+        """
+        model = self.get_model()
+        if hasattr(model, "load_reft_state"):
+            model.load_reft_state(state)
+
     def load_model(self) -> None:
         """Load model onto target device."""
         raise NotImplementedError

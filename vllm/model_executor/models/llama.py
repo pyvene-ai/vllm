@@ -50,7 +50,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
+from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP, SupportsReFT
 from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
@@ -483,7 +483,8 @@ class LlamaModel(nn.Module):
         return loaded_params
 
 
-class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
+class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3,
+                       SupportsReFT):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"]
@@ -495,6 +496,8 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         "lm_head": "output_embeddings"
     }
     embedding_padding_modules = ["lm_head"]
+
+    supports_reft = True
 
     # Mistral/Llama models can also be loaded with --load-format mistral
     # from consolidated.safetensors checkpoints
@@ -533,6 +536,16 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         lora_config = vllm_config.lora_config
         self.config = config
         self.lora_config = lora_config
+
+        # If a ReFT spec was registered via vllm.reft.set_reft_spec(), use
+        # ReFT-aware decoder layers so CUDA graphs capture the adapter path.
+        # The caller-supplied layer_type takes precedence (e.g. Eagle3 draft).
+        if layer_type is LlamaDecoderLayer:
+            from vllm.reft import get_reft_spec
+            from vllm.reft.layer import make_reft_llama_layer
+            reft_spec = get_reft_spec()
+            if reft_spec is not None:
+                layer_type = make_reft_llama_layer(reft_spec)
 
         self.model = self._init_model(vllm_config=vllm_config,
                                       prefix=maybe_prefix(prefix, "model"),
@@ -575,6 +588,26 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         num_layers = len(self.model.layers)
         return (2, num_layers // 2, num_layers - 3)
+
+    # ------------------------------------------------------------------
+    # SupportsReFT implementation
+    # ------------------------------------------------------------------
+
+    def load_reft_state(self, state: "dict[int, dict]") -> None:
+        """Load per-layer ReFT adapter state dicts into decoder layers.
+
+        Called by ``LLM.sync_reft_state()`` after construction and after
+        each optimizer step to keep vLLM's adapter weights in sync with
+        the HF training model.
+
+        Args:
+            state: Mapping from layer index → adapter state_dict.
+        """
+        for layer_idx, adapter_state in state.items():
+            if layer_idx < len(self.model.layers):
+                layer = self.model.layers[layer_idx]
+                if hasattr(layer, "load_reft_state"):
+                    layer.load_reft_state(adapter_state)
 
     def _init_model(self,
                     vllm_config: VllmConfig,

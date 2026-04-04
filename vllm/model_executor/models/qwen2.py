@@ -52,7 +52,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import is_interleaved
 
-from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
+from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP, SupportsReFT
 from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
@@ -442,7 +442,8 @@ class Qwen2Model(nn.Module):
         return loaded_params
 
 
-class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
+class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3,
+                       SupportsReFT):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -455,6 +456,8 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         ],
     }
 
+    supports_reft = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -465,8 +468,18 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         self.lora_config = lora_config
 
         self.quant_config = quant_config
+
+        # If a ReFT spec was registered via vllm.reft.set_reft_spec(), use
+        # ReFT-aware decoder layers so CUDA graphs capture the adapter path.
+        from vllm.reft import get_reft_spec
+        from vllm.reft.layer import make_reft_qwen2_layer
+        reft_spec = get_reft_spec()
+        decoder_layer_type = (make_reft_qwen2_layer(reft_spec)
+                              if reft_spec is not None else Qwen2DecoderLayer)
+
         self.model = Qwen2Model(vllm_config=vllm_config,
-                                prefix=maybe_prefix(prefix, "model"))
+                                prefix=maybe_prefix(prefix, "model"),
+                                decoder_layer_type=decoder_layer_type)
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -494,6 +507,26 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         num_layers = len(self.model.layers)
         return (2, num_layers // 2, num_layers - 3)
+
+    # ------------------------------------------------------------------
+    # SupportsReFT implementation
+    # ------------------------------------------------------------------
+
+    def load_reft_state(self, state: "dict[int, dict]") -> None:
+        """Load per-layer ReFT adapter state dicts into decoder layers.
+
+        Called by ``LLM.sync_reft_state()`` after construction and after
+        each optimizer step to keep vLLM's adapter weights in sync with
+        the HF training model.
+
+        Args:
+            state: Mapping from layer index → adapter state_dict.
+        """
+        for layer_idx, adapter_state in state.items():
+            if layer_idx < len(self.model.layers):
+                layer = self.model.layers[layer_idx]
+                if hasattr(layer, "load_reft_state"):
+                    layer.load_reft_state(adapter_state)
 
     def forward(
         self,

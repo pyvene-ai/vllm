@@ -490,6 +490,15 @@ class Worker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(1, uniform_decode=True)
 
+    def sync_reft_state(self, state: dict) -> None:
+        """Load ReFT adapter state into the model.
+
+        Called via ``collective_rpc`` from ``LLM.sync_reft_state()``.
+        Delegates to the base-class implementation which calls
+        ``model.load_reft_state(state)`` if the model supports it.
+        """
+        super().sync_reft_state(state)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
 
