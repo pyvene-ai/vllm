@@ -280,7 +280,9 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
             hidden_states, residual = super().forward(
                 positions, hidden_states, residual)
 
-            adapter = object.__getattribute__(self, "_reft_adapter")
+            # Use normal attribute lookup here so TorchDynamo can trace the
+            # forward path; explicit object.__getattribute__ is unsupported.
+            adapter = self._reft_adapter
             if adapter is None:
                 return hidden_states, residual
 
@@ -290,7 +292,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
 
             ctx = get_forward_context()
             attn_metadata = getattr(ctx, "attn_metadata", None)
-            reft_position = object.__getattribute__(self, "_reft_position")
+            reft_position = self._reft_position
             delta = _apply_position_mask(
                 delta, positions, reft_position,
                 hidden_states.dtype, positions.shape[0], attn_metadata,
@@ -301,7 +303,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
 
         def load_reft_state(self, state_dict: dict) -> None:
             """Update adapter weights and refresh graph-safe caches."""
-            adapter = object.__getattribute__(self, "_reft_adapter")
+            adapter = self._reft_adapter
             if adapter is None:
                 return
             missing, unexpected = adapter.load_state_dict(
@@ -387,7 +389,9 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             hidden_states, residual = super().forward(
                 positions, hidden_states, residual)
 
-            adapter = object.__getattribute__(self, "_reft_adapter")
+            # Use normal attribute lookup here so TorchDynamo can trace the
+            # forward path; explicit object.__getattribute__ is unsupported.
+            adapter = self._reft_adapter
             if adapter is None:
                 return hidden_states, residual
 
@@ -397,7 +401,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
 
             ctx = get_forward_context()
             attn_metadata = getattr(ctx, "attn_metadata", None)
-            reft_position = object.__getattribute__(self, "_reft_position")
+            reft_position = self._reft_position
             delta = _apply_position_mask(
                 delta, positions, reft_position,
                 hidden_states.dtype, positions.shape[0], attn_metadata,
@@ -408,7 +412,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
 
         def load_reft_state(self, state_dict: dict) -> None:
             """Update adapter weights and refresh graph-safe caches."""
-            adapter = object.__getattribute__(self, "_reft_adapter")
+            adapter = self._reft_adapter
             if adapter is None:
                 return
             missing, unexpected = adapter.load_state_dict(
