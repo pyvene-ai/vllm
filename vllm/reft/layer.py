@@ -37,6 +37,7 @@ the correct device after .to() calls.
 import copy
 import logging
 import math
+import os
 import re
 import types
 from typing import Optional
@@ -45,6 +46,14 @@ import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+_REFT_MASK_DEBUG_ENABLED = os.environ.get("VLLM_REFT_DEBUG_MASK", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_REFT_MASK_DEBUG_LIMIT = int(os.environ.get("VLLM_REFT_DEBUG_LIMIT", "12"))
+_reft_mask_debug_counts: dict[tuple[str, int, str, str], int] = {}
 
 # ---------------------------------------------------------------------------
 # Graph-safe cache helpers (mirrors vllm_config/vllm_reft_layer.py)
@@ -134,21 +143,19 @@ def _extract_layer_idx(prefix: str) -> Optional[int]:
 # Position masking (CUDA-graph-safe)
 # ---------------------------------------------------------------------------
 
-def _apply_position_mask(
-    delta: torch.Tensor,
+def _compute_position_mask(
     positions: torch.Tensor,
     position: str,
     dtype: torch.dtype,
     num_tokens: int,
     attn_metadata,
-) -> torch.Tensor:
-    """Apply the ReFT position mask to *delta*.
+) -> Optional[torch.Tensor]:
+    """Return the per-token ReFT mask, or ``None`` for unconditional apply.
 
     All masking uses tensor ops only – no Python branching on live tensor
     values – so the full masking path is captured inside CUDA graphs.
 
     Args:
-        delta:        (num_tokens, hidden_size) – unmasked ReFT delta.
         positions:    (num_tokens,) – vLLM position indices.
         position:     "prefill" | "first" | "last".
         dtype:        Hidden-state dtype used for mask scalars.
@@ -160,14 +167,13 @@ def _apply_position_mask(
     if position == "prefill":
         if num_prefill_tokens is not None:
             token_idx = torch.arange(num_tokens, device=positions.device)
-            prefill_mask = (token_idx < num_prefill_tokens).to(dtype)
-            return delta * prefill_mask.unsqueeze(-1)
+            return (token_idx < num_prefill_tokens).to(dtype)
         else:
             # Fallback: all tokens at position 0 → we are in a prefill pass.
             gate = (positions[0:1] == 0).to(dtype)
-            return delta * gate.expand(num_tokens).unsqueeze(-1)
+            return gate.expand(num_tokens)
 
-    elif position == "first":
+    if position == "first":
         mask = (positions == 0).to(dtype)
         if num_prefill_tokens is not None:
             token_idx = torch.arange(num_tokens, device=positions.device)
@@ -176,9 +182,9 @@ def _apply_position_mask(
         else:
             in_prefill = (positions[0:1] == 0).to(dtype)
             mask = mask * in_prefill
-        return delta * mask.unsqueeze(-1)
+        return mask
 
-    elif position == "last":
+    if position == "last":
         if num_prefill_tokens is not None:
             token_idx = torch.arange(num_tokens, device=positions.device)
             prefill_mask = (token_idx < num_prefill_tokens).to(dtype)
@@ -189,7 +195,7 @@ def _apply_position_mask(
             is_last = prefill_mask * ((1.0 - next_prefill) + next_is_new_seq)
             is_last = torch.clamp(is_last, max=1.0)
             is_last[-1] = prefill_mask[-1]
-            return delta * is_last.unsqueeze(-1)
+            return is_last
         else:
             # Fallback tensor-only "last" mask.
             is_last = torch.zeros_like(positions, dtype=dtype)
@@ -197,10 +203,87 @@ def _apply_position_mask(
             next_is_zero = (torch.roll(positions, -1) == 0).to(dtype)
             is_last = is_last + next_is_zero * (1.0 - is_last)
             in_prefill = (positions[0:1] == 0).to(dtype)
-            return delta * (is_last * in_prefill).unsqueeze(-1)
+            return is_last * in_prefill
 
     # "all" or unknown position – apply unconditionally (guarded at call-site).
-    return delta
+    return None
+
+
+def _apply_position_mask(
+    delta: torch.Tensor,
+    positions: torch.Tensor,
+    position: str,
+    dtype: torch.dtype,
+    num_tokens: int,
+    attn_metadata,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Apply the ReFT position mask to *delta* and return ``(delta, mask)``."""
+    mask = _compute_position_mask(positions, position, dtype, num_tokens, attn_metadata)
+    if mask is None:
+        return delta, None
+    return delta * mask.unsqueeze(-1), mask
+
+
+def _maybe_log_mask_debug(
+    *,
+    arch: str,
+    layer_idx: int,
+    position: str,
+    positions: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    attn_metadata,
+) -> None:
+    """Log how many tokens receive a nonzero ReFT mask in eager mode."""
+    if not _REFT_MASK_DEBUG_ENABLED:
+        return
+    if hasattr(torch, "compiler") and torch.compiler.is_compiling():
+        return
+
+    num_tokens = int(positions.numel())
+    if num_tokens == 0:
+        return
+
+    num_prefill_tokens = getattr(attn_metadata, "num_prefill_tokens", None)
+    if num_prefill_tokens is None:
+        first_is_prefill = bool((positions[:1] == 0).all().item())
+        prefill_tokens = num_tokens if first_is_prefill else 0
+    else:
+        prefill_tokens = int(num_prefill_tokens)
+    decode_tokens = max(0, num_tokens - prefill_tokens)
+
+    if mask is None:
+        masked_tokens = num_tokens
+    else:
+        masked_tokens = int((mask.detach().float() > 0).sum().item())
+
+    if prefill_tokens > 0 and decode_tokens > 0:
+        phase = "mixed"
+    elif prefill_tokens > 0:
+        phase = "prefill"
+    else:
+        phase = "decode"
+
+    key = (arch, layer_idx, position, phase)
+    count = _reft_mask_debug_counts.get(key, 0)
+    if count >= _REFT_MASK_DEBUG_LIMIT:
+        return
+    _reft_mask_debug_counts[key] = count + 1
+
+    positions_head = positions[: min(8, num_tokens)].detach().cpu().tolist()
+    logger.info(
+        "[ReFT-vLLM mask debug] arch=%s layer=%d position=%s phase=%s "
+        "masked_tokens=%d total_tokens=%d prefill_tokens=%d decode_tokens=%d "
+        "positions_head=%s",
+        arch,
+        layer_idx,
+        position,
+        phase,
+        masked_tokens,
+        num_tokens,
+        prefill_tokens,
+        decode_tokens,
+        positions_head,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +350,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 )
             else:
                 object.__setattr__(self, "_reft_adapter", None)
+                object.__setattr__(self, "_reft_layer_idx", -1)
 
             # Store position string as a normal attribute (not a parameter).
             object.__setattr__(self, "_reft_position", position)
@@ -293,9 +377,17 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
             ctx = get_forward_context()
             attn_metadata = getattr(ctx, "attn_metadata", None)
             reft_position = self._reft_position
-            delta = _apply_position_mask(
+            delta, mask = _apply_position_mask(
                 delta, positions, reft_position,
                 hidden_states.dtype, positions.shape[0], attn_metadata,
+            )
+            _maybe_log_mask_debug(
+                arch="qwen2",
+                layer_idx=self._reft_layer_idx,
+                position=reft_position,
+                positions=positions,
+                mask=mask,
+                attn_metadata=attn_metadata,
             )
 
             hidden_states = hidden_states + delta
@@ -377,6 +469,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 )
             else:
                 object.__setattr__(self, "_reft_adapter", None)
+                object.__setattr__(self, "_reft_layer_idx", -1)
 
             object.__setattr__(self, "_reft_position", position)
 
@@ -402,9 +495,17 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             ctx = get_forward_context()
             attn_metadata = getattr(ctx, "attn_metadata", None)
             reft_position = self._reft_position
-            delta = _apply_position_mask(
+            delta, mask = _apply_position_mask(
                 delta, positions, reft_position,
                 hidden_states.dtype, positions.shape[0], attn_metadata,
+            )
+            _maybe_log_mask_debug(
+                arch="llama",
+                layer_idx=self._reft_layer_idx,
+                position=reft_position,
+                positions=positions,
+                mask=mask,
+                attn_metadata=attn_metadata,
             )
 
             hidden_states = hidden_states + delta
