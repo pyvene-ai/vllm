@@ -161,13 +161,12 @@ def _compute_position_mask(
     num_prefill_tokens = getattr(attn_metadata, "num_prefill_tokens", None)
 
     if position == "prefill":
-        if num_prefill_tokens is not None:
-            token_idx = torch.arange(num_tokens, device=positions.device)
-            return (token_idx < num_prefill_tokens).to(dtype)
-        else:
-            # Fallback: all tokens at position 0 → we are in a prefill pass.
-            gate = (positions[0:1] == 0).to(dtype)
-            return gate.expand(num_tokens)
+        # In HF generate(), the adapter applies to EVERY token – both
+        # prefill and decode – because each decode step processes a single
+        # token whose position is always within the intervention boundary.
+        # The model is trained with this behaviour, so vLLM must match it:
+        # apply the adapter unconditionally (return None → no mask).
+        return None
 
     if position == "first":
         mask = (positions == 0).to(dtype)
