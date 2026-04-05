@@ -68,16 +68,21 @@ class WorkerBase:
         """Apply a function on the model inside this worker."""
         return fn(self.get_model())
 
-    def sync_reft_state(self, state: dict) -> None:
+    def sync_reft_state(self, state_file: str) -> None:
         """Load ReFT adapter state into the model managed by this worker.
 
         Routed from ``LLM.sync_reft_state()`` → ``ExecutorBase`` →
-        ``collective_rpc("sync_reft_state", kwargs={"state": state})``.
+        ``collective_rpc("sync_reft_state", kwargs={"state_file": path})``.
 
         Args:
-            state: Mapping from layer index (int) → adapter ``state_dict``
-                   as returned by ``export_vllm_reft_state(hf_model)``.
+            state_file: Path to a ``torch.save``-d file containing a mapping
+                        from layer index (int) → adapter ``state_dict``.
+                        The caller is responsible for deleting the file after
+                        all workers have loaded it.
         """
+        import torch
+
+        state = torch.load(state_file, map_location="cpu", weights_only=False)
         model = self.get_model()
         if hasattr(model, "load_reft_state"):
             model.load_reft_state(state)

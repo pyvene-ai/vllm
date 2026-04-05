@@ -498,8 +498,32 @@ class LLM:
             vllm_reft.clear_reft_spec()
 
             llm.sync_reft_state(export_vllm_reft_state(hf_model))
+
+        Implementation note:
+            vLLM's IPC layer (MsgpackEncoder/Decoder) only reconstructs
+            ``torch.Tensor`` objects when a typed schema is present.  The
+            untyped ``generic_decoder`` used for utility calls decodes
+            tensor-encoded tuples back to plain Python lists, so tensors
+            passed directly as kwargs would arrive as lists on the worker.
+            We avoid this by serialising the state dict to a temp file with
+            ``torch.save`` and passing only the file-path string (natively
+            serialisable) through IPC.  The worker loads and deletes the file.
         """
-        self.collective_rpc("sync_reft_state", kwargs={"state": state})
+        import os
+        import tempfile
+        import torch
+
+        fd, path = tempfile.mkstemp(suffix=".pt", prefix="vllm_reft_state_")
+        os.close(fd)
+        try:
+            torch.save(state, path)
+            self.collective_rpc("sync_reft_state",
+                                kwargs={"state_file": path})
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def get_internal_model(self) -> Optional[nn.Module]:
         """Return the PyTorch model object inside the (in-process) vLLM engine.
