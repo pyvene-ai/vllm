@@ -504,9 +504,11 @@ class VllmBackend:
             hash_content = []
             for filepath in forward_code_files:
                 hash_content.append(filepath)
-                if filepath == "<string>":
-                    # This means the function was dynamically generated, with
-                    # e.g. exec(). We can't actually check these.
+                if filepath.startswith("<"):
+                    # Synthetic paths like "<string>" (exec'd code) or
+                    # "<frozen os>" / "<frozen importlib._bootstrap>" (Python
+                    # 3.12+ freezes several stdlib modules into the
+                    # interpreter; they have no on-disk source file).
                     continue
                 with open(filepath) as f:
                     hash_content.append(f.read())
