@@ -331,17 +331,24 @@ def _capture_last_token(
         return
 
     # Find the last token that was actually masked (received nonzero delta)
+    # without converting a tensor value into a Python scalar. Using a tensor
+    # index keeps the helper traceable under TorchDynamo/fullgraph capture.
     if mask is not None:
-        # mask shape: (num_tokens,)
-        # Find last nonzero position
-        nonzero_mask = (mask > 0).to(torch.int64)
-        # Use argmax on reversed tensor to find last nonzero
-        last_idx = h_full.shape[0] - 1 - nonzero_mask.flip(0).argmax()
+        token_idx = torch.arange(
+            h_full.shape[0], device=h_full.device, dtype=torch.int64
+        )
+        nonzero_mask = mask.to(device=h_full.device) > 0
+        masked_idx = torch.where(nonzero_mask, token_idx, torch.zeros_like(token_idx))
+        has_masked = nonzero_mask.any()
+        last_idx = torch.where(has_masked, masked_idx.max(), token_idx[-1])
     else:
-        last_idx = h_full.shape[0] - 1
+        last_idx = torch.full(
+            (), h_full.shape[0] - 1, device=h_full.device, dtype=torch.int64
+        )
 
-    h_last = h_full[last_idx].to(torch.float32)
-    d_last = delta[last_idx].to(torch.float32)
+    gather_idx = last_idx.reshape(1)
+    h_last = h_full.index_select(0, gather_idx).squeeze(0).to(torch.float32)
+    d_last = delta.index_select(0, gather_idx).squeeze(0).to(torch.float32)
 
     module._reft_cap_h.copy_(h_last)
     module._reft_cap_delta.copy_(d_last)
