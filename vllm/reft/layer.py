@@ -378,15 +378,17 @@ def _record_mask_debug_stats(
 
 
 def _collect_layer_reft_debug_stats(layer: nn.Module) -> Optional[dict]:
-    """Return serializable mask stats for one layer, if any were recorded."""
+    """Return serializable ReFT debug stats for one layer."""
     total_tokens = getattr(layer, "_reft_debug_total_tokens", None)
     if total_tokens is None:
         return None
     total = int(total_tokens.detach().cpu().item())
-    if total == 0:
-        return None
 
     return {
+        "layer_idx": int(getattr(layer, "_reft_layer_idx", -1)),
+        "has_adapter": getattr(layer, "_reft_adapter", None) is not None,
+        "debug_enabled": bool(getattr(layer, "_reft_debug_enabled", False)),
+        "has_debug_buffers": True,
         "position": getattr(layer, "_reft_position", None),
         "masked_tokens": int(layer._reft_debug_masked_tokens.detach().cpu().item()),
         "total_tokens": total,
