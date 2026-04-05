@@ -82,6 +82,13 @@ class WorkerBase:
         if hasattr(model, "load_reft_state"):
             model.load_reft_state(state)
 
+    def get_reft_debug_stats(self) -> dict:
+        """Return serializable ReFT debug stats gathered inside the model."""
+        model = self.get_model()
+        if hasattr(model, "get_reft_debug_stats"):
+            return model.get_reft_debug_stats()
+        return {}
+
     def load_model(self) -> None:
         """Load model onto target device."""
         raise NotImplementedError

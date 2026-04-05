@@ -516,6 +516,19 @@ class LLM:
             return results[0]
         return None
 
+    def get_reft_debug_stats(self) -> dict[str, Any]:
+        """Return serializable ReFT debug stats from all workers.
+
+        Unlike ``get_internal_model()``, this avoids serializing Python callables
+        and is safe to use in multiprocessing modes.
+        """
+        results = self.collective_rpc("get_reft_debug_stats")
+        if not results:
+            return {}
+        if len(results) == 1:
+            return results[0]
+        return {str(worker_idx): stats for worker_idx, stats in enumerate(results)}
+
     def collective_rpc(self,
                        method: Union[str, Callable[..., _R]],
                        timeout: Optional[float] = None,

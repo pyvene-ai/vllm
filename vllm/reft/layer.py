@@ -286,6 +286,93 @@ def _maybe_log_mask_debug(
     )
 
 
+def _init_reft_debug_buffers(module: nn.Module, device: torch.device) -> None:
+    """Initialize non-persistent buffers used for compiled-path mask stats."""
+    if hasattr(module, "_reft_debug_total_tokens"):
+        return
+
+    def _zero() -> torch.Tensor:
+        return torch.zeros((), dtype=torch.int64, device=device)
+
+    module.register_buffer("_reft_debug_total_tokens", _zero(), persistent=False)
+    module.register_buffer("_reft_debug_masked_tokens", _zero(), persistent=False)
+    module.register_buffer("_reft_debug_prefill_tokens", _zero(), persistent=False)
+    module.register_buffer("_reft_debug_decode_tokens", _zero(), persistent=False)
+    module.register_buffer("_reft_debug_prefill_calls", _zero(), persistent=False)
+    module.register_buffer("_reft_debug_decode_calls", _zero(), persistent=False)
+    module.register_buffer("_reft_debug_mixed_calls", _zero(), persistent=False)
+
+
+def _record_mask_debug_stats(
+    module: nn.Module,
+    *,
+    mask: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    attn_metadata,
+) -> None:
+    """Accumulate compiled-path-safe ReFT mask stats into layer buffers."""
+    if not _REFT_MASK_DEBUG_ENABLED or not hasattr(module, "_reft_debug_total_tokens"):
+        return
+
+    num_tokens_int = positions.shape[0]
+    if num_tokens_int == 0:
+        return
+    stats_device = module._reft_debug_total_tokens.device
+    num_tokens = torch.tensor(num_tokens_int, dtype=torch.int64, device=stats_device)
+
+    if mask is None:
+        masked_tokens = num_tokens
+    else:
+        masked_tokens = (mask.to(device=stats_device) > 0).to(torch.int64).sum()
+
+    num_prefill_tokens = getattr(attn_metadata, "num_prefill_tokens", None)
+    if num_prefill_tokens is not None:
+        prefill_tokens = torch.tensor(int(num_prefill_tokens), dtype=torch.int64, device=stats_device)
+        prefill_tokens = torch.minimum(prefill_tokens, num_tokens)
+    else:
+        first_is_prefill = (positions[:1].to(device=stats_device) == 0).all()
+        prefill_tokens = torch.where(first_is_prefill, num_tokens, torch.zeros_like(num_tokens))
+
+    decode_tokens = num_tokens - prefill_tokens
+    one = torch.ones((), dtype=torch.int64, device=stats_device)
+    zero = torch.zeros((), dtype=torch.int64, device=stats_device)
+
+    module._reft_debug_total_tokens.add_(num_tokens)
+    module._reft_debug_masked_tokens.add_(masked_tokens)
+    module._reft_debug_prefill_tokens.add_(prefill_tokens)
+    module._reft_debug_decode_tokens.add_(decode_tokens)
+    module._reft_debug_prefill_calls.add_(
+        torch.where((prefill_tokens > 0) & (decode_tokens == 0), one, zero)
+    )
+    module._reft_debug_decode_calls.add_(
+        torch.where((prefill_tokens == 0) & (decode_tokens > 0), one, zero)
+    )
+    module._reft_debug_mixed_calls.add_(
+        torch.where((prefill_tokens > 0) & (decode_tokens > 0), one, zero)
+    )
+
+
+def _collect_layer_reft_debug_stats(layer: nn.Module) -> Optional[dict]:
+    """Return serializable mask stats for one layer, if any were recorded."""
+    total_tokens = getattr(layer, "_reft_debug_total_tokens", None)
+    if total_tokens is None:
+        return None
+    total = int(total_tokens.detach().cpu().item())
+    if total == 0:
+        return None
+
+    return {
+        "position": getattr(layer, "_reft_position", None),
+        "masked_tokens": int(layer._reft_debug_masked_tokens.detach().cpu().item()),
+        "total_tokens": total,
+        "prefill_tokens": int(layer._reft_debug_prefill_tokens.detach().cpu().item()),
+        "decode_tokens": int(layer._reft_debug_decode_tokens.detach().cpu().item()),
+        "prefill_calls": int(layer._reft_debug_prefill_calls.detach().cpu().item()),
+        "decode_calls": int(layer._reft_debug_decode_calls.detach().cpu().item()),
+        "mixed_calls": int(layer._reft_debug_mixed_calls.detach().cpu().item()),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Qwen2 ReFT-aware decoder layer factory
 # ---------------------------------------------------------------------------
@@ -336,6 +423,8 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 if (hasattr(adapter_copy, "w2")
                         and not hasattr(adapter_copy, "_w2_pinv_cache")):
                     _install_pinv_cache(adapter_copy)
+                if _REFT_MASK_DEBUG_ENABLED:
+                    _init_reft_debug_buffers(self, dev)
 
                 # Hidden from nn.Module: vLLM's weight loader would raise for
                 # adapter params that don't exist in the checkpoint.
@@ -389,6 +478,12 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 mask=mask,
                 attn_metadata=attn_metadata,
             )
+            _record_mask_debug_stats(
+                self,
+                mask=mask,
+                positions=positions,
+                attn_metadata=attn_metadata,
+            )
 
             hidden_states = hidden_states + delta
             return hidden_states, residual
@@ -412,6 +507,9 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                     "[ReFT-vLLM] Unexpected state keys in ReFT adapter sync: %s",
                     unexpected)
             _refresh_adapter_caches(adapter)
+
+        def get_reft_debug_stats(self) -> Optional[dict]:
+            return _collect_layer_reft_debug_stats(self)
 
     ReFTQwen2DecoderLayer.__name__ = "ReFTQwen2DecoderLayer"
     ReFTQwen2DecoderLayer.__qualname__ = "ReFTQwen2DecoderLayer"
@@ -457,6 +555,8 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 if (hasattr(adapter_copy, "w2")
                         and not hasattr(adapter_copy, "_w2_pinv_cache")):
                     _install_pinv_cache(adapter_copy)
+                if _REFT_MASK_DEBUG_ENABLED:
+                    _init_reft_debug_buffers(self, dev)
 
                 object.__setattr__(self, "_reft_adapter", adapter_copy)
                 object.__setattr__(self, "_reft_layer_idx", layer_idx)
@@ -507,6 +607,12 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 mask=mask,
                 attn_metadata=attn_metadata,
             )
+            _record_mask_debug_stats(
+                self,
+                mask=mask,
+                positions=positions,
+                attn_metadata=attn_metadata,
+            )
 
             hidden_states = hidden_states + delta
             return hidden_states, residual
@@ -530,6 +636,9 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                     "[ReFT-vLLM] Unexpected state keys in ReFT adapter sync: %s",
                     unexpected)
             _refresh_adapter_caches(adapter)
+
+        def get_reft_debug_stats(self) -> Optional[dict]:
+            return _collect_layer_reft_debug_stats(self)
 
     ReFTLlamaDecoderLayer.__name__ = "ReFTLlamaDecoderLayer"
     ReFTLlamaDecoderLayer.__qualname__ = "ReFTLlamaDecoderLayer"

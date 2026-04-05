@@ -609,6 +609,16 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3,
                 if hasattr(layer, "load_reft_state"):
                     layer.load_reft_state(adapter_state)
 
+    def get_reft_debug_stats(self) -> dict[int, dict]:
+        """Return serializable per-layer ReFT debug stats, if enabled."""
+        stats = {}
+        for layer_idx, layer in enumerate(self.model.layers):
+            if hasattr(layer, "get_reft_debug_stats"):
+                layer_stats = layer.get_reft_debug_stats()
+                if layer_stats is not None:
+                    stats[layer_idx] = layer_stats
+        return stats
+
     def _init_model(self,
                     vllm_config: VllmConfig,
                     prefix: str = "",
