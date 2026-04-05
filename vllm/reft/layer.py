@@ -47,6 +47,7 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 _reft_mask_debug_counts: dict[tuple[str, int, str, str], int] = {}
+_reft_init_debug_count = 0
 
 
 def _reft_mask_debug_enabled() -> bool:
@@ -60,6 +61,39 @@ def _reft_mask_debug_enabled() -> bool:
 
 def _reft_mask_debug_limit() -> int:
     return int(os.environ.get("VLLM_REFT_DEBUG_LIMIT", "12"))
+
+
+def _maybe_log_reft_layer_init(
+    *,
+    arch: str,
+    layer_idx: int,
+    attached: bool,
+    debug_enabled: bool,
+    position: str,
+    adapter: Optional[nn.Module],
+) -> None:
+    """Emit a small construction-time log for ReFT-aware decoder layers."""
+    global _reft_init_debug_count
+
+    if not (debug_enabled or _reft_mask_debug_enabled()):
+        return
+
+    limit = int(os.environ.get("VLLM_REFT_DEBUG_INIT_LIMIT", "64"))
+    if _reft_init_debug_count >= limit:
+        return
+    _reft_init_debug_count += 1
+
+    adapter_type = type(adapter).__name__ if adapter is not None else None
+    logger.info(
+        "[ReFT-vLLM init debug] arch=%s layer=%d attached=%s debug_enabled=%s "
+        "position=%s adapter_type=%s",
+        arch,
+        layer_idx,
+        attached,
+        debug_enabled,
+        position,
+        adapter_type,
+    )
 
 # ---------------------------------------------------------------------------
 # Graph-safe cache helpers (mirrors vllm_config/vllm_reft_layer.py)
@@ -476,6 +510,14 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
 
             # Store position string as a normal attribute (not a parameter).
             object.__setattr__(self, "_reft_position", position)
+            _maybe_log_reft_layer_init(
+                arch="qwen2",
+                layer_idx=getattr(self, "_reft_layer_idx", -1),
+                attached=self._reft_adapter is not None,
+                debug_enabled=bool(getattr(self, "_reft_debug_enabled", False)),
+                position=position,
+                adapter=self._reft_adapter,
+            )
 
         def forward(
             self,
@@ -609,6 +651,14 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 object.__setattr__(self, "_reft_debug_enabled", False)
 
             object.__setattr__(self, "_reft_position", position)
+            _maybe_log_reft_layer_init(
+                arch="llama",
+                layer_idx=getattr(self, "_reft_layer_idx", -1),
+                attached=self._reft_adapter is not None,
+                debug_enabled=bool(getattr(self, "_reft_debug_enabled", False)),
+                position=position,
+                adapter=self._reft_adapter,
+            )
 
         def forward(
             self,

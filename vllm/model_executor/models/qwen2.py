@@ -531,7 +531,16 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3,
     def get_reft_debug_stats(self) -> dict[int, dict]:
         """Return serializable per-layer ReFT debug stats, if enabled."""
         stats = {}
-        for layer_idx, layer in enumerate(self.model.layers):
+        layers = list(self.model.layers)
+        stats["__summary__"] = {
+            "model_type": type(self).__name__,
+            "num_layers": len(layers),
+            "reft_debug_layers": sum(hasattr(layer, "get_reft_debug_stats") for layer in layers),
+            "loadable_layers": sum(hasattr(layer, "load_reft_state") for layer in layers),
+            "adapter_attr_layers": sum(hasattr(layer, "_reft_adapter") for layer in layers),
+            "debug_enabled_layers": sum(bool(getattr(layer, "_reft_debug_enabled", False)) for layer in layers),
+        }
+        for layer_idx, layer in enumerate(layers):
             if hasattr(layer, "get_reft_debug_stats"):
                 layer_stats = layer.get_reft_debug_stats()
                 if layer_stats is not None:
