@@ -181,12 +181,20 @@ def _adapter_to_blueprint(adapter) -> dict:
         if ls is not None and hasattr(ls, "weight"):
             kwargs["dtype"] = str(ls.weight.dtype)
 
-    return {
+    blueprint = {
         "__type__": "AdapterBlueprint",
         "__module__": cls.__module__,
         "__qualname__": cls.__qualname__,
         "kwargs": kwargs,
     }
+    import sys
+    print(
+        f"[vllm.reft] _adapter_to_blueprint: "
+        f"{cls.__qualname__} from {cls.__module__} | "
+        f"kwargs={{{', '.join(f'{k}={v!r}' for k, v in sorted(kwargs.items()))}}}",
+        file=sys.stderr, flush=True,
+    )
+    return blueprint
 
 
 def _mixer_instance_to_name(mixer_instance) -> Optional[str]:
@@ -210,10 +218,20 @@ def _blueprint_to_adapter(blueprint: dict):
     string back to a ``torch.dtype``, then calls the constructor.
     """
     import importlib
+    import sys
     import torch
 
-    mod = importlib.import_module(blueprint["__module__"])
-    cls = getattr(mod, blueprint["__qualname__"])
+    mod_name = blueprint["__module__"]
+    qual_name = blueprint["__qualname__"]
+    print(
+        f"[vllm.reft] _blueprint_to_adapter: "
+        f"module={mod_name} qualname={qual_name} "
+        f"kwargs_keys={sorted(blueprint['kwargs'].keys())}",
+        file=sys.stderr, flush=True,
+    )
+
+    mod = importlib.import_module(mod_name)
+    cls = getattr(mod, qual_name)
 
     kwargs = dict(blueprint["kwargs"])
     dtype_val = kwargs.get("dtype")
@@ -270,6 +288,7 @@ def _read_spec_file() -> Optional[dict]:
     # Reconstruct adapter from blueprint if this is a new-style spec file.
     adapter = spec.get("sample_adapter")
     if isinstance(adapter, dict) and adapter.get("__type__") == "AdapterBlueprint":
+        import sys
         try:
             spec["sample_adapter"] = _blueprint_to_adapter(adapter)
         except Exception as e:
@@ -278,7 +297,24 @@ def _read_spec_file() -> Optional[dict]:
                 "[vllm.reft] Failed to reconstruct adapter from blueprint: %s. "
                 "Blueprint: %s", e, adapter,
             )
+            # Also print to stderr — logger may not be configured in worker
+            print(
+                f"[vllm.reft] CRITICAL: Blueprint adapter reconstruction FAILED: "
+                f"{type(e).__name__}: {e}\n"
+                f"  module={adapter.get('__module__')}\n"
+                f"  qualname={adapter.get('__qualname__')}\n"
+                f"  kwargs_keys={sorted(adapter.get('kwargs', {}).keys())}",
+                file=sys.stderr, flush=True,
+            )
             return None
+        else:
+            rebuilt = spec["sample_adapter"]
+            print(
+                f"[vllm.reft] Blueprint reconstructed OK: "
+                f"{type(rebuilt).__name__} | "
+                f"state_keys={sorted(rebuilt.state_dict().keys())}",
+                file=sys.stderr, flush=True,
+            )
 
     return spec
 

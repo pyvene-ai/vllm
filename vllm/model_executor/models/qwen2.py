@@ -522,11 +522,29 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3,
         Args:
             state: Mapping from layer index → adapter state_dict.
         """
+        import sys
+        loaded = []
+        skipped = []
+        no_method = []
         for layer_idx, adapter_state in state.items():
             if layer_idx < len(self.model.layers):
                 layer = self.model.layers[layer_idx]
                 if hasattr(layer, "load_reft_state"):
+                    adapter = getattr(layer, "_reft_adapter", None)
                     layer.load_reft_state(adapter_state)
+                    loaded.append(layer_idx)
+                else:
+                    no_method.append(layer_idx)
+            else:
+                skipped.append(layer_idx)
+        print(
+            f"[ReFT sync] Qwen2 load_reft_state: "
+            f"loaded={sorted(loaded)} "
+            f"no_method={sorted(no_method)} "
+            f"skipped={sorted(skipped)} "
+            f"total_layers={len(self.model.layers)}",
+            file=sys.stderr, flush=True,
+        )
 
     def get_reft_debug_stats(self) -> dict[int, dict]:
         """Return serializable per-layer ReFT debug stats, if enabled."""

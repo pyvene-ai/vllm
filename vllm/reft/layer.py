@@ -96,6 +96,53 @@ def _maybe_log_reft_layer_init(
     )
 
 # ---------------------------------------------------------------------------
+# Weight verification helper (prints to stderr for worker visibility)
+# ---------------------------------------------------------------------------
+
+def _log_weight_verification(
+    arch: str,
+    layer_idx: int,
+    adapter: nn.Module,
+    input_state_dict: dict,
+) -> None:
+    """Compare adapter weights with the input state dict after load.
+
+    Prints to stderr so the output is visible even in V1 worker processes
+    where Python logging may not be configured.
+    """
+    import sys
+    adapter_sd = adapter.state_dict()
+    # Only compare keys that exist in both
+    common_keys = set(adapter_sd.keys()) & set(input_state_dict.keys())
+    only_adapter = set(adapter_sd.keys()) - set(input_state_dict.keys())
+    only_input = set(input_state_dict.keys()) - set(adapter_sd.keys())
+    diffs = []
+    for key in sorted(common_keys):
+        a = adapter_sd[key].detach().float().cpu()
+        b = input_state_dict[key].detach().float().cpu()
+        if a.shape != b.shape:
+            diffs.append(f"  {key}: SHAPE MISMATCH adapter={a.shape} input={b.shape}")
+        else:
+            max_diff = (a - b).abs().max().item()
+            if max_diff > 1e-6:
+                diffs.append(f"  {key}: MAX_DIFF={max_diff:.6e} (NOT LOADED?)")
+
+    status = "OK" if not diffs else "MISMATCH"
+    msg = (
+        f"[ReFT weight verify] {arch} L{layer_idx} "
+        f"adapter_type={type(adapter).__name__} "
+        f"status={status} "
+        f"common={len(common_keys)} "
+        f"only_adapter={sorted(only_adapter)} "
+        f"only_input={sorted(only_input)}"
+    )
+    print(msg, file=sys.stderr, flush=True)
+    if diffs:
+        for d in diffs:
+            print(f"  {d}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Graph-safe cache helpers (mirrors vllm_config/vllm_reft_layer.py)
 # ---------------------------------------------------------------------------
 
@@ -636,7 +683,9 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 return
             missing, unexpected = adapter.load_state_dict(
                 state_dict, strict=False)
-            allowed_missing = {"_R_cache", "_w2_pinv_cache"}
+            allowed_missing = {
+                "_R_cache", "_w2_pinv_cache", "_w2_ridge_cache",
+            }
             unexpected_missing = [k for k in missing
                                    if k not in allowed_missing]
             if unexpected_missing:
@@ -648,6 +697,10 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                     "[ReFT-vLLM] Unexpected state keys in ReFT adapter sync: %s",
                     unexpected)
             _refresh_adapter_caches(adapter)
+            _log_weight_verification(
+                "qwen2", self._reft_layer_idx,
+                adapter, state_dict,
+            )
 
         def get_reft_debug_stats(self) -> Optional[dict]:
             return _collect_layer_reft_debug_stats(self)
@@ -780,7 +833,9 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 return
             missing, unexpected = adapter.load_state_dict(
                 state_dict, strict=False)
-            allowed_missing = {"_R_cache", "_w2_pinv_cache"}
+            allowed_missing = {
+                "_R_cache", "_w2_pinv_cache", "_w2_ridge_cache",
+            }
             unexpected_missing = [k for k in missing
                                    if k not in allowed_missing]
             if unexpected_missing:
@@ -792,6 +847,10 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                     "[ReFT-vLLM] Unexpected state keys in ReFT adapter sync: %s",
                     unexpected)
             _refresh_adapter_caches(adapter)
+            _log_weight_verification(
+                "llama", self._reft_layer_idx,
+                adapter, state_dict,
+            )
 
         def get_reft_debug_stats(self) -> Optional[dict]:
             return _collect_layer_reft_debug_stats(self)
