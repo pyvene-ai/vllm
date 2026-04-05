@@ -99,72 +99,28 @@ def _maybe_log_reft_layer_init(
 # Graph-safe cache helpers (mirrors vllm_config/vllm_reft_layer.py)
 # ---------------------------------------------------------------------------
 
-def _install_R_cache(adapter: nn.Module) -> None:
-    """Cache the Householder rotation matrix and patch _compute_delta.
+def _install_adapter_caches(adapter: nn.Module) -> None:
+    """Install inference caches on an adapter via the standard protocol.
 
-    Avoids recomputing the full Householder product on every forward pass.
-    Cache is stored in the same dtype as learned_source.weight (usually bf16)
-    so that learned_source(h) - h @ R_cache == 0 exactly at initialisation,
-    preventing vLLM log-probs from drifting away from the HF model at step 0.
+    Calls ``adapter.install_inference_caches()`` if the method exists.
+    Each adapter class is responsible for defining what needs to be cached
+    (e.g. ``_R_cache`` for the rotation matrix, ``_w2_pinv_cache`` for
+    pseudo-inverses, ``_w2_ridge_cache`` for regularised solves, etc.).
+    vLLM never needs to know about specific adapter formulas.
     """
-    R_f32 = adapter.rotate_layer.weight.detach().float()
-    w_dtype = adapter.learned_source.weight.dtype
-    adapter.register_buffer("_R_cache", R_f32.to(w_dtype))
-
-    def _cached_compute_delta(self, hidden_states):
-        source = self.learned_source(hidden_states) - hidden_states @ self._R_cache
-        mixer = getattr(self, "mixer", None)
-        if mixer is not None and not getattr(mixer, "needs_kv", False):
-            mix_out, _ = mixer(source, None)
-            source = source + mix_out
-        delta = source @ self._R_cache.T
-        if getattr(self, "scaled", True):
-            delta = delta / math.sqrt(self.low_rank_dim)
-        return delta
-
-    adapter._compute_delta = types.MethodType(_cached_compute_delta, adapter)
-
-
-def _install_pinv_cache(adapter: nn.Module) -> None:
-    """Cache pinv(w2) and patch _compute_delta to avoid SVD inside graph.
-
-    torch.linalg.pinv uses cuSolver which allocates memory dynamically and
-    is not CUDA-graph-safe.  This replaces the runtime call with a buffer
-    lookup and a refresh call after each optimizer step.
-    """
-    w2 = adapter.w2.detach().float()
-    adapter.register_buffer("_w2_pinv_cache", torch.linalg.pinv(w2))
-
-    def _cached_compute_delta(self, hidden_states):
-        h = hidden_states.float()
-        if hasattr(self, "_R_cache"):
-            source = self.learned_source(h) - h @ self._R_cache
-        else:
-            source = self._compute_raw_source(h)
-        delta = source @ self._w2_pinv_cache
-        if getattr(self, "scaled", True):
-            delta = delta / math.sqrt(self.low_rank_dim)
-        return delta.to(hidden_states.dtype)
-
-    adapter._compute_delta = types.MethodType(_cached_compute_delta, adapter)
+    if hasattr(adapter, "install_inference_caches"):
+        adapter.install_inference_caches()
 
 
 def _refresh_adapter_caches(adapter: nn.Module) -> None:
-    """Refresh _R_cache and _w2_pinv_cache after loading new adapter weights.
+    """Refresh inference caches after loading new adapter weights.
 
-    Called by the ReFT decoder layer's load_reft_state() method after each
-    optimizer step to keep the cached tensors in sync with the trained weights.
+    Calls ``adapter.refresh_inference_caches()`` if the method exists.
+    Called by the ReFT decoder layer's ``load_reft_state()`` after each
+    weight sync so cached tensors stay in sync with the trained weights.
     """
-    if hasattr(adapter, "_R_cache") and hasattr(adapter, "rotate_layer"):
-        R = adapter.rotate_layer.weight.detach().float()
-        cache_dtype = adapter._R_cache.dtype
-        adapter._R_cache.data.copy_(R.to(adapter._R_cache.device).to(cache_dtype))
-
-    if hasattr(adapter, "_w2_pinv_cache"):
-        w2 = adapter.w2.detach().float()
-        adapter._w2_pinv_cache.data.copy_(
-            torch.linalg.pinv(w2).to(adapter._w2_pinv_cache.device)
-        )
+    if hasattr(adapter, "refresh_inference_caches"):
+        adapter.refresh_inference_caches()
 
 
 # ---------------------------------------------------------------------------
@@ -482,13 +438,8 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                                        else "cpu")
                 adapter_copy = copy.deepcopy(sample_adapter).to(dev)
 
-                # Install CUDA-graph-safe caches.
-                if (hasattr(adapter_copy, "rotate_layer")
-                        and not hasattr(adapter_copy, "_R_cache")):
-                    _install_R_cache(adapter_copy)
-                if (hasattr(adapter_copy, "w2")
-                        and not hasattr(adapter_copy, "_w2_pinv_cache")):
-                    _install_pinv_cache(adapter_copy)
+                # Install CUDA-graph-safe caches via the adapter's own protocol.
+                _install_adapter_caches(adapter_copy)
                 _init_reft_debug_buffers(self, dev)
 
                 # Hidden from nn.Module: vLLM's weight loader would raise for
@@ -498,10 +449,10 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
                 logger.debug(
                     "[ReFT-vLLM] Attached adapter to Qwen2 layer %d "
-                    "(has_R_cache=%s, has_pinv_cache=%s)",
+                    "(adapter_type=%s, has_R_cache=%s)",
                     layer_idx,
+                    type(adapter_copy).__name__,
                     hasattr(adapter_copy, "_R_cache"),
-                    hasattr(adapter_copy, "_w2_pinv_cache"),
                 )
             else:
                 object.__setattr__(self, "_reft_adapter", None)
@@ -627,12 +578,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                                        else "cpu")
                 adapter_copy = copy.deepcopy(sample_adapter).to(dev)
 
-                if (hasattr(adapter_copy, "rotate_layer")
-                        and not hasattr(adapter_copy, "_R_cache")):
-                    _install_R_cache(adapter_copy)
-                if (hasattr(adapter_copy, "w2")
-                        and not hasattr(adapter_copy, "_w2_pinv_cache")):
-                    _install_pinv_cache(adapter_copy)
+                _install_adapter_caches(adapter_copy)
                 _init_reft_debug_buffers(self, dev)
 
                 object.__setattr__(self, "_reft_adapter", adapter_copy)
@@ -640,10 +586,10 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
                 logger.debug(
                     "[ReFT-vLLM] Attached adapter to Llama layer %d "
-                    "(has_R_cache=%s, has_pinv_cache=%s)",
+                    "(adapter_type=%s, has_R_cache=%s)",
                     layer_idx,
+                    type(adapter_copy).__name__,
                     hasattr(adapter_copy, "_R_cache"),
-                    hasattr(adapter_copy, "_w2_pinv_cache"),
                 )
             else:
                 object.__setattr__(self, "_reft_adapter", None)
