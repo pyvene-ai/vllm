@@ -284,36 +284,48 @@ def _maybe_log_mask_debug(
     )
 
 
+_CAPTURE_MAX_TOKENS = 2048  # pre-allocated buffer size
+
+
 def _init_reft_capture_buffers(module: nn.Module, hidden_size: int,
                                device: torch.device) -> None:
-    """Pre-allocate buffers for last-token h_full/delta capture.
+    """Pre-allocate buffers for per-token h_full/delta capture.
 
-    All capture happens via in-place tensor ops (.copy_) so it's fully
-    compatible with TorchDynamo and CUDA graphs.
+    Buffers are (max_tokens, hidden_size) — we always write to the full
+    buffer and track the actual token count separately.  All operations
+    are pure tensor ops, fully compatible with TorchDynamo/CUDA graphs.
     """
     if hasattr(module, "_reft_cap_h"):
         return
+    M = _CAPTURE_MAX_TOKENS
+    H = hidden_size
+    # Full per-token captures
     module.register_buffer(
-        "_reft_cap_h", torch.zeros(hidden_size, dtype=torch.float32,
+        "_reft_cap_h", torch.zeros(M, H, dtype=torch.float32,
                                    device=device), persistent=False)
     module.register_buffer(
-        "_reft_cap_delta", torch.zeros(hidden_size, dtype=torch.float32,
+        "_reft_cap_delta", torch.zeros(M, H, dtype=torch.float32,
                                        device=device), persistent=False)
+    # Per-token norms (1-D, one per token position)
     module.register_buffer(
-        "_reft_cap_h_norm", torch.zeros((), dtype=torch.float32,
-                                        device=device), persistent=False)
-    module.register_buffer(
-        "_reft_cap_delta_norm", torch.zeros((), dtype=torch.float32,
-                                            device=device), persistent=False)
-    module.register_buffer(
-        "_reft_cap_delta_max", torch.zeros((), dtype=torch.float32,
-                                           device=device), persistent=False)
-    module.register_buffer(
-        "_reft_cap_cos_sim", torch.zeros((), dtype=torch.float32,
+        "_reft_cap_h_norms", torch.zeros(M, dtype=torch.float32,
                                          device=device), persistent=False)
     module.register_buffer(
-        "_reft_cap_valid", torch.zeros((), dtype=torch.int64,
-                                       device=device), persistent=False)
+        "_reft_cap_delta_norms", torch.zeros(M, dtype=torch.float32,
+                                             device=device), persistent=False)
+    # Scalar aggregates
+    module.register_buffer(
+        "_reft_cap_num_tokens", torch.zeros((), dtype=torch.int64,
+                                            device=device), persistent=False)
+    module.register_buffer(
+        "_reft_cap_delta_abs_max", torch.zeros((), dtype=torch.float32,
+                                               device=device), persistent=False)
+    module.register_buffer(
+        "_reft_cap_h_mean_norm", torch.zeros((), dtype=torch.float32,
+                                             device=device), persistent=False)
+    module.register_buffer(
+        "_reft_cap_delta_mean_norm", torch.zeros((), dtype=torch.float32,
+                                                 device=device), persistent=False)
 
 
 def _capture_last_token(
@@ -321,46 +333,44 @@ def _capture_last_token(
     *,
     h_full: torch.Tensor,
     delta: torch.Tensor,
-    mask: Optional[torch.Tensor],
+    mask: Optional[torch.Tensor],  # noqa: ARG001 — kept for call-site compat
 ) -> None:
-    """Capture last masked token's h_full/delta into pre-allocated buffers.
+    """Capture all tokens' h_full/delta into pre-allocated buffers.
 
-    Pure tensor ops only — safe inside TorchDynamo and CUDA graphs.
+    Pure tensor ops only — no data-dependent indexing, no Python scalars
+    from tensor values. Fully compatible with TorchDynamo and CUDA graphs.
+
+    The buffers are fixed-size (CAPTURE_MAX_TOKENS x hidden_size).
+    We write min(num_tokens, max) into the buffer and zero the rest.
     """
     if not hasattr(module, "_reft_cap_h"):
         return
 
-    # Find the last token that was actually masked (received nonzero delta)
-    # without converting a tensor value into a Python scalar. Using a tensor
-    # index keeps the helper traceable under TorchDynamo/fullgraph capture.
-    if mask is not None:
-        token_idx = torch.arange(
-            h_full.shape[0], device=h_full.device, dtype=torch.int64
-        )
-        nonzero_mask = mask.to(device=h_full.device) > 0
-        masked_idx = torch.where(nonzero_mask, token_idx, torch.zeros_like(token_idx))
-        has_masked = nonzero_mask.any()
-        last_idx = torch.where(has_masked, masked_idx.max(), token_idx[-1])
-    else:
-        last_idx = torch.full(
-            (), h_full.shape[0] - 1, device=h_full.device, dtype=torch.int64
-        )
+    M = _CAPTURE_MAX_TOKENS
+    n = h_full.shape[0]  # Python int from .shape — Dynamo-safe
+    dev = module._reft_cap_h.device
+    write_n = min(n, M)
 
-    gather_idx = last_idx.reshape(1)
-    h_last = h_full.index_select(0, gather_idx).squeeze(0).to(torch.float32)
-    d_last = delta.index_select(0, gather_idx).squeeze(0).to(torch.float32)
+    h_f = h_full[:write_n].detach().to(device=dev, dtype=torch.float32)
+    d_f = delta[:write_n].detach().to(device=dev, dtype=torch.float32)
 
-    module._reft_cap_h.copy_(h_last)
-    module._reft_cap_delta.copy_(d_last)
-    module._reft_cap_h_norm.copy_(h_last.norm())
-    module._reft_cap_delta_norm.copy_(d_last.norm())
-    module._reft_cap_delta_max.copy_(d_last.abs().max())
-    # cosine similarity between h and delta
-    cos = torch.nn.functional.cosine_similarity(
-        h_last.unsqueeze(0), d_last.unsqueeze(0)
-    ).squeeze()
-    module._reft_cap_cos_sim.copy_(cos)
-    module._reft_cap_valid.fill_(1)
+    # Zero out then write — avoids dynamic slicing on the right side
+    module._reft_cap_h.zero_()
+    module._reft_cap_delta.zero_()
+    module._reft_cap_h_norms.zero_()
+    module._reft_cap_delta_norms.zero_()
+
+    module._reft_cap_h[:write_n].copy_(h_f)
+    module._reft_cap_delta[:write_n].copy_(d_f)
+    module._reft_cap_h_norms[:write_n].copy_(h_f.norm(dim=-1))
+    module._reft_cap_delta_norms[:write_n].copy_(d_f.norm(dim=-1))
+
+    # Store token count: zero then add n as a tensor to avoid SymInt in .fill_()
+    module._reft_cap_num_tokens.zero_()
+    module._reft_cap_num_tokens.add_(h_f.shape[0])
+    module._reft_cap_delta_abs_max.copy_(d_f.abs().amax())
+    module._reft_cap_h_mean_norm.copy_(h_f.norm(dim=-1).mean())
+    module._reft_cap_delta_mean_norm.copy_(d_f.norm(dim=-1).mean())
 
 
 def _init_reft_debug_buffers(module: nn.Module, device: torch.device) -> None:
@@ -474,15 +484,20 @@ def _collect_layer_reft_debug_stats(layer: nn.Module) -> Optional[dict]:
         "hidden_l2_sum": float(layer._reft_debug_hidden_l2_sum.detach().cpu().item()),
     }
 
-    # Include last-token capture data if available
-    cap_valid = getattr(layer, "_reft_cap_valid", None)
-    if cap_valid is not None and int(cap_valid.item()) > 0:
-        stats["cap_h"] = layer._reft_cap_h.detach().cpu().tolist()
-        stats["cap_delta"] = layer._reft_cap_delta.detach().cpu().tolist()
-        stats["cap_h_norm"] = float(layer._reft_cap_h_norm.item())
-        stats["cap_delta_norm"] = float(layer._reft_cap_delta_norm.item())
-        stats["cap_delta_max"] = float(layer._reft_cap_delta_max.item())
-        stats["cap_cos_sim"] = float(layer._reft_cap_cos_sim.item())
+    # Include per-token capture data if available
+    cap_n = getattr(layer, "_reft_cap_num_tokens", None)
+    if cap_n is not None:
+        n = int(cap_n.item())
+        if n > 0:
+            stats["cap_num_tokens"] = n
+            # Full per-token h_full and delta tensors (truncated to actual token count)
+            stats["cap_h"] = layer._reft_cap_h[:n].detach().cpu().tolist()
+            stats["cap_delta"] = layer._reft_cap_delta[:n].detach().cpu().tolist()
+            stats["cap_h_norms"] = layer._reft_cap_h_norms[:n].detach().cpu().tolist()
+            stats["cap_delta_norms"] = layer._reft_cap_delta_norms[:n].detach().cpu().tolist()
+            stats["cap_delta_abs_max"] = float(layer._reft_cap_delta_abs_max.item())
+            stats["cap_h_mean_norm"] = float(layer._reft_cap_h_mean_norm.item())
+            stats["cap_delta_mean_norm"] = float(layer._reft_cap_delta_mean_norm.item())
 
     return stats
 
