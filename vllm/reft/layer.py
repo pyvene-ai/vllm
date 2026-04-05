@@ -326,7 +326,8 @@ def _record_mask_debug_stats(
     attn_metadata,
 ) -> None:
     """Accumulate compiled-path-safe ReFT mask stats into layer buffers."""
-    if not _reft_mask_debug_enabled() or not hasattr(module, "_reft_debug_total_tokens"):
+    debug_enabled = getattr(module, "_reft_debug_enabled", False) or _reft_mask_debug_enabled()
+    if not debug_enabled or not hasattr(module, "_reft_debug_total_tokens"):
         return
 
     num_tokens_int = positions.shape[0]
@@ -426,6 +427,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
     layer_indices_set = frozenset(reft_spec["layer_indices"])
     position = reft_spec["position"]
     sample_adapter: nn.Module = reft_spec["sample_adapter"]
+    debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
 
     class ReFTQwen2DecoderLayer(Qwen2DecoderLayer):
         """Qwen2DecoderLayer with optional ReFT adapter delta."""
@@ -457,6 +459,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 # adapter params that don't exist in the checkpoint.
                 object.__setattr__(self, "_reft_adapter", adapter_copy)
                 object.__setattr__(self, "_reft_layer_idx", layer_idx)
+                object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
                 logger.debug(
                     "[ReFT-vLLM] Attached adapter to Qwen2 layer %d "
                     "(has_R_cache=%s, has_pinv_cache=%s)",
@@ -467,6 +470,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
             else:
                 object.__setattr__(self, "_reft_adapter", None)
                 object.__setattr__(self, "_reft_layer_idx", -1)
+                object.__setattr__(self, "_reft_debug_enabled", False)
 
             # Store position string as a normal attribute (not a parameter).
             object.__setattr__(self, "_reft_position", position)
@@ -561,6 +565,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
     layer_indices_set = frozenset(reft_spec["layer_indices"])
     position = reft_spec["position"]
     sample_adapter: nn.Module = reft_spec["sample_adapter"]
+    debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
 
     class ReFTLlamaDecoderLayer(LlamaDecoderLayer):
         """LlamaDecoderLayer with optional ReFT adapter delta."""
@@ -588,6 +593,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
 
                 object.__setattr__(self, "_reft_adapter", adapter_copy)
                 object.__setattr__(self, "_reft_layer_idx", layer_idx)
+                object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
                 logger.debug(
                     "[ReFT-vLLM] Attached adapter to Llama layer %d "
                     "(has_R_cache=%s, has_pinv_cache=%s)",
@@ -598,6 +604,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             else:
                 object.__setattr__(self, "_reft_adapter", None)
                 object.__setattr__(self, "_reft_layer_idx", -1)
+                object.__setattr__(self, "_reft_debug_enabled", False)
 
             object.__setattr__(self, "_reft_position", position)
 
