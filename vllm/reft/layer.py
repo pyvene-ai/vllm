@@ -284,6 +284,52 @@ def _maybe_log_mask_debug(
     )
 
 
+def _reft_capture_dir() -> Optional[str]:
+    """Return the capture directory from env, or None if capture is disabled."""
+    return os.environ.get("VLLM_REFT_CAPTURE_DIR")
+
+
+def _init_reft_capture_buffers(module: nn.Module) -> None:
+    """Initialize capture counter for per-layer delta saving."""
+    if not hasattr(module, "_reft_capture_count"):
+        object.__setattr__(module, "_reft_capture_count", 0)
+        object.__setattr__(module, "_reft_capture_limit", 1)
+
+
+def _maybe_capture_delta(
+    module: nn.Module,
+    *,
+    h_full: torch.Tensor,
+    delta: torch.Tensor,
+    mask: Optional[torch.Tensor],
+) -> None:
+    """Save h_full and delta tensors to disk for comparison with HF.
+
+    Gated by VLLM_REFT_CAPTURE_DIR env var. Saves one .pt file per layer
+    per capture call. Only captures the first N calls (default 1) to avoid
+    filling disk during long generations.
+    """
+    capture_dir = _reft_capture_dir()
+    if capture_dir is None:
+        return
+
+    count = getattr(module, "_reft_capture_count", 0)
+    limit = getattr(module, "_reft_capture_limit", 1)
+    if count >= limit:
+        return
+
+    layer_idx = getattr(module, "_reft_layer_idx", -1)
+    os.makedirs(capture_dir, exist_ok=True)
+    save_path = os.path.join(capture_dir, f"capture_L{layer_idx}_call{count}.pt")
+    torch.save({
+        "h_full": h_full.detach().cpu(),
+        "delta": delta.detach().cpu(),
+        "mask": mask.detach().cpu() if mask is not None else None,
+        "layer_idx": layer_idx,
+    }, save_path)
+    object.__setattr__(module, "_reft_capture_count", count + 1)
+
+
 def _init_reft_debug_buffers(module: nn.Module, device: torch.device) -> None:
     """Initialize non-persistent buffers used for compiled-path mask stats."""
     if hasattr(module, "_reft_debug_total_tokens"):
@@ -443,6 +489,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 # Install CUDA-graph-safe caches via the adapter's own protocol.
                 _install_adapter_caches(adapter_copy)
                 _init_reft_debug_buffers(self, dev)
+                _init_reft_capture_buffers(self)
 
                 # Hidden from nn.Module: vLLM's weight loader would raise for
                 # adapter params that don't exist in the checkpoint.
@@ -514,6 +561,9 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 positions=positions,
                 attn_metadata=attn_metadata,
             )
+            _maybe_capture_delta(
+                self, h_full=h_full, delta=delta, mask=mask,
+            )
 
             hidden_states = hidden_states + delta
             return hidden_states, residual
@@ -582,6 +632,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
 
                 _install_adapter_caches(adapter_copy)
                 _init_reft_debug_buffers(self, dev)
+                _init_reft_capture_buffers(self)
 
                 object.__setattr__(self, "_reft_adapter", adapter_copy)
                 object.__setattr__(self, "_reft_layer_idx", layer_idx)
@@ -649,6 +700,9 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 mask=mask,
                 positions=positions,
                 attn_metadata=attn_metadata,
+            )
+            _maybe_capture_delta(
+                self, h_full=h_full, delta=delta, mask=mask,
             )
 
             hidden_states = hidden_states + delta
