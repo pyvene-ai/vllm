@@ -46,14 +46,20 @@ import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
-_REFT_MASK_DEBUG_ENABLED = os.environ.get("VLLM_REFT_DEBUG_MASK", "").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_REFT_MASK_DEBUG_LIMIT = int(os.environ.get("VLLM_REFT_DEBUG_LIMIT", "12"))
 _reft_mask_debug_counts: dict[tuple[str, int, str, str], int] = {}
+
+
+def _reft_mask_debug_enabled() -> bool:
+    return os.environ.get("VLLM_REFT_DEBUG_MASK", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _reft_mask_debug_limit() -> int:
+    return int(os.environ.get("VLLM_REFT_DEBUG_LIMIT", "12"))
 
 # ---------------------------------------------------------------------------
 # Graph-safe cache helpers (mirrors vllm_config/vllm_reft_layer.py)
@@ -234,7 +240,7 @@ def _maybe_log_mask_debug(
     attn_metadata,
 ) -> None:
     """Log how many tokens receive a nonzero ReFT mask in eager mode."""
-    if not _REFT_MASK_DEBUG_ENABLED:
+    if not _reft_mask_debug_enabled():
         return
     if hasattr(torch, "compiler") and torch.compiler.is_compiling():
         return
@@ -265,7 +271,7 @@ def _maybe_log_mask_debug(
 
     key = (arch, layer_idx, position, phase)
     count = _reft_mask_debug_counts.get(key, 0)
-    if count >= _REFT_MASK_DEBUG_LIMIT:
+    if count >= _reft_mask_debug_limit():
         return
     _reft_mask_debug_counts[key] = count + 1
 
@@ -294,6 +300,9 @@ def _init_reft_debug_buffers(module: nn.Module, device: torch.device) -> None:
     def _zero() -> torch.Tensor:
         return torch.zeros((), dtype=torch.int64, device=device)
 
+    def _zero_f() -> torch.Tensor:
+        return torch.zeros((), dtype=torch.float32, device=device)
+
     module.register_buffer("_reft_debug_total_tokens", _zero(), persistent=False)
     module.register_buffer("_reft_debug_masked_tokens", _zero(), persistent=False)
     module.register_buffer("_reft_debug_prefill_tokens", _zero(), persistent=False)
@@ -301,17 +310,23 @@ def _init_reft_debug_buffers(module: nn.Module, device: torch.device) -> None:
     module.register_buffer("_reft_debug_prefill_calls", _zero(), persistent=False)
     module.register_buffer("_reft_debug_decode_calls", _zero(), persistent=False)
     module.register_buffer("_reft_debug_mixed_calls", _zero(), persistent=False)
+    module.register_buffer("_reft_debug_delta_l2_sum", _zero_f(), persistent=False)
+    module.register_buffer("_reft_debug_delta_abs_sum", _zero_f(), persistent=False)
+    module.register_buffer("_reft_debug_delta_abs_max", _zero_f(), persistent=False)
+    module.register_buffer("_reft_debug_hidden_l2_sum", _zero_f(), persistent=False)
 
 
 def _record_mask_debug_stats(
     module: nn.Module,
     *,
+    delta: torch.Tensor,
+    hidden_states: torch.Tensor,
     mask: Optional[torch.Tensor],
     positions: torch.Tensor,
     attn_metadata,
 ) -> None:
     """Accumulate compiled-path-safe ReFT mask stats into layer buffers."""
-    if not _REFT_MASK_DEBUG_ENABLED or not hasattr(module, "_reft_debug_total_tokens"):
+    if not _reft_mask_debug_enabled() or not hasattr(module, "_reft_debug_total_tokens"):
         return
 
     num_tokens_int = positions.shape[0]
@@ -351,6 +366,15 @@ def _record_mask_debug_stats(
         torch.where((prefill_tokens > 0) & (decode_tokens > 0), one, zero)
     )
 
+    delta_f = delta.detach().to(device=stats_device, dtype=torch.float32)
+    hidden_f = hidden_states.detach().to(device=stats_device, dtype=torch.float32)
+    module._reft_debug_delta_l2_sum.add_(delta_f.norm(dim=-1).sum())
+    module._reft_debug_delta_abs_sum.add_(delta_f.abs().sum())
+    module._reft_debug_delta_abs_max.copy_(
+        torch.maximum(module._reft_debug_delta_abs_max, delta_f.abs().amax())
+    )
+    module._reft_debug_hidden_l2_sum.add_(hidden_f.norm(dim=-1).sum())
+
 
 def _collect_layer_reft_debug_stats(layer: nn.Module) -> Optional[dict]:
     """Return serializable mask stats for one layer, if any were recorded."""
@@ -370,6 +394,10 @@ def _collect_layer_reft_debug_stats(layer: nn.Module) -> Optional[dict]:
         "prefill_calls": int(layer._reft_debug_prefill_calls.detach().cpu().item()),
         "decode_calls": int(layer._reft_debug_decode_calls.detach().cpu().item()),
         "mixed_calls": int(layer._reft_debug_mixed_calls.detach().cpu().item()),
+        "delta_l2_sum": float(layer._reft_debug_delta_l2_sum.detach().cpu().item()),
+        "delta_abs_sum": float(layer._reft_debug_delta_abs_sum.detach().cpu().item()),
+        "delta_abs_max": float(layer._reft_debug_delta_abs_max.detach().cpu().item()),
+        "hidden_l2_sum": float(layer._reft_debug_hidden_l2_sum.detach().cpu().item()),
     }
 
 
@@ -423,8 +451,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 if (hasattr(adapter_copy, "w2")
                         and not hasattr(adapter_copy, "_w2_pinv_cache")):
                     _install_pinv_cache(adapter_copy)
-                if _REFT_MASK_DEBUG_ENABLED:
-                    _init_reft_debug_buffers(self, dev)
+                _init_reft_debug_buffers(self, dev)
 
                 # Hidden from nn.Module: vLLM's weight loader would raise for
                 # adapter params that don't exist in the checkpoint.
@@ -480,6 +507,8 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
             )
             _record_mask_debug_stats(
                 self,
+                delta=delta,
+                hidden_states=h_full,
                 mask=mask,
                 positions=positions,
                 attn_metadata=attn_metadata,
@@ -555,8 +584,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 if (hasattr(adapter_copy, "w2")
                         and not hasattr(adapter_copy, "_w2_pinv_cache")):
                     _install_pinv_cache(adapter_copy)
-                if _REFT_MASK_DEBUG_ENABLED:
-                    _init_reft_debug_buffers(self, dev)
+                _init_reft_debug_buffers(self, dev)
 
                 object.__setattr__(self, "_reft_adapter", adapter_copy)
                 object.__setattr__(self, "_reft_layer_idx", layer_idx)
@@ -609,6 +637,8 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             )
             _record_mask_debug_stats(
                 self,
+                delta=delta,
+                hidden_states=h_full,
                 mask=mask,
                 positions=positions,
                 attn_metadata=attn_metadata,
