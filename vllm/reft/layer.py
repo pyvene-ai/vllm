@@ -284,54 +284,76 @@ def _maybe_log_mask_debug(
     )
 
 
-def _reft_capture_dir() -> Optional[str]:
-    """Return the capture directory from env, or None if capture is disabled."""
-    return os.environ.get("VLLM_REFT_CAPTURE_DIR")
+def _init_reft_capture_buffers(module: nn.Module, hidden_size: int,
+                               device: torch.device) -> None:
+    """Pre-allocate buffers for last-token h_full/delta capture.
+
+    All capture happens via in-place tensor ops (.copy_) so it's fully
+    compatible with TorchDynamo and CUDA graphs.
+    """
+    if hasattr(module, "_reft_cap_h"):
+        return
+    module.register_buffer(
+        "_reft_cap_h", torch.zeros(hidden_size, dtype=torch.float32,
+                                   device=device), persistent=False)
+    module.register_buffer(
+        "_reft_cap_delta", torch.zeros(hidden_size, dtype=torch.float32,
+                                       device=device), persistent=False)
+    module.register_buffer(
+        "_reft_cap_h_norm", torch.zeros((), dtype=torch.float32,
+                                        device=device), persistent=False)
+    module.register_buffer(
+        "_reft_cap_delta_norm", torch.zeros((), dtype=torch.float32,
+                                            device=device), persistent=False)
+    module.register_buffer(
+        "_reft_cap_delta_max", torch.zeros((), dtype=torch.float32,
+                                           device=device), persistent=False)
+    module.register_buffer(
+        "_reft_cap_cos_sim", torch.zeros((), dtype=torch.float32,
+                                         device=device), persistent=False)
+    module.register_buffer(
+        "_reft_cap_valid", torch.zeros((), dtype=torch.int64,
+                                       device=device), persistent=False)
 
 
-def _init_reft_capture_buffers(module: nn.Module) -> None:
-    """Initialize capture counter for per-layer delta saving."""
-    if not hasattr(module, "_reft_capture_count"):
-        object.__setattr__(module, "_reft_capture_count", 0)
-        object.__setattr__(module, "_reft_capture_limit", 1)
-
-
-@torch.compiler.disable
-def _maybe_capture_delta(
+def _capture_last_token(
     module: nn.Module,
     *,
     h_full: torch.Tensor,
     delta: torch.Tensor,
     mask: Optional[torch.Tensor],
 ) -> None:
-    """Save h_full and delta tensors to disk for comparison with HF.
+    """Capture last masked token's h_full/delta into pre-allocated buffers.
 
-    Gated by VLLM_REFT_CAPTURE_DIR env var. Saves one .pt file per layer
-    per capture call. Only captures the first N calls (default 1) to avoid
-    filling disk during long generations.
-
-    Decorated with @torch.compiler.disable so TorchDynamo doesn't try to
-    trace os.makedirs / posix.stat.
+    Pure tensor ops only — safe inside TorchDynamo and CUDA graphs.
     """
-    capture_dir = _reft_capture_dir()
-    if capture_dir is None:
+    if not hasattr(module, "_reft_cap_h"):
         return
 
-    count = getattr(module, "_reft_capture_count", 0)
-    limit = getattr(module, "_reft_capture_limit", 1)
-    if count >= limit:
-        return
+    # Find the last token that was actually masked (received nonzero delta)
+    if mask is not None:
+        # mask shape: (num_tokens,)
+        # Find last nonzero position
+        nonzero_mask = (mask > 0).to(torch.int64)
+        # Use argmax on reversed tensor to find last nonzero
+        last_idx = h_full.shape[0] - 1 - nonzero_mask.flip(0).argmax()
+    else:
+        last_idx = h_full.shape[0] - 1
 
-    layer_idx = getattr(module, "_reft_layer_idx", -1)
-    os.makedirs(capture_dir, exist_ok=True)
-    save_path = os.path.join(capture_dir, f"capture_L{layer_idx}_call{count}.pt")
-    torch.save({
-        "h_full": h_full.detach().cpu(),
-        "delta": delta.detach().cpu(),
-        "mask": mask.detach().cpu() if mask is not None else None,
-        "layer_idx": layer_idx,
-    }, save_path)
-    object.__setattr__(module, "_reft_capture_count", count + 1)
+    h_last = h_full[last_idx].to(torch.float32)
+    d_last = delta[last_idx].to(torch.float32)
+
+    module._reft_cap_h.copy_(h_last)
+    module._reft_cap_delta.copy_(d_last)
+    module._reft_cap_h_norm.copy_(h_last.norm())
+    module._reft_cap_delta_norm.copy_(d_last.norm())
+    module._reft_cap_delta_max.copy_(d_last.abs().max())
+    # cosine similarity between h and delta
+    cos = torch.nn.functional.cosine_similarity(
+        h_last.unsqueeze(0), d_last.unsqueeze(0)
+    ).squeeze()
+    module._reft_cap_cos_sim.copy_(cos)
+    module._reft_cap_valid.fill_(1)
 
 
 def _init_reft_debug_buffers(module: nn.Module, device: torch.device) -> None:
@@ -426,7 +448,7 @@ def _collect_layer_reft_debug_stats(layer: nn.Module) -> Optional[dict]:
         return None
     total = int(total_tokens.detach().cpu().item())
 
-    return {
+    stats = {
         "layer_idx": int(getattr(layer, "_reft_layer_idx", -1)),
         "has_adapter": getattr(layer, "_reft_adapter", None) is not None,
         "debug_enabled": bool(getattr(layer, "_reft_debug_enabled", False)),
@@ -444,6 +466,18 @@ def _collect_layer_reft_debug_stats(layer: nn.Module) -> Optional[dict]:
         "delta_abs_max": float(layer._reft_debug_delta_abs_max.detach().cpu().item()),
         "hidden_l2_sum": float(layer._reft_debug_hidden_l2_sum.detach().cpu().item()),
     }
+
+    # Include last-token capture data if available
+    cap_valid = getattr(layer, "_reft_cap_valid", None)
+    if cap_valid is not None and int(cap_valid.item()) > 0:
+        stats["cap_h"] = layer._reft_cap_h.detach().cpu().tolist()
+        stats["cap_delta"] = layer._reft_cap_delta.detach().cpu().tolist()
+        stats["cap_h_norm"] = float(layer._reft_cap_h_norm.item())
+        stats["cap_delta_norm"] = float(layer._reft_cap_delta_norm.item())
+        stats["cap_delta_max"] = float(layer._reft_cap_delta_max.item())
+        stats["cap_cos_sim"] = float(layer._reft_cap_cos_sim.item())
+
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -493,7 +527,8 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 # Install CUDA-graph-safe caches via the adapter's own protocol.
                 _install_adapter_caches(adapter_copy)
                 _init_reft_debug_buffers(self, dev)
-                _init_reft_capture_buffers(self)
+                hidden_size = getattr(config, "hidden_size", 896)
+                _init_reft_capture_buffers(self, hidden_size, dev)
 
                 # Hidden from nn.Module: vLLM's weight loader would raise for
                 # adapter params that don't exist in the checkpoint.
@@ -565,7 +600,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 positions=positions,
                 attn_metadata=attn_metadata,
             )
-            _maybe_capture_delta(
+            _capture_last_token(
                 self, h_full=h_full, delta=delta, mask=mask,
             )
 
@@ -636,7 +671,11 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
 
                 _install_adapter_caches(adapter_copy)
                 _init_reft_debug_buffers(self, dev)
-                _init_reft_capture_buffers(self)
+                llama_config = getattr(vllm_config, "model_config", vllm_config)
+                hf_config = getattr(llama_config, "hf_config",
+                                    getattr(llama_config, "config", config))
+                hidden_size = getattr(hf_config, "hidden_size", 4096)
+                _init_reft_capture_buffers(self, hidden_size, dev)
 
                 object.__setattr__(self, "_reft_adapter", adapter_copy)
                 object.__setattr__(self, "_reft_layer_idx", layer_idx)
@@ -705,7 +744,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 positions=positions,
                 attn_metadata=attn_metadata,
             )
-            _maybe_capture_delta(
+            _capture_last_token(
                 self, h_full=h_full, delta=delta, mask=mask,
             )
 
