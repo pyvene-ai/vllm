@@ -127,11 +127,15 @@ def _adapter_to_blueprint(adapter) -> dict:
 
     cls = type(adapter)
 
-    # Walk the MRO to find the first __init__ with explicit named parameters.
-    # Subclasses that forward *args/**kwargs (e.g. GatedLoReFTAdapter) are
-    # skipped so we reach the concrete parent that defines the real signature.
+    # Walk the MRO and accumulate explicit named parameters from every
+    # __init__ in the chain.  Subclasses like LoReFTRidgeAdapter define
+    # ``def __init__(self, *args, lam=1e-3, **kwargs)`` — the old code
+    # stopped at the first __init__ with *any* explicit param (``lam``)
+    # and never reached W2Adapter.__init__ which defines ``hidden_size``,
+    # ``low_rank_dim``, etc.  Now we collect params from all levels, with
+    # subclass params taking priority on name collisions.
     init_params: dict = {}
-    for klass in cls.__mro__:
+    for klass in reversed(cls.__mro__):
         if klass is object:
             continue
         init_fn = klass.__dict__.get("__init__")
@@ -145,9 +149,7 @@ def _adapter_to_blueprint(adapter) -> dict:
                 inspect.Parameter.VAR_KEYWORD,
             )
         }
-        if explicit:
-            init_params = explicit
-            break
+        init_params.update(explicit)
 
     kwargs: dict = {}
     for name, param in init_params.items():
@@ -270,7 +272,12 @@ def _read_spec_file() -> Optional[dict]:
     if isinstance(adapter, dict) and adapter.get("__type__") == "AdapterBlueprint":
         try:
             spec["sample_adapter"] = _blueprint_to_adapter(adapter)
-        except Exception:
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).error(
+                "[vllm.reft] Failed to reconstruct adapter from blueprint: %s. "
+                "Blueprint: %s", e, adapter,
+            )
             return None
 
     return spec
