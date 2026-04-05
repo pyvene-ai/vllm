@@ -296,6 +296,7 @@ def _init_reft_capture_buffers(module: nn.Module) -> None:
         object.__setattr__(module, "_reft_capture_limit", 1)
 
 
+@torch.compiler.disable
 def _maybe_capture_delta(
     module: nn.Module,
     *,
@@ -308,6 +309,9 @@ def _maybe_capture_delta(
     Gated by VLLM_REFT_CAPTURE_DIR env var. Saves one .pt file per layer
     per capture call. Only captures the first N calls (default 1) to avoid
     filling disk during long generations.
+
+    Decorated with @torch.compiler.disable so TorchDynamo doesn't try to
+    trace os.makedirs / posix.stat.
     """
     capture_dir = _reft_capture_dir()
     if capture_dir is None:
