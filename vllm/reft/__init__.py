@@ -176,7 +176,9 @@ def _adapter_to_blueprint(adapter) -> dict:
         # else: omit — constructor must not require it or will use its default
 
     # dtype is not always stored as a direct attribute; derive from weights.
-    if "dtype" not in kwargs:
+    # Check for None too — the MRO walk may pick up the default (None) when
+    # the adapter doesn't store dtype as self.dtype.
+    if kwargs.get("dtype") is None:
         ls = getattr(adapter, "learned_source", None)
         if ls is not None and hasattr(ls, "weight"):
             kwargs["dtype"] = str(ls.weight.dtype)
