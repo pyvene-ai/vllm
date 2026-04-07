@@ -678,8 +678,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
             # rmsnorm(h_adapted + 0) = rmsnorm(h_full + delta), matching
             # the HF path exactly and avoiding FP non-associativity from
             # the three-way split (mlp_out + delta) + old_residual.
-            hidden_states = h_full + delta
-            residual = torch.zeros_like(residual)
+            hidden_states = hidden_states + delta
             return hidden_states, residual
 
         def load_reft_state(self, state_dict: dict) -> None:
@@ -834,7 +833,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             # rmsnorm(h_adapted + 0) = rmsnorm(h_full + delta), matching
             # the HF path exactly and avoiding FP non-associativity from
             # the three-way split (mlp_out + delta) + old_residual.
-            hidden_states = h_full + delta
+            hidden_states = hidden_states + delta
             return hidden_states, residual
 
         def load_reft_state(self, state_dict: dict) -> None:
