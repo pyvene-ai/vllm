@@ -183,17 +183,30 @@ def _adapter_to_blueprint(adapter) -> dict:
         if ls is not None and hasattr(ls, "weight"):
             kwargs["dtype"] = str(ls.weight.dtype)
 
+    # Save trained weights alongside the blueprint so that worker processes
+    # start with correct weights *before* CUDA graph capture / torch.compile
+    # warmup.  Without this, the blueprint adapter is constructed with random
+    # init weights, and post-init sync_reft_state() updates them in-place —
+    # but compiled/captured graphs may not reflect the in-place updates.
+    import torch
+    adapter_state = {
+        k: v.detach().cpu()
+        for k, v in adapter.state_dict().items()
+    }
+
     blueprint = {
         "__type__": "AdapterBlueprint",
         "__module__": cls.__module__,
         "__qualname__": cls.__qualname__,
         "kwargs": kwargs,
+        "state_dict": adapter_state,
     }
     import sys
     print(
         f"[vllm.reft] _adapter_to_blueprint: "
         f"{cls.__qualname__} from {cls.__module__} | "
-        f"kwargs={{{', '.join(f'{k}={v!r}' for k, v in sorted(kwargs.items()))}}}",
+        f"kwargs={{{', '.join(f'{k}={v!r}' for k, v in sorted(kwargs.items()))}}} | "
+        f"state_keys={sorted(adapter_state.keys())}",
         file=sys.stderr, flush=True,
     )
     return blueprint
@@ -217,7 +230,9 @@ def _blueprint_to_adapter(blueprint: dict):
     """Re-instantiate a fresh adapter from a saved blueprint dict.
 
     Imports the adapter class by its module path, converts the stored dtype
-    string back to a ``torch.dtype``, then calls the constructor.
+    string back to a ``torch.dtype``, then calls the constructor.  If the
+    blueprint contains a ``state_dict``, loads trained weights immediately
+    so the adapter is ready *before* CUDA graph capture / torch.compile.
     """
     import importlib
     import sys
@@ -225,10 +240,12 @@ def _blueprint_to_adapter(blueprint: dict):
 
     mod_name = blueprint["__module__"]
     qual_name = blueprint["__qualname__"]
+    has_state = "state_dict" in blueprint and blueprint["state_dict"]
     print(
         f"[vllm.reft] _blueprint_to_adapter: "
         f"module={mod_name} qualname={qual_name} "
-        f"kwargs_keys={sorted(blueprint['kwargs'].keys())}",
+        f"kwargs_keys={sorted(blueprint['kwargs'].keys())} "
+        f"has_state_dict={has_state}",
         file=sys.stderr, flush=True,
     )
 
@@ -241,7 +258,33 @@ def _blueprint_to_adapter(blueprint: dict):
         # "torch.bfloat16" → torch.bfloat16
         kwargs["dtype"] = getattr(torch, dtype_val.split(".")[-1], None)
 
-    return cls(**kwargs)
+    adapter = cls(**kwargs)
+
+    # Load trained weights if available in the blueprint.
+    saved_state = blueprint.get("state_dict")
+    if saved_state:
+        missing, unexpected = adapter.load_state_dict(saved_state, strict=False)
+        allowed_missing = {"_R_cache", "_w2_pinv_cache", "_w2_ridge_cache"}
+        real_missing = [k for k in missing if k not in allowed_missing]
+        if real_missing or unexpected:
+            print(
+                f"[vllm.reft] Blueprint state_dict load: "
+                f"missing={real_missing} unexpected={unexpected}",
+                file=sys.stderr, flush=True,
+            )
+        else:
+            print(
+                f"[vllm.reft] Blueprint state_dict loaded OK "
+                f"({len(saved_state)} keys)",
+                file=sys.stderr, flush=True,
+            )
+        # Refresh inference caches (e.g. _R_cache) from loaded weights.
+        if hasattr(adapter, "install_inference_caches"):
+            adapter.install_inference_caches()
+        if hasattr(adapter, "refresh_inference_caches"):
+            adapter.refresh_inference_caches()
+
+    return adapter
 
 
 def _write_spec_file(spec: dict) -> None:
