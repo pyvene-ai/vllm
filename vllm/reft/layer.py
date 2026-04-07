@@ -835,7 +835,6 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             # the HF path exactly and avoiding FP non-associativity from
             # the three-way split (mlp_out + delta) + old_residual.
             hidden_states = h_full + delta
-            residual = torch.zeros_like(residual)
             return hidden_states, residual
 
         def load_reft_state(self, state_dict: dict) -> None:
