@@ -210,9 +210,15 @@ def _compute_position_mask(
     if position == "prefill":
         # HF BaseAdapter.forward() skips decode tokens (seq_len == 1) for
         # non-"all" positions.  Match that: apply only to prefill tokens.
+        #
+        # vLLM V1 reorders batches so decode tokens come FIRST and prefill
+        # tokens come LAST.  num_prefill_tokens counts the tokens at the
+        # END of the batch, so the prefill region is
+        # [num_tokens - num_prefill_tokens, num_tokens).
         if num_prefill_tokens is not None:
+            num_decode_tokens = num_tokens - num_prefill_tokens
             token_idx = torch.arange(num_tokens, device=positions.device)
-            return (token_idx < num_prefill_tokens).to(dtype)
+            return (token_idx >= num_decode_tokens).to(dtype)
         else:
             # Fallback: all tokens at position 0 → we are in a prefill pass.
             gate = (positions[0:1] == 0).to(dtype)
@@ -221,8 +227,9 @@ def _compute_position_mask(
     if position == "first":
         mask = (positions == 0).to(dtype)
         if num_prefill_tokens is not None:
+            num_decode_tokens = num_tokens - num_prefill_tokens
             token_idx = torch.arange(num_tokens, device=positions.device)
-            prefill_mask = (token_idx < num_prefill_tokens).to(dtype)
+            prefill_mask = (token_idx >= num_decode_tokens).to(dtype)
             mask = mask * prefill_mask
         else:
             in_prefill = (positions[0:1] == 0).to(dtype)
@@ -231,8 +238,9 @@ def _compute_position_mask(
 
     if position == "last":
         if num_prefill_tokens is not None:
+            num_decode_tokens = num_tokens - num_prefill_tokens
             token_idx = torch.arange(num_tokens, device=positions.device)
-            prefill_mask = (token_idx < num_prefill_tokens).to(dtype)
+            prefill_mask = (token_idx >= num_decode_tokens).to(dtype)
             next_prefill = torch.zeros_like(prefill_mask)
             next_prefill[:-1] = prefill_mask[1:]
             next_is_new_seq = torch.zeros_like(prefill_mask)
@@ -673,11 +681,6 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 self, h_full=h_full, delta=delta, mask=mask,
             )
 
-            # Put the full adapted state into hidden_states and zero
-            # residual so the next layer's fused add+rmsnorm computes
-            # rmsnorm(h_adapted + 0) = rmsnorm(h_full + delta), matching
-            # the HF path exactly and avoiding FP non-associativity from
-            # the three-way split (mlp_out + delta) + old_residual.
             hidden_states = hidden_states + delta
             return hidden_states, residual
 
@@ -828,11 +831,6 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 self, h_full=h_full, delta=delta, mask=mask,
             )
 
-            # Put the full adapted state into hidden_states and zero
-            # residual so the next layer's fused add+rmsnorm computes
-            # rmsnorm(h_adapted + 0) = rmsnorm(h_full + delta), matching
-            # the HF path exactly and avoiding FP non-associativity from
-            # the three-way split (mlp_out + delta) + old_residual.
             hidden_states = hidden_states + delta
             return hidden_states, residual
 
