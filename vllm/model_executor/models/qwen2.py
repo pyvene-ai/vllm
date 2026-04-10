@@ -546,18 +546,35 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
+        import sys
+        # Peek at incoming weight names to log adapter params
+        weights_list = list(weights)
+        reft_weights = [n for n, _ in weights_list if "reft_adapter" in n]
+        if reft_weights:
+            print(
+                f"[ReFT load_weights] Received {len(reft_weights)} adapter params: "
+                f"{reft_weights}",
+                file=sys.stderr, flush=True,
+            )
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."]
                            if self.config.tie_word_embeddings else None),
         )
-        loaded = loader.load_weights(weights)
+        loaded = loader.load_weights(iter(weights_list))
         # ReFT adapter params are initialized from the blueprint spec,
         # not from the HF checkpoint.  Mark them as loaded so the
         # checkpoint validator in default_loader.py does not raise.
         for name, _ in self.named_parameters():
             if ".reft_adapter." in name:
                 loaded.add(name)
+        reft_loaded = [n for n in loaded if "reft_adapter" in n]
+        if reft_weights:
+            actually_loaded = [n for n in reft_weights if n in loaded]
+            print(
+                f"[ReFT load_weights] Actually loaded: {len(actually_loaded)}/{len(reft_weights)}",
+                file=sys.stderr, flush=True,
+            )
         return loaded
 
     def refresh_reft_caches(self) -> None:
@@ -566,8 +583,30 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         Called via ``collective_rpc("refresh_reft_caches")`` after TRL's
         ``sync_weights()`` pushes new adapter parameters.
         """
-        for layer in self.model.layers:
+        import sys
+        refreshed = []
+        for idx, layer in enumerate(self.model.layers):
             adapter = getattr(layer, "reft_adapter", None)
             if adapter is not None and hasattr(adapter,
                                                "refresh_inference_caches"):
+                # Snapshot R_cache before refresh for verification
+                r_before = None
+                if hasattr(adapter, "_R_cache"):
+                    r_before = adapter._R_cache.data.float().abs().mean().item()
                 adapter.refresh_inference_caches()
+                r_after = None
+                if hasattr(adapter, "_R_cache"):
+                    r_after = adapter._R_cache.data.float().abs().mean().item()
+                refreshed.append(idx)
+                if r_before is not None:
+                    changed = abs(r_after - r_before) > 1e-8
+                    print(
+                        f"[ReFT cache refresh] layer {idx}: "
+                        f"R_cache mean {r_before:.6f} -> {r_after:.6f} "
+                        f"({'CHANGED' if changed else 'same'})",
+                        file=sys.stderr, flush=True,
+                    )
+        print(
+            f"[ReFT cache refresh] refreshed {len(refreshed)} adapters: {refreshed}",
+            file=sys.stderr, flush=True,
+        )
