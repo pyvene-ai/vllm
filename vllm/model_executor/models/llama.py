@@ -50,7 +50,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP, SupportsReFT
+from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
@@ -483,8 +483,7 @@ class LlamaModel(nn.Module):
         return loaded_params
 
 
-class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3,
-                       SupportsReFT):
+class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"]
@@ -496,8 +495,6 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3,
         "lm_head": "output_embeddings"
     }
     embedding_padding_modules = ["lm_head"]
-
-    supports_reft = True
 
     # Mistral/Llama models can also be loaded with --load-format mistral
     # from consolidated.safetensors checkpoints
@@ -589,54 +586,19 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3,
         num_layers = len(self.model.layers)
         return (2, num_layers // 2, num_layers - 3)
 
-    # ------------------------------------------------------------------
-    # SupportsReFT implementation
-    # ------------------------------------------------------------------
-
-    def load_reft_state(self, state: "dict[int, dict]") -> None:
-        """Load per-layer ReFT adapter state dicts into decoder layers.
-
-        Called by ``LLM.sync_reft_state()`` after construction and after
-        each optimizer step to keep vLLM's adapter weights in sync with
-        the HF training model.
-
-        Args:
-            state: Mapping from layer index → adapter state_dict.
-        """
-        import sys
-        loaded = []
-        skipped = []
-        no_method = []
-        for layer_idx, adapter_state in state.items():
-            if layer_idx < len(self.model.layers):
-                layer = self.model.layers[layer_idx]
-                if hasattr(layer, "load_reft_state"):
-                    layer.load_reft_state(adapter_state)
-                    loaded.append(layer_idx)
-                else:
-                    no_method.append(layer_idx)
-            else:
-                skipped.append(layer_idx)
-        print(
-            f"[ReFT sync] Llama load_reft_state: "
-            f"loaded={sorted(loaded)} "
-            f"no_method={sorted(no_method)} "
-            f"skipped={sorted(skipped)} "
-            f"total_layers={len(self.model.layers)}",
-            file=sys.stderr, flush=True,
-        )
-
-    def get_reft_debug_stats(self) -> dict[int, dict]:
+    def get_reft_debug_stats(self) -> dict:
         """Return serializable per-layer ReFT debug stats, if enabled."""
-        stats = {}
+        stats: dict = {}
         layers = list(self.model.layers)
         stats["__summary__"] = {
             "model_type": type(self).__name__,
             "num_layers": len(layers),
-            "reft_debug_layers": sum(hasattr(layer, "get_reft_debug_stats") for layer in layers),
-            "loadable_layers": sum(hasattr(layer, "load_reft_state") for layer in layers),
-            "adapter_attr_layers": sum(hasattr(layer, "_reft_adapter") for layer in layers),
-            "debug_enabled_layers": sum(bool(getattr(layer, "_reft_debug_enabled", False)) for layer in layers),
+            "adapter_attr_layers": sum(
+                getattr(layer, "reft_adapter", None) is not None
+                for layer in layers),
+            "debug_enabled_layers": sum(
+                bool(getattr(layer, "_reft_debug_enabled", False))
+                for layer in layers),
         }
         for layer_idx, layer in enumerate(layers):
             if hasattr(layer, "get_reft_debug_stats"):
@@ -681,9 +643,28 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3,
             skip_prefixes=(["lm_head."]
                            if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(
+        loaded = loader.load_weights(
             self.maybe_remap_mistral(name, loaded_weight)
             for name, loaded_weight in weights)
+        # ReFT adapter params are initialized from the blueprint spec,
+        # not from the HF checkpoint.  Mark them as loaded so the
+        # checkpoint validator in default_loader.py does not raise.
+        for name, _ in self.named_parameters():
+            if ".reft_adapter." in name:
+                loaded.add(name)
+        return loaded
+
+    def refresh_reft_caches(self) -> None:
+        """Recompute derived ReFT caches after adapter weights are updated.
+
+        Called via ``collective_rpc("refresh_reft_caches")`` after TRL's
+        ``sync_weights()`` pushes new adapter parameters.
+        """
+        for layer in self.model.layers:
+            adapter = getattr(layer, "reft_adapter", None)
+            if adapter is not None and hasattr(adapter,
+                                               "refresh_inference_caches"):
+                adapter.refresh_inference_caches()
 
     # This function is used to remap the mistral format as
     # used by Mistral and Llama <=2

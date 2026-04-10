@@ -476,82 +476,14 @@ class LLM:
             modality_lora_path,
         )
 
-    def sync_reft_state(self, state: "dict[int, dict]") -> None:
-        """Sync ReFT adapter weights to all vLLM workers.
-
-        Call this once after ``LLM(...)`` returns and after every optimizer
-        step in GRPO training to keep vLLM's adapter weights on-policy.
-
-        Args:
-            state: Per-layer adapter state dicts as returned by
-                   ``export_vllm_reft_state(hf_model)`` from
-                   ``adaptors/injection.py``.  Keys are integer layer
-                   indices; values are ``adapter.state_dict()`` mappings.
-
-        Example::
-
-            import vllm.reft as vllm_reft
-            from adaptors.injection import export_vllm_reft_state
-
-            vllm_reft.set_reft_spec(reft_spec)
-            llm = LLM(model=model_name, ...)
-            vllm_reft.clear_reft_spec()
-
-            llm.sync_reft_state(export_vllm_reft_state(hf_model))
-
-        Implementation note:
-            vLLM's IPC layer (MsgpackEncoder/Decoder) only reconstructs
-            ``torch.Tensor`` objects when a typed schema is present.  The
-            untyped ``generic_decoder`` used for utility calls decodes
-            tensor-encoded tuples back to plain Python lists, so tensors
-            passed directly as kwargs would arrive as lists on the worker.
-            We avoid this by serialising the state dict to a temp file with
-            ``torch.save`` and passing only the file-path string (natively
-            serialisable) through IPC.  The worker loads and deletes the file.
-        """
-        import os
-        import tempfile
-        import torch
-
-        fd, path = tempfile.mkstemp(suffix=".pt", prefix="vllm_reft_state_")
-        os.close(fd)
-        try:
-            torch.save(state, path)
-            self.collective_rpc("sync_reft_state",
-                                kwargs={"state_file": path})
-        finally:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-
-    def get_internal_model(self) -> Optional[nn.Module]:
-        """Return the PyTorch model object inside the (in-process) vLLM engine.
-
-        Works in single-process and in-process (VLLM_ENABLE_V1_MULTIPROCESSING=0)
-        modes.  Returns ``None`` for out-of-process multi-GPU setups where the
-        model lives in a separate process.
-
-        Primarily useful for direct weight loading or debugging.  Prefer
-        ``sync_reft_state()`` for production weight sync.
-        """
-        results = self.apply_model(lambda m: m)
-        if results:
-            return results[0]
-        return None
-
-    def get_reft_debug_stats(self) -> dict[str, Any]:
-        """Return serializable ReFT debug stats from all workers.
-
-        Unlike ``get_internal_model()``, this avoids serializing Python callables
-        and is safe to use in multiprocessing modes.
-        """
+    def get_reft_debug_stats(self) -> dict:
+        """Return per-layer ReFT debug stats via worker RPC."""
         results = self.collective_rpc("get_reft_debug_stats")
-        if not results:
-            return {}
+        # Single-worker: return its stats directly
         if len(results) == 1:
             return results[0]
-        return {str(worker_idx): stats for worker_idx, stats in enumerate(results)}
+        # Multi-worker: return {worker_idx: stats}
+        return {i: r for i, r in enumerate(results)}
 
     def collective_rpc(self,
                        method: Union[str, Callable[..., _R]],

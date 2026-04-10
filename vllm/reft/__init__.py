@@ -22,7 +22,9 @@ Usage (from trainer code):
     finally:
         vllm_reft.clear_reft_spec()
 
-    llm.sync_reft_state(state_dict_per_layer)   # load actual trained weights
+    # Adapter weights are synced via TRL's standard sync_weights() pipeline.
+    # After sync, call llm.collective_rpc("refresh_reft_caches") to recompute
+    # derived inference caches.
 """
 
 import os

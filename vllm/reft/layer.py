@@ -99,49 +99,6 @@ def _maybe_log_reft_layer_init(
 # Weight verification helper (prints to stderr for worker visibility)
 # ---------------------------------------------------------------------------
 
-def _log_weight_verification(
-    arch: str,
-    layer_idx: int,
-    adapter: nn.Module,
-    input_state_dict: dict,
-) -> None:
-    """Compare adapter weights with the input state dict after load.
-
-    Prints to stderr so the output is visible even in V1 worker processes
-    where Python logging may not be configured.
-    """
-    import sys
-    adapter_sd = adapter.state_dict()
-    # Only compare keys that exist in both
-    common_keys = set(adapter_sd.keys()) & set(input_state_dict.keys())
-    only_adapter = set(adapter_sd.keys()) - set(input_state_dict.keys())
-    only_input = set(input_state_dict.keys()) - set(adapter_sd.keys())
-    diffs = []
-    for key in sorted(common_keys):
-        a = adapter_sd[key].detach().float().cpu()
-        b = input_state_dict[key].detach().float().cpu()
-        if a.shape != b.shape:
-            diffs.append(f"  {key}: SHAPE MISMATCH adapter={a.shape} input={b.shape}")
-        else:
-            max_diff = (a - b).abs().max().item()
-            if max_diff > 1e-6:
-                diffs.append(f"  {key}: MAX_DIFF={max_diff:.6e} (NOT LOADED?)")
-
-    status = "OK" if not diffs else "MISMATCH"
-    msg = (
-        f"[ReFT weight verify] {arch} L{layer_idx} "
-        f"adapter_type={type(adapter).__name__} "
-        f"status={status} "
-        f"common={len(common_keys)} "
-        f"only_adapter={sorted(only_adapter)} "
-        f"only_input={sorted(only_input)}"
-    )
-    print(msg, file=sys.stderr, flush=True)
-    if diffs:
-        for d in diffs:
-            print(f"  {d}", file=sys.stderr, flush=True)
-
-
 # ---------------------------------------------------------------------------
 # Graph-safe cache helpers (mirrors vllm_config/vllm_reft_layer.py)
 # ---------------------------------------------------------------------------
@@ -157,17 +114,6 @@ def _install_adapter_caches(adapter: nn.Module) -> None:
     """
     if hasattr(adapter, "install_inference_caches"):
         adapter.install_inference_caches()
-
-
-def _refresh_adapter_caches(adapter: nn.Module) -> None:
-    """Refresh inference caches after loading new adapter weights.
-
-    Calls ``adapter.refresh_inference_caches()`` if the method exists.
-    Called by the ReFT decoder layer's ``load_reft_state()`` after each
-    weight sync so cached tensors stay in sync with the trained weights.
-    """
-    if hasattr(adapter, "refresh_inference_caches"):
-        adapter.refresh_inference_caches()
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +468,7 @@ def _collect_layer_reft_debug_stats(layer: nn.Module) -> Optional[dict]:
 
     stats = {
         "layer_idx": int(getattr(layer, "_reft_layer_idx", -1)),
-        "has_adapter": getattr(layer, "_reft_adapter", None) is not None,
+        "has_adapter": getattr(layer, "reft_adapter", None) is not None,
         "debug_enabled": bool(getattr(layer, "_reft_debug_enabled", False)),
         "has_debug_buffers": True,
         "position": getattr(layer, "_reft_position", None),
@@ -545,7 +491,6 @@ def _collect_layer_reft_debug_stats(layer: nn.Module) -> Optional[dict]:
         n = int(cap_n.item())
         if n > 0:
             stats["cap_num_tokens"] = n
-            # Full per-token h_full and delta tensors (truncated to actual token count)
             stats["cap_h"] = layer._reft_cap_h[:n].detach().cpu().tolist()
             stats["cap_delta"] = layer._reft_cap_delta[:n].detach().cpu().tolist()
             stats["cap_h_norms"] = layer._reft_cap_h_norms[:n].detach().cpu().tolist()
@@ -607,9 +552,11 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 hidden_size = getattr(config, "hidden_size", 896)
                 _init_reft_capture_buffers(self, hidden_size, dev)
 
-                # Hidden from nn.Module: vLLM's weight loader would raise for
-                # adapter params that don't exist in the checkpoint.
-                object.__setattr__(self, "_reft_adapter", adapter_copy)
+                # Register as a proper nn.Module submodule so that
+                # named_parameters() sees adapter weights and TRL's
+                # sync_weights() can push them through the standard
+                # update_named_param / load_weights path.
+                self.reft_adapter = adapter_copy
                 object.__setattr__(self, "_reft_layer_idx", layer_idx)
                 object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
                 logger.debug(
@@ -620,7 +567,6 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                     hasattr(adapter_copy, "_R_cache"),
                 )
             else:
-                object.__setattr__(self, "_reft_adapter", None)
                 object.__setattr__(self, "_reft_layer_idx", -1)
                 object.__setattr__(self, "_reft_debug_enabled", False)
 
@@ -629,10 +575,10 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
             _maybe_log_reft_layer_init(
                 arch="qwen2",
                 layer_idx=getattr(self, "_reft_layer_idx", -1),
-                attached=self._reft_adapter is not None,
+                attached=getattr(self, "reft_adapter", None) is not None,
                 debug_enabled=bool(getattr(self, "_reft_debug_enabled", False)),
                 position=position,
-                adapter=self._reft_adapter,
+                adapter=getattr(self, "reft_adapter", None),
             )
 
         def forward(
@@ -646,7 +592,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
 
             # Use normal attribute lookup here so TorchDynamo can trace the
             # forward path; explicit object.__getattribute__ is unsupported.
-            adapter = self._reft_adapter
+            adapter = getattr(self, "reft_adapter", None)
             if adapter is None:
                 return hidden_states, residual
 
@@ -683,32 +629,6 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
 
             hidden_states = hidden_states + delta
             return hidden_states, residual
-
-        def load_reft_state(self, state_dict: dict) -> None:
-            """Update adapter weights and refresh graph-safe caches."""
-            adapter = self._reft_adapter
-            if adapter is None:
-                return
-            missing, unexpected = adapter.load_state_dict(
-                state_dict, strict=False)
-            allowed_missing = {
-                "_R_cache", "_w2_pinv_cache", "_w2_ridge_cache",
-            }
-            unexpected_missing = [k for k in missing
-                                   if k not in allowed_missing]
-            if unexpected_missing:
-                logger.warning(
-                    "[ReFT-vLLM] Missing state keys in ReFT adapter sync: %s",
-                    unexpected_missing)
-            if unexpected:
-                logger.warning(
-                    "[ReFT-vLLM] Unexpected state keys in ReFT adapter sync: %s",
-                    unexpected)
-            _refresh_adapter_caches(adapter)
-            _log_weight_verification(
-                "qwen2", self._reft_layer_idx,
-                adapter, state_dict,
-            )
 
         def get_reft_debug_stats(self) -> Optional[dict]:
             return _collect_layer_reft_debug_stats(self)
@@ -760,7 +680,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 hidden_size = getattr(hf_config, "hidden_size", 4096)
                 _init_reft_capture_buffers(self, hidden_size, dev)
 
-                object.__setattr__(self, "_reft_adapter", adapter_copy)
+                self.reft_adapter = adapter_copy
                 object.__setattr__(self, "_reft_layer_idx", layer_idx)
                 object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
                 logger.debug(
@@ -771,7 +691,6 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                     hasattr(adapter_copy, "_R_cache"),
                 )
             else:
-                object.__setattr__(self, "_reft_adapter", None)
                 object.__setattr__(self, "_reft_layer_idx", -1)
                 object.__setattr__(self, "_reft_debug_enabled", False)
 
@@ -779,10 +698,10 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             _maybe_log_reft_layer_init(
                 arch="llama",
                 layer_idx=getattr(self, "_reft_layer_idx", -1),
-                attached=self._reft_adapter is not None,
+                attached=getattr(self, "reft_adapter", None) is not None,
                 debug_enabled=bool(getattr(self, "_reft_debug_enabled", False)),
                 position=position,
-                adapter=self._reft_adapter,
+                adapter=getattr(self, "reft_adapter", None),
             )
 
         def forward(
@@ -794,9 +713,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             hidden_states, residual = super().forward(
                 positions, hidden_states, residual)
 
-            # Use normal attribute lookup here so TorchDynamo can trace the
-            # forward path; explicit object.__getattribute__ is unsupported.
-            adapter = self._reft_adapter
+            adapter = getattr(self, "reft_adapter", None)
             if adapter is None:
                 return hidden_states, residual
 
@@ -833,32 +750,6 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
 
             hidden_states = hidden_states + delta
             return hidden_states, residual
-
-        def load_reft_state(self, state_dict: dict) -> None:
-            """Update adapter weights and refresh graph-safe caches."""
-            adapter = self._reft_adapter
-            if adapter is None:
-                return
-            missing, unexpected = adapter.load_state_dict(
-                state_dict, strict=False)
-            allowed_missing = {
-                "_R_cache", "_w2_pinv_cache", "_w2_ridge_cache",
-            }
-            unexpected_missing = [k for k in missing
-                                   if k not in allowed_missing]
-            if unexpected_missing:
-                logger.warning(
-                    "[ReFT-vLLM] Missing state keys in ReFT adapter sync: %s",
-                    unexpected_missing)
-            if unexpected:
-                logger.warning(
-                    "[ReFT-vLLM] Unexpected state keys in ReFT adapter sync: %s",
-                    unexpected)
-            _refresh_adapter_caches(adapter)
-            _log_weight_verification(
-                "llama", self._reft_layer_idx,
-                adapter, state_dict,
-            )
 
         def get_reft_debug_stats(self) -> Optional[dict]:
             return _collect_layer_reft_debug_stats(self)

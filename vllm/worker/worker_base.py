@@ -68,27 +68,19 @@ class WorkerBase:
         """Apply a function on the model inside this worker."""
         return fn(self.get_model())
 
-    def sync_reft_state(self, state_file: str) -> None:
-        """Load ReFT adapter state into the model managed by this worker.
+    def refresh_reft_caches(self) -> None:
+        """Recompute derived ReFT caches after adapter weights are updated.
 
-        Routed from ``LLM.sync_reft_state()`` → ``ExecutorBase`` →
-        ``collective_rpc("sync_reft_state", kwargs={"state_file": path})``.
-
-        Args:
-            state_file: Path to a ``torch.save``-d file containing a mapping
-                        from layer index (int) → adapter ``state_dict``.
-                        The caller is responsible for deleting the file after
-                        all workers have loaded it.
+        Called via ``collective_rpc("refresh_reft_caches")`` after TRL's
+        ``sync_weights()`` pushes new adapter parameters through
+        ``load_weights()``.
         """
-        import torch
-
-        state = torch.load(state_file, map_location="cpu", weights_only=False)
         model = self.get_model()
-        if hasattr(model, "load_reft_state"):
-            model.load_reft_state(state)
+        if hasattr(model, "refresh_reft_caches"):
+            model.refresh_reft_caches()
 
     def get_reft_debug_stats(self) -> dict:
-        """Return serializable ReFT debug stats gathered inside the model."""
+        """Return per-layer ReFT debug stats from the model."""
         model = self.get_model()
         if hasattr(model, "get_reft_debug_stats"):
             return model.get_reft_debug_stats()
