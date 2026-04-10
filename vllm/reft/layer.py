@@ -216,9 +216,9 @@ def _compute_position_mask(
         # END of the batch, so the prefill region is
         # [num_tokens - num_prefill_tokens, num_tokens).
         if num_prefill_tokens is not None:
-            # num_decode_tokens = num_tokens - num_prefill_tokens
+            num_decode_tokens = num_tokens - num_prefill_tokens
             token_idx = torch.arange(num_tokens, device=positions.device)
-            return (token_idx < num_prefill_tokens).to(dtype)
+            return (token_idx >= num_decode_tokens).to(dtype)
         else:
             # Fallback: all tokens at position 0 → we are in a prefill pass.
             gate = (positions[0:1] == 0).to(dtype)
