@@ -527,6 +527,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
     layer_indices_set = frozenset(reft_spec["layer_indices"])
     position = reft_spec["position"]
     sample_adapter: nn.Module = reft_spec["sample_adapter"]
+    per_layer_adapters: dict = reft_spec.get("adapters", {})
     debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
 
     class ReFTQwen2DecoderLayer(Qwen2DecoderLayer):
@@ -544,7 +545,10 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 except StopIteration:
                     dev = torch.device("cuda" if torch.cuda.is_available()
                                        else "cpu")
-                adapter_copy = copy.deepcopy(sample_adapter).to(dev)
+                # Use per-layer adapter when available to preserve the correct
+                # parametrization base buffer; fall back to sample_adapter.
+                source = per_layer_adapters.get(layer_idx, sample_adapter)
+                adapter_copy = copy.deepcopy(source).to(dev)
 
                 # Install CUDA-graph-safe caches via the adapter's own protocol.
                 _install_adapter_caches(adapter_copy)
@@ -654,6 +658,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
     layer_indices_set = frozenset(reft_spec["layer_indices"])
     position = reft_spec["position"]
     sample_adapter: nn.Module = reft_spec["sample_adapter"]
+    per_layer_adapters: dict = reft_spec.get("adapters", {})
     debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
 
     class ReFTLlamaDecoderLayer(LlamaDecoderLayer):
@@ -670,7 +675,8 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 except StopIteration:
                     dev = torch.device("cuda" if torch.cuda.is_available()
                                        else "cpu")
-                adapter_copy = copy.deepcopy(sample_adapter).to(dev)
+                source = per_layer_adapters.get(layer_idx, sample_adapter)
+                adapter_copy = copy.deepcopy(source).to(dev)
 
                 _install_adapter_caches(adapter_copy)
                 _init_reft_debug_buffers(self, dev)

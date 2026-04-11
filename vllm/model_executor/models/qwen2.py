@@ -546,35 +546,16 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
-        import sys
-        # Peek at incoming weight names to log adapter params
-        weights_list = list(weights)
-        reft_weights = [n for n, _ in weights_list if "reft_adapter" in n]
-        if reft_weights:
-            print(
-                f"[ReFT load_weights] Received {len(reft_weights)} adapter params: "
-                f"{reft_weights}",
-                file=sys.stderr, flush=True,
-            )
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."]
                            if self.config.tie_word_embeddings else None),
         )
-        loaded = loader.load_weights(iter(weights_list))
-        # ReFT adapter params are initialized from the blueprint spec,
-        # not from the HF checkpoint.  Mark them as loaded so the
-        # checkpoint validator in default_loader.py does not raise.
+        loaded = loader.load_weights(weights)
+        # Mark adapter params as loaded for checkpoint validator
         for name, _ in self.named_parameters():
             if ".reft_adapter." in name:
                 loaded.add(name)
-        reft_loaded = [n for n in loaded if "reft_adapter" in n]
-        if reft_weights:
-            actually_loaded = [n for n in reft_weights if n in loaded]
-            print(
-                f"[ReFT load_weights] Actually loaded: {len(actually_loaded)}/{len(reft_weights)}",
-                file=sys.stderr, flush=True,
-            )
         return loaded
 
     def refresh_reft_caches(self) -> None:
@@ -589,21 +570,23 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
             adapter = getattr(layer, "reft_adapter", None)
             if adapter is not None and hasattr(adapter,
                                                "refresh_inference_caches"):
-                # Snapshot R_cache before refresh for verification
-                r_before = None
+                # Snapshot R_cache fingerprint before refresh
+                r_before_fp = None
                 if hasattr(adapter, "_R_cache"):
-                    r_before = adapter._R_cache.data.float().abs().mean().item()
+                    flat = adapter._R_cache.data.flatten()
+                    r_before_fp = flat[:8].tolist()
                 adapter.refresh_inference_caches()
-                r_after = None
+                r_after_fp = None
                 if hasattr(adapter, "_R_cache"):
-                    r_after = adapter._R_cache.data.float().abs().mean().item()
+                    flat = adapter._R_cache.data.flatten()
+                    r_after_fp = flat[:8].tolist()
                 refreshed.append(idx)
-                if r_before is not None:
-                    changed = abs(r_after - r_before) > 1e-8
+                if r_before_fp is not None:
+                    changed = r_before_fp != r_after_fp
                     print(
                         f"[ReFT cache refresh] layer {idx}: "
-                        f"R_cache mean {r_before:.6f} -> {r_after:.6f} "
-                        f"({'CHANGED' if changed else 'same'})",
+                        f"{'CHANGED' if changed else 'same'} "
+                        f"(first vals: {[f'{v:.6f}' for v in r_after_fp[:4]]})",
                         file=sys.stderr, flush=True,
                     )
         print(
