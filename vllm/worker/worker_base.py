@@ -86,13 +86,6 @@ class WorkerBase:
             return model.get_reft_debug_stats()
         return {}
 
-    def get_reft_adapter_fingerprints(self) -> dict:
-        """Return fingerprints of all ReFT adapter params/buffers for verification."""
-        model = self.get_model()
-        if hasattr(model, "get_reft_adapter_fingerprints"):
-            return model.get_reft_adapter_fingerprints()
-        return {}
-
     def load_model(self) -> None:
         """Load model onto target device."""
         raise NotImplementedError
