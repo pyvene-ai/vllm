@@ -302,6 +302,11 @@ def _write_spec_file(spec: dict) -> None:
     adapter = saveable_spec.get("sample_adapter")
     if adapter is not None:
         saveable_spec["sample_adapter"] = _adapter_to_blueprint(adapter)
+    adapters = saveable_spec.pop("adapters", None)
+    if adapters is not None:
+        saveable_spec["adapter_states"] = {
+            idx: a.state_dict() for idx, a in adapters.items()
+        }
 
     fd, path = tempfile.mkstemp(suffix=".pt", prefix="vllm_reft_spec_")
     os.close(fd)
@@ -362,6 +367,18 @@ def _read_spec_file() -> Optional[dict]:
                 f"state_keys={sorted(rebuilt.state_dict().keys())}",
                 file=sys.stderr, flush=True,
             )
+
+    # Reconstruct per-layer adapters from saved state dicts.
+    adapter_states = spec.pop("adapter_states", None)
+    sample = spec.get("sample_adapter")
+    if adapter_states is not None and sample is not None:
+        import copy
+        adapters = {}
+        for idx, sd in adapter_states.items():
+            a = copy.deepcopy(sample)
+            a.load_state_dict(sd)
+            adapters[int(idx)] = a
+        spec["adapters"] = adapters
 
     return spec
 
