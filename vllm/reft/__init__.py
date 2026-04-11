@@ -36,7 +36,6 @@ __all__ = [
     "set_reft_spec",
     "get_reft_spec",
     "clear_reft_spec",
-    "write_reft_spec_to_path",
 ]
 
 # ---------------------------------------------------------------------------
@@ -93,27 +92,6 @@ def clear_reft_spec() -> None:
     """Clear the active ReFT spec for this thread and remove the temp file."""
     _reft_spec_local.spec = None
     _remove_spec_file()
-
-
-def write_reft_spec_to_path(spec: dict[str, Any], path: str) -> None:
-    """Serialise a ReFT spec to a user-chosen file path.
-
-    The file uses the same format as the internal temp-file mechanism, so
-    ``trl vllm-serve --reft_spec_file <path>`` and ``_read_spec_file`` can
-    both read it.
-    """
-    import torch
-
-    saveable_spec = dict(spec)
-    adapter = saveable_spec.get("sample_adapter")
-    if adapter is not None:
-        saveable_spec["sample_adapter"] = _adapter_to_blueprint(adapter)
-    adapters = saveable_spec.pop("adapters", None)
-    if adapters is not None:
-        saveable_spec["adapter_states"] = {
-            idx: a.state_dict() for idx, a in adapters.items()
-        }
-    torch.save(saveable_spec, path)
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +219,7 @@ def _mixer_instance_to_name(mixer_instance) -> Optional[str]:
     if mixer_instance is None:
         return None
     try:
-        from adaptors._mixer import MIXER_REGISTRY
+        from pyreft.adapters._mixer import MIXER_REGISTRY
         for name, mixer_cls in MIXER_REGISTRY.items():
             if isinstance(mixer_instance, mixer_cls):
                 return name
@@ -263,6 +241,9 @@ def _blueprint_to_adapter(blueprint: dict):
     import torch
 
     mod_name = blueprint["__module__"]
+    # Backward compat: old blueprints stored "adaptors.*" module paths
+    if mod_name.startswith("adaptors."):
+        mod_name = mod_name.replace("adaptors.", "pyreft.adapters.", 1)
     qual_name = blueprint["__qualname__"]
     has_state = "state_dict" in blueprint and blueprint["state_dict"]
     print(
