@@ -86,6 +86,13 @@ class WorkerBase:
             return model.get_reft_debug_stats()
         return {}
 
+    def get_reft_weight_fingerprints(self, layer_indices=None) -> dict:
+        """Return adapter param/buffer fingerprints for diagnostic comparison."""
+        model = self.get_model()
+        if hasattr(model, "get_reft_weight_fingerprints"):
+            return model.get_reft_weight_fingerprints(layer_indices)
+        return {}
+
     def load_model(self) -> None:
         """Load model onto target device."""
         raise NotImplementedError

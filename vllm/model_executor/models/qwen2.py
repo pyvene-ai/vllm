@@ -558,6 +558,38 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
                 loaded.add(name)
         return loaded
 
+    def get_reft_weight_fingerprints(self, layer_indices=None) -> dict:
+        """Return param/buffer fingerprints for ReFT adapters.
+
+        Used by diagnostic scripts to verify weight sync in server mode.
+        Returns a dict keyed by layer index, each containing param and buffer
+        fingerprints (name, shape, dtype, first 4 flattened values).
+        """
+        result = {}
+        layers = list(self.model.layers)
+        if layer_indices is None:
+            n = len(layers)
+            layer_indices = [0, n // 2, n - 1]
+        for idx in layer_indices:
+            adapter = getattr(layers[idx], "reft_adapter", None)
+            if adapter is None:
+                continue
+            layer_fp = {"params": {}, "buffers": {}}
+            for pname, p in adapter.named_parameters():
+                layer_fp["params"][pname] = {
+                    "shape": list(p.shape),
+                    "dtype": str(p.dtype),
+                    "first4": p.data.detach().float().flatten()[:4].tolist(),
+                }
+            for bname, b in adapter.named_buffers():
+                layer_fp["buffers"][bname] = {
+                    "shape": list(b.shape),
+                    "dtype": str(b.dtype),
+                    "first4": b.data.detach().float().flatten()[:4].tolist(),
+                }
+            result[idx] = layer_fp
+        return result
+
     def refresh_reft_caches(self) -> None:
         """Recompute derived ReFT caches after adapter weights are updated.
 
