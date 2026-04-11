@@ -570,6 +570,24 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
             adapter = getattr(layer, "reft_adapter", None)
             if adapter is not None and hasattr(adapter,
                                                "refresh_inference_caches"):
+                # Print ALL adapter param fingerprints BEFORE refresh
+                if idx in (0, 12, 23):  # sample layers
+                    for pname, p in adapter.named_parameters():
+                        fp = p.data.flatten()[:4].tolist()
+                        print(
+                            f"[ReFT VLLM params] layer {idx} "
+                            f"{pname}: {[f'{v:.6f}' for v in fp]}  "
+                            f"shape={list(p.shape)} dtype={p.dtype}",
+                            file=sys.stderr, flush=True,
+                        )
+                    for bname, b in adapter.named_buffers():
+                        fp = b.data.flatten()[:4].tolist()
+                        print(
+                            f"[ReFT VLLM buffer] layer {idx} "
+                            f"{bname}: {[f'{v:.6f}' for v in fp]}  "
+                            f"shape={list(b.shape)} dtype={b.dtype}",
+                            file=sys.stderr, flush=True,
+                        )
                 # Snapshot R_cache fingerprint before refresh
                 r_before_fp = None
                 if hasattr(adapter, "_R_cache"):
