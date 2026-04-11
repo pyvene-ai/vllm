@@ -611,3 +611,24 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
             f"[ReFT cache refresh] refreshed {len(refreshed)} adapters: {refreshed}",
             file=sys.stderr, flush=True,
         )
+
+    def get_reft_adapter_fingerprints(self) -> dict:
+        """Return first-4-values fingerprint of every adapter param and buffer."""
+        result = {}
+        for idx, layer in enumerate(self.model.layers):
+            adapter = getattr(layer, "reft_adapter", None)
+            if adapter is None:
+                continue
+            for pname, p in adapter.named_parameters():
+                key = f"layers.{idx}.reft_adapter.{pname}"
+                fp = p.data.detach().cpu().flatten()[:4].tolist()
+                result[key] = {"first4": [f"{v:.6f}" for v in fp],
+                               "shape": list(p.shape),
+                               "dtype": str(p.dtype)}
+            for bname, b in adapter.named_buffers():
+                key = f"layers.{idx}.reft_adapter.{bname}"
+                fp = b.data.detach().cpu().flatten()[:4].tolist()
+                result[key] = {"first4": [f"{v:.6f}" for v in fp],
+                               "shape": list(b.shape),
+                               "dtype": str(b.dtype)}
+        return result
