@@ -133,6 +133,55 @@ def _extract_layer_idx(prefix: str) -> Optional[int]:
 # Position masking (CUDA-graph-safe)
 # ---------------------------------------------------------------------------
 
+def _resolve_attn_metadata(attn_metadata):
+    """Resolve attn_metadata to a single object.
+
+    In vLLM V1, ForwardContext.attn_metadata is a dict mapping layer names
+    to per-layer metadata objects.  All layers within a KV-cache group share
+    the same metadata, so we just grab the first value.
+    """
+    if isinstance(attn_metadata, dict):
+        for v in attn_metadata.values():
+            return v
+    return attn_metadata
+
+
+def _prefill_request_indices(
+    num_prefill_tokens: int,
+    num_decodes: int,
+    num_prefills: int,
+    query_start_loc: Optional[torch.Tensor],
+    prefill_positions: torch.Tensor,
+) -> torch.Tensor:
+    """Map each prefill token to its request index (0-based within prefills).
+
+    Prefers ``query_start_loc`` (from attn_metadata) for an exact answer.
+    Falls back to detecting position resets when metadata is unavailable.
+    """
+    if num_prefill_tokens <= 1:
+        return torch.zeros(num_prefill_tokens, device=prefill_positions.device,
+                           dtype=torch.long)
+
+    # --- Preferred path: use query_start_loc from metadata ---
+    if query_start_loc is not None and num_prefills > 0:
+        # query_start_loc covers all requests (decode + prefill), shape (N+1,).
+        # Prefill requests start at index num_decodes.
+        # The prefill-region offsets are relative to the start of prefill tokens.
+        prefill_qsl = query_start_loc[num_decodes:] - query_start_loc[num_decodes]
+        prefill_tok_idx = torch.arange(
+            num_prefill_tokens, device=prefill_positions.device)
+        req_idx = torch.searchsorted(
+            prefill_qsl[1:], prefill_tok_idx, right=True)
+        return req_idx.clamp(max=num_prefills - 1)
+
+    # --- Fallback: detect request boundaries from position resets ---
+    is_boundary = torch.zeros(num_prefill_tokens,
+                              device=prefill_positions.device, dtype=torch.long)
+    is_boundary[1:] = (
+        prefill_positions[1:] <= prefill_positions[:-1]).long()
+    return is_boundary.cumsum(0)
+
+
 def _compute_position_mask(
     positions: torch.Tensor,
     position: str,
@@ -142,8 +191,9 @@ def _compute_position_mask(
 ) -> Optional[torch.Tensor]:
     """Return the per-token ReFT mask, or ``None`` for unconditional apply.
 
-    All masking uses tensor ops only – no Python branching on live tensor
-    values – so the full masking path is captured inside CUDA graphs.
+    Handles both vLLM V0 (single metadata object) and V1 (dict of per-layer
+    metadata).  Uses ``seq_lens`` from the attention metadata to correctly
+    identify the true first/last prefill token under chunked prefill.
 
     Args:
         positions:    (num_tokens,) – vLLM position indices.
@@ -152,52 +202,76 @@ def _compute_position_mask(
         num_tokens:   Number of tokens in this batch (tensor shape dim 0).
         attn_metadata: Optional attention metadata from ForwardContext.
     """
+    attn_metadata = _resolve_attn_metadata(attn_metadata)
     num_prefill_tokens = getattr(attn_metadata, "num_prefill_tokens", None)
 
     if position == "prefill":
-        # HF BaseAdapter.forward() skips decode tokens (seq_len == 1) for
-        # non-"all" positions.  Match that: apply only to prefill tokens.
-        #
-        # vLLM V1 reorders batches so decode tokens come FIRST and prefill
-        # tokens come LAST.  num_prefill_tokens counts the tokens at the
-        # END of the batch, so the prefill region is
-        # [num_tokens - num_prefill_tokens, num_tokens).
         if num_prefill_tokens is not None:
             num_decode_tokens = num_tokens - num_prefill_tokens
             token_idx = torch.arange(num_tokens, device=positions.device)
             return (token_idx >= num_decode_tokens).to(dtype)
         else:
-            # Fallback: all tokens at position 0 → we are in a prefill pass.
             gate = (positions[0:1] == 0).to(dtype)
             return gate.expand(num_tokens)
 
     if position == "first":
-        mask = (positions == 0).to(dtype)
         if num_prefill_tokens is not None:
             num_decode_tokens = num_tokens - num_prefill_tokens
-            token_idx = torch.arange(num_tokens, device=positions.device)
-            prefill_mask = (token_idx >= num_decode_tokens).to(dtype)
-            mask = mask * prefill_mask
+            # position == 0 only appears in the very first chunk of a
+            # request, so a simple check is sufficient — no seq_lens needed.
+            full_mask = torch.zeros(num_tokens, device=positions.device,
+                                    dtype=dtype)
+            if num_prefill_tokens > 0:
+                prefill_positions = positions[num_decode_tokens:]
+                full_mask[num_decode_tokens:] = (prefill_positions == 0).to(dtype)
+            return full_mask
         else:
             in_prefill = (positions[0:1] == 0).to(dtype)
-            mask = mask * in_prefill
-        return mask
+            return (positions == 0).to(dtype) * in_prefill
 
     if position == "last":
         if num_prefill_tokens is not None:
             num_decode_tokens = num_tokens - num_prefill_tokens
-            token_idx = torch.arange(num_tokens, device=positions.device)
-            prefill_mask = (token_idx >= num_decode_tokens).to(dtype)
-            next_prefill = torch.zeros_like(prefill_mask)
-            next_prefill[:-1] = prefill_mask[1:]
-            next_is_new_seq = torch.zeros_like(prefill_mask)
-            next_is_new_seq[:-1] = (positions[1:] == 0).to(dtype)
-            is_last = prefill_mask * ((1.0 - next_prefill) + next_is_new_seq)
-            is_last = torch.clamp(is_last, max=1.0)
-            is_last[-1] = prefill_mask[-1]
-            return is_last
+            full_mask = torch.zeros(num_tokens, device=positions.device,
+                                    dtype=dtype)
+            if num_prefill_tokens == 0:
+                return full_mask
+
+            prefill_positions = positions[num_decode_tokens:]  # (P,)
+            num_decodes = getattr(attn_metadata, "num_decodes", 0)
+            num_prefills = getattr(attn_metadata, "num_prefills", 0)
+            query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+
+            # --- Identify the last token of each request's query span ---
+            req_idx = _prefill_request_indices(
+                num_prefill_tokens, num_decodes, num_prefills,
+                query_start_loc, prefill_positions)
+
+            # last-in-query-span: token where req_idx changes or final token
+            is_last_in_span = torch.zeros(num_prefill_tokens,
+                                          device=positions.device, dtype=dtype)
+            if num_prefill_tokens > 1:
+                is_last_in_span[:-1] = (
+                    req_idx[1:] != req_idx[:-1]).to(dtype)
+            is_last_in_span[-1] = 1.0
+
+            # --- Filter to only true last prefill tokens ---
+            seq_lens = getattr(attn_metadata, "seq_lens", None)
+            if seq_lens is not None and num_decodes is not None:
+                # seq_lens is ordered [decode_reqs..., prefill_reqs...]
+                prefill_seq_lens = seq_lens[num_decodes:]
+                expected_last_pos = prefill_seq_lens[req_idx] - 1
+                is_true_last = (
+                    prefill_positions == expected_last_pos).to(dtype)
+                full_mask[num_decode_tokens:] = (
+                    is_last_in_span * is_true_last)
+            else:
+                # No seq_lens available — fall back to last-in-span only.
+                full_mask[num_decode_tokens:] = is_last_in_span
+
+            return full_mask
         else:
-            # Fallback tensor-only "last" mask.
+            # Fallback tensor-only "last" mask (no prefill/decode split info).
             is_last = torch.zeros_like(positions, dtype=dtype)
             is_last[-1] = 1.0
             next_is_zero = (torch.roll(positions, -1) == 0).to(dtype)
@@ -243,7 +317,8 @@ def _maybe_log_mask_debug(
     if num_tokens == 0:
         return
 
-    num_prefill_tokens = getattr(attn_metadata, "num_prefill_tokens", None)
+    resolved_meta = _resolve_attn_metadata(attn_metadata)
+    num_prefill_tokens = getattr(resolved_meta, "num_prefill_tokens", None)
     if num_prefill_tokens is None:
         first_is_prefill = bool((positions[:1] == 0).all().item())
         prefill_tokens = num_tokens if first_is_prefill else 0
@@ -426,7 +501,8 @@ def _record_mask_debug_stats(
     else:
         masked_tokens = (mask.to(device=stats_device) > 0).to(torch.int64).sum()
 
-    num_prefill_tokens = getattr(attn_metadata, "num_prefill_tokens", None)
+    resolved_meta = _resolve_attn_metadata(attn_metadata)
+    num_prefill_tokens = getattr(resolved_meta, "num_prefill_tokens", None)
     if num_prefill_tokens is not None:
         prefill_tokens = torch.tensor(int(num_prefill_tokens), dtype=torch.int64, device=stats_device)
         prefill_tokens = torch.minimum(prefill_tokens, num_tokens)
