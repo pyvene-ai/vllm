@@ -556,8 +556,9 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
                 if model_dtype is None:
                     model_dtype = torch.bfloat16
-                adapter_copy = copy.deepcopy(source).to(
-                    device=dev, dtype=model_dtype)
+                adapter_copy = copy.deepcopy(source).to(dev)
+                if hasattr(adapter_copy, "learned_source"):
+                    adapter_copy.learned_source.to(dtype=model_dtype)
 
                 # Install CUDA-graph-safe caches via the adapter's own protocol.
                 _install_adapter_caches(adapter_copy, model_dtype=model_dtype)
@@ -685,18 +686,20 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                     dev = torch.device("cuda" if torch.cuda.is_available()
                                        else "cpu")
                 source = per_layer_adapters.get(layer_idx, sample_adapter)
-                # Cast to model dtype (bfloat16) so learned_source and
-                # matmuls don't allocate float32 temporaries during CUDA
-                # graph capture.  _apply override keeps rotate_layer in
-                # float32 for numerical precision.
                 llama_config = getattr(vllm_config, "model_config", vllm_config)
                 hf_config = getattr(llama_config, "hf_config",
                                     getattr(llama_config, "config", config))
                 model_dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
                 if model_dtype is None:
                     model_dtype = torch.bfloat16
-                adapter_copy = copy.deepcopy(source).to(
-                    device=dev, dtype=model_dtype)
+                # Move to device only (not dtype) — rotate_layer's
+                # Householder parametrization requires all-float32.
+                adapter_copy = copy.deepcopy(source).to(dev)
+                # Cast learned_source to model dtype so nn.Linear
+                # forward doesn't allocate float32 temporaries during
+                # CUDA graph capture.
+                if hasattr(adapter_copy, "learned_source"):
+                    adapter_copy.learned_source.to(dtype=model_dtype)
 
                 _install_adapter_caches(adapter_copy, model_dtype=model_dtype)
                 _init_reft_debug_buffers(self, dev)
