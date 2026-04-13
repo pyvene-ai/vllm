@@ -621,25 +621,6 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 delta, positions, reft_position,
                 hidden_states.dtype, positions.shape[0], attn_metadata,
             )
-            _maybe_log_mask_debug(
-                arch="qwen2",
-                layer_idx=self._reft_layer_idx,
-                position=reft_position,
-                positions=positions,
-                mask=mask,
-                attn_metadata=attn_metadata,
-            )
-            _record_mask_debug_stats(
-                self,
-                delta=delta,
-                hidden_states=h_full,
-                mask=mask,
-                positions=positions,
-                attn_metadata=attn_metadata,
-            )
-            _capture_last_token(
-                self, h_full=h_full, delta=delta, mask=mask,
-            )
 
             hidden_states = hidden_states + delta
             return hidden_states, residual
@@ -753,25 +734,6 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             delta, mask = _apply_position_mask(
                 delta, positions, reft_position,
                 hidden_states.dtype, positions.shape[0], attn_metadata,
-            )
-            _maybe_log_mask_debug(
-                arch="llama",
-                layer_idx=self._reft_layer_idx,
-                position=reft_position,
-                positions=positions,
-                mask=mask,
-                attn_metadata=attn_metadata,
-            )
-            _record_mask_debug_stats(
-                self,
-                delta=delta,
-                hidden_states=h_full,
-                mask=mask,
-                positions=positions,
-                attn_metadata=attn_metadata,
-            )
-            _capture_last_token(
-                self, h_full=h_full, delta=delta, mask=mask,
             )
 
             hidden_states = hidden_states + delta
