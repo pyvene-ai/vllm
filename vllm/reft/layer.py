@@ -146,6 +146,64 @@ def _resolve_attn_metadata(attn_metadata):
     return attn_metadata
 
 
+def _get_prefill_info(attn_metadata) -> tuple[
+    Optional[int], int, int, Optional[torch.Tensor], Optional[torch.Tensor]
+]:
+    """Extract prefill/decode split info from any V1 attention metadata.
+
+    Returns (num_prefill_tokens, num_decodes, num_prefills,
+             query_start_loc, seq_lens).
+
+    Works with both FlashInfer (has explicit num_prefill_tokens) and
+    Flash Attention (only has query_start_loc, need to derive the split).
+    """
+    # --- Try explicit fields first (FlashInfer) ---
+    num_prefill_tokens = getattr(attn_metadata, "num_prefill_tokens", None)
+    num_decodes = getattr(attn_metadata, "num_decodes", None)
+    num_prefills = getattr(attn_metadata, "num_prefills", None)
+    query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+    seq_lens = getattr(attn_metadata, "seq_lens", None)
+
+    if num_prefill_tokens is not None:
+        # FlashInfer or similar backend with explicit split info
+        if num_decodes is None:
+            num_decodes = 0
+        if num_prefills is None:
+            num_prefills = 0
+        return (int(num_prefill_tokens), int(num_decodes), int(num_prefills),
+                query_start_loc, seq_lens)
+
+    # --- Derive from query_start_loc (Flash Attention and others) ---
+    if query_start_loc is not None and query_start_loc.numel() > 1:
+        # query_start_loc: (num_reqs + 1,) cumulative query token counts.
+        # In V1, decode requests (query_len=1) come FIRST, then prefill
+        # requests (query_len>1).
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]  # (num_reqs,)
+        is_prefill = (query_lens > 1)
+        num_reqs = query_lens.numel()
+
+        # Since decodes come first and prefills last, find the split point.
+        # The first prefill request is where query_len > 1 first appears.
+        if is_prefill.any():
+            # All decode requests have query_len=1 and come first.
+            first_prefill_idx = int(is_prefill.to(torch.int32).argmax().item())
+            n_decodes = first_prefill_idx
+            n_prefills = num_reqs - n_decodes
+            n_prefill_tokens = int(
+                (query_start_loc[-1] - query_start_loc[n_decodes]).item())
+        else:
+            # All decode, no prefill
+            n_decodes = num_reqs
+            n_prefills = 0
+            n_prefill_tokens = 0
+
+        return (n_prefill_tokens, n_decodes, n_prefills,
+                query_start_loc, seq_lens)
+
+    # No usable metadata
+    return (None, 0, 0, None, seq_lens)
+
+
 def _prefill_request_indices(
     num_prefill_tokens: int,
     num_decodes: int,
@@ -192,18 +250,16 @@ def _compute_position_mask(
     """Return the per-token ReFT mask, or ``None`` for unconditional apply.
 
     Handles both vLLM V0 (single metadata object) and V1 (dict of per-layer
-    metadata).  Uses ``seq_lens`` from the attention metadata to correctly
-    identify the true first/last prefill token under chunked prefill.
+    metadata).  Works with any V1 attention backend (FlashInfer, Flash
+    Attention, etc.) by deriving the prefill/decode split from
+    ``query_start_loc`` when explicit fields are absent.
 
-    Args:
-        positions:    (num_tokens,) – vLLM position indices.
-        position:     "prefill" | "first" | "last".
-        dtype:        Hidden-state dtype used for mask scalars.
-        num_tokens:   Number of tokens in this batch (tensor shape dim 0).
-        attn_metadata: Optional attention metadata from ForwardContext.
+    Uses ``seq_lens`` to correctly identify the true first/last prefill
+    token under chunked prefill.
     """
     attn_metadata = _resolve_attn_metadata(attn_metadata)
-    num_prefill_tokens = getattr(attn_metadata, "num_prefill_tokens", None)
+    (num_prefill_tokens, num_decodes, num_prefills,
+     query_start_loc, seq_lens) = _get_prefill_info(attn_metadata)
 
     if position == "prefill":
         if num_prefill_tokens is not None:
@@ -238,9 +294,6 @@ def _compute_position_mask(
                 return full_mask
 
             prefill_positions = positions[num_decode_tokens:]  # (P,)
-            num_decodes = getattr(attn_metadata, "num_decodes", 0)
-            num_prefills = getattr(attn_metadata, "num_prefills", 0)
-            query_start_loc = getattr(attn_metadata, "query_start_loc", None)
 
             # --- Identify the last token of each request's query span ---
             req_idx = _prefill_request_indices(
@@ -256,8 +309,7 @@ def _compute_position_mask(
             is_last_in_span[-1] = 1.0
 
             # --- Filter to only true last prefill tokens ---
-            seq_lens = getattr(attn_metadata, "seq_lens", None)
-            if seq_lens is not None and num_decodes is not None:
+            if seq_lens is not None:
                 # seq_lens is ordered [decode_reqs..., prefill_reqs...]
                 prefill_seq_lens = seq_lens[num_decodes:]
                 expected_last_pos = prefill_seq_lens[req_idx] - 1
@@ -318,12 +370,12 @@ def _maybe_log_mask_debug(
         return
 
     resolved_meta = _resolve_attn_metadata(attn_metadata)
-    num_prefill_tokens = getattr(resolved_meta, "num_prefill_tokens", None)
-    if num_prefill_tokens is None:
+    npt, _, _, _, _ = _get_prefill_info(resolved_meta)
+    if npt is None:
         first_is_prefill = bool((positions[:1] == 0).all().item())
         prefill_tokens = num_tokens if first_is_prefill else 0
     else:
-        prefill_tokens = int(num_prefill_tokens)
+        prefill_tokens = int(npt)
     decode_tokens = max(0, num_tokens - prefill_tokens)
 
     if mask is None:
@@ -502,9 +554,9 @@ def _record_mask_debug_stats(
         masked_tokens = (mask.to(device=stats_device) > 0).to(torch.int64).sum()
 
     resolved_meta = _resolve_attn_metadata(attn_metadata)
-    num_prefill_tokens = getattr(resolved_meta, "num_prefill_tokens", None)
-    if num_prefill_tokens is not None:
-        prefill_tokens = torch.tensor(int(num_prefill_tokens), dtype=torch.int64, device=stats_device)
+    npt, _, _, _, _ = _get_prefill_info(resolved_meta)
+    if npt is not None:
+        prefill_tokens = torch.tensor(int(npt), dtype=torch.int64, device=stats_device)
         prefill_tokens = torch.minimum(prefill_tokens, num_tokens)
     else:
         first_is_prefill = (positions[:1].to(device=stats_device) == 0).all()
