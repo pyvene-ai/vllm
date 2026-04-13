@@ -622,7 +622,12 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 hidden_states.dtype, positions.shape[0], attn_metadata,
             )
 
-            hidden_states = hidden_states + delta
+            # Distribute (h_full + delta) across hidden_states and residual
+            # so the next layer's fused add+rmsnorm computes
+            # rmsnorm(delta + h_full) in a single addition — matching
+            # the HF path exactly without a wasted zero-add.
+            hidden_states = delta
+            residual = h_full
             return hidden_states, residual
 
         def get_reft_debug_stats(self) -> Optional[dict]:
@@ -736,7 +741,12 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 hidden_states.dtype, positions.shape[0], attn_metadata,
             )
 
-            hidden_states = hidden_states + delta
+            # Distribute (h_full + delta) across hidden_states and residual
+            # so the next layer's fused add+rmsnorm computes
+            # rmsnorm(delta + h_full) in a single addition — matching
+            # the HF path exactly without a wasted zero-add.
+            hidden_states = delta
+            residual = h_full
             return hidden_states, residual
 
         def get_reft_debug_stats(self) -> Optional[dict]:
