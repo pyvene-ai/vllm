@@ -264,23 +264,9 @@ def _blueprint_to_adapter(blueprint: dict):
     # Load trained weights if available in the blueprint.
     saved_state = blueprint.get("state_dict")
     if saved_state:
-        missing, unexpected = adapter.load_state_dict(saved_state, strict=False)
-        allowed_missing = {"_R_cache", "_w2_pinv_cache", "_w2_ridge_cache"}
-        real_missing = [k for k in missing if k not in allowed_missing]
-        if real_missing or unexpected:
-            logger.warning(
-                "Blueprint state_dict load: missing=%s unexpected=%s",
-                real_missing, unexpected,
-            )
-        else:
-            logger.debug(
-                "Blueprint state_dict loaded OK (%d keys)", len(saved_state),
-            )
-        # Refresh inference caches (e.g. _R_cache) from loaded weights.
+        adapter.load_state_dict(saved_state)
         if hasattr(adapter, "install_inference_caches"):
             adapter.install_inference_caches()
-        if hasattr(adapter, "refresh_inference_caches"):
-            adapter.refresh_inference_caches()
 
     return adapter
 
@@ -361,9 +347,9 @@ def _read_spec_file() -> Optional[dict]:
         adapters = {}
         for idx, sd in adapter_states.items():
             a = copy.deepcopy(sample)
-            a.load_state_dict(sd, strict=False)
-            if hasattr(a, "refresh_inference_caches"):
-                a.refresh_inference_caches()
+            a.load_state_dict(sd)
+            if hasattr(a, "install_inference_caches"):
+                a.install_inference_caches()
             adapters[int(idx)] = a
         spec["adapters"] = adapters
 
