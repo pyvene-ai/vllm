@@ -114,12 +114,7 @@ def _install_adapter_caches(adapter: nn.Module,
     vLLM never needs to know about specific adapter formulas.
     """
     if hasattr(adapter, "install_inference_caches"):
-        import inspect
-        sig = inspect.signature(adapter.install_inference_caches)
-        if "model_dtype" in sig.parameters:
-            adapter.install_inference_caches(model_dtype=model_dtype)
-        else:
-            adapter.install_inference_caches()
+        adapter.install_inference_caches(model_dtype=model_dtype)
 
 
 # ---------------------------------------------------------------------------
