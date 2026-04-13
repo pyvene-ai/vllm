@@ -220,7 +220,7 @@ def _apply_position_mask(
     mask = _compute_position_mask(positions, position, dtype, num_tokens, attn_metadata)
     if mask is None:
         return delta, None
-    return delta * mask.unsqueeze(-1), mask
+    return (delta * mask.unsqueeze(-1)).contiguous(), mask
 
 
 def _maybe_log_mask_debug(
@@ -349,29 +349,31 @@ def _capture_last_token(
 
     M = _CAPTURE_MAX_TOKENS
     n = h_full.shape[0]  # Python int from .shape — Dynamo-safe
-    dev = module._reft_cap_h.device
     write_n = min(n, M)
 
-    h_f = h_full[:write_n].detach().to(device=dev, dtype=torch.float32)
-    d_f = delta[:write_n].detach().to(device=dev, dtype=torch.float32)
-
-    # Zero out then write — avoids dynamic slicing on the right side
+    # Zero out then copy with implicit dtype cast — avoids allocating
+    # temporary float32 tensors which break CUDA graph capture.
     module._reft_cap_h.zero_()
     module._reft_cap_delta.zero_()
     module._reft_cap_h_norms.zero_()
     module._reft_cap_delta_norms.zero_()
 
-    module._reft_cap_h[:write_n].copy_(h_f)
-    module._reft_cap_delta[:write_n].copy_(d_f)
-    module._reft_cap_h_norms[:write_n].copy_(h_f.norm(dim=-1))
-    module._reft_cap_delta_norms[:write_n].copy_(d_f.norm(dim=-1))
+    module._reft_cap_h[:write_n].copy_(h_full[:write_n].detach())
+    module._reft_cap_delta[:write_n].copy_(delta[:write_n].detach())
+    module._reft_cap_h_norms[:write_n].copy_(
+        module._reft_cap_h[:write_n].norm(dim=-1))
+    module._reft_cap_delta_norms[:write_n].copy_(
+        module._reft_cap_delta[:write_n].norm(dim=-1))
 
     # Store token count: zero then add n as a tensor to avoid SymInt in .fill_()
     module._reft_cap_num_tokens.zero_()
-    module._reft_cap_num_tokens.add_(h_f.shape[0])
-    module._reft_cap_delta_abs_max.copy_(d_f.abs().amax())
-    module._reft_cap_h_mean_norm.copy_(h_f.norm(dim=-1).mean())
-    module._reft_cap_delta_mean_norm.copy_(d_f.norm(dim=-1).mean())
+    module._reft_cap_num_tokens.add_(write_n)
+    module._reft_cap_delta_abs_max.copy_(
+        module._reft_cap_delta[:write_n].abs().amax())
+    module._reft_cap_h_mean_norm.copy_(
+        module._reft_cap_h[:write_n].norm(dim=-1).mean())
+    module._reft_cap_delta_mean_norm.copy_(
+        module._reft_cap_delta[:write_n].norm(dim=-1).mean())
 
 
 def _init_reft_debug_buffers(module: nn.Module, device: torch.device) -> None:
