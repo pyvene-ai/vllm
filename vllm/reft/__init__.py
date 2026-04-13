@@ -27,10 +27,13 @@ Usage (from trainer code):
     # derived inference caches.
 """
 
+import logging
 import os
 import tempfile
 import threading
 from typing import Any, Optional
+
+logger = logging.getLogger("vllm.reft")
 
 __all__ = [
     "set_reft_spec",
@@ -203,13 +206,10 @@ def _adapter_to_blueprint(adapter) -> dict:
         "kwargs": kwargs,
         "state_dict": adapter_state,
     }
-    import sys
-    print(
-        f"[vllm.reft] _adapter_to_blueprint: "
-        f"{cls.__qualname__} from {cls.__module__} | "
-        f"kwargs={{{', '.join(f'{k}={v!r}' for k, v in sorted(kwargs.items()))}}} | "
-        f"state_keys={sorted(adapter_state.keys())}",
-        file=sys.stderr, flush=True,
+    logger.debug(
+        "_adapter_to_blueprint: %s from %s | kwargs=%s | state_keys=%s",
+        cls.__qualname__, cls.__module__,
+        sorted(kwargs.keys()), sorted(adapter_state.keys()),
     )
     return blueprint
 
@@ -237,7 +237,6 @@ def _blueprint_to_adapter(blueprint: dict):
     so the adapter is ready *before* CUDA graph capture / torch.compile.
     """
     import importlib
-    import sys
     import torch
 
     mod_name = blueprint["__module__"]
@@ -246,12 +245,9 @@ def _blueprint_to_adapter(blueprint: dict):
         mod_name = mod_name.replace("adaptors.", "pyreft.adapters.", 1)
     qual_name = blueprint["__qualname__"]
     has_state = "state_dict" in blueprint and blueprint["state_dict"]
-    print(
-        f"[vllm.reft] _blueprint_to_adapter: "
-        f"module={mod_name} qualname={qual_name} "
-        f"kwargs_keys={sorted(blueprint['kwargs'].keys())} "
-        f"has_state_dict={has_state}",
-        file=sys.stderr, flush=True,
+    logger.debug(
+        "_blueprint_to_adapter: module=%s qualname=%s kwargs_keys=%s has_state_dict=%s",
+        mod_name, qual_name, sorted(blueprint['kwargs'].keys()), has_state,
     )
 
     mod = importlib.import_module(mod_name)
@@ -272,16 +268,13 @@ def _blueprint_to_adapter(blueprint: dict):
         allowed_missing = {"_R_cache", "_w2_pinv_cache", "_w2_ridge_cache"}
         real_missing = [k for k in missing if k not in allowed_missing]
         if real_missing or unexpected:
-            print(
-                f"[vllm.reft] Blueprint state_dict load: "
-                f"missing={real_missing} unexpected={unexpected}",
-                file=sys.stderr, flush=True,
+            logger.warning(
+                "Blueprint state_dict load: missing=%s unexpected=%s",
+                real_missing, unexpected,
             )
         else:
-            print(
-                f"[vllm.reft] Blueprint state_dict loaded OK "
-                f"({len(saved_state)} keys)",
-                file=sys.stderr, flush=True,
+            logger.debug(
+                "Blueprint state_dict loaded OK (%d keys)", len(saved_state),
             )
         # Refresh inference caches (e.g. _R_cache) from loaded weights.
         if hasattr(adapter, "install_inference_caches"):
@@ -343,32 +336,21 @@ def _read_spec_file() -> Optional[dict]:
     # Reconstruct adapter from blueprint if this is a new-style spec file.
     adapter = spec.get("sample_adapter")
     if isinstance(adapter, dict) and adapter.get("__type__") == "AdapterBlueprint":
-        import sys
         try:
             spec["sample_adapter"] = _blueprint_to_adapter(adapter)
         except Exception as e:
-            import logging as _logging
-            _logging.getLogger(__name__).error(
-                "[vllm.reft] Failed to reconstruct adapter from blueprint: %s. "
-                "Blueprint: %s", e, adapter,
-            )
-            # Also print to stderr — logger may not be configured in worker
-            print(
-                f"[vllm.reft] CRITICAL: Blueprint adapter reconstruction FAILED: "
-                f"{type(e).__name__}: {e}\n"
-                f"  module={adapter.get('__module__')}\n"
-                f"  qualname={adapter.get('__qualname__')}\n"
-                f"  kwargs_keys={sorted(adapter.get('kwargs', {}).keys())}",
-                file=sys.stderr, flush=True,
+            logger.error(
+                "Failed to reconstruct adapter from blueprint: %s. "
+                "module=%s qualname=%s kwargs_keys=%s",
+                e, adapter.get('__module__'), adapter.get('__qualname__'),
+                sorted(adapter.get('kwargs', {}).keys()),
             )
             return None
         else:
             rebuilt = spec["sample_adapter"]
-            print(
-                f"[vllm.reft] Blueprint reconstructed OK: "
-                f"{type(rebuilt).__name__} | "
-                f"state_keys={sorted(rebuilt.state_dict().keys())}",
-                file=sys.stderr, flush=True,
+            logger.debug(
+                "Blueprint reconstructed OK: %s | state_keys=%s",
+                type(rebuilt).__name__, sorted(rebuilt.state_dict().keys()),
             )
 
     # Reconstruct per-layer adapters from saved state dicts.

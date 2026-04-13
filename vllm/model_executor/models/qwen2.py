@@ -24,6 +24,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
+import logging
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any, Optional, Union
@@ -51,6 +52,8 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import is_interleaved
+
+logger = logging.getLogger("vllm.reft")
 
 from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
@@ -596,51 +599,27 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         Called via ``collective_rpc("refresh_reft_caches")`` after TRL's
         ``sync_weights()`` pushes new adapter parameters.
         """
-        import sys
         refreshed = []
         for idx, layer in enumerate(self.model.layers):
             adapter = getattr(layer, "reft_adapter", None)
             if adapter is not None and hasattr(adapter,
                                                "refresh_inference_caches"):
-                # Print ALL adapter param fingerprints BEFORE refresh
-                if idx in (0, 12, 23):  # sample layers
+                if logger.isEnabledFor(logging.DEBUG) and idx in (0, 12, 23):
                     for pname, p in adapter.named_parameters():
                         fp = p.data.flatten()[:4].tolist()
-                        print(
-                            f"[ReFT VLLM params] layer {idx} "
-                            f"{pname}: {[f'{v:.6f}' for v in fp]}  "
-                            f"shape={list(p.shape)} dtype={p.dtype}",
-                            file=sys.stderr, flush=True,
+                        logger.debug(
+                            "[VLLM params] layer %d %s: %s shape=%s dtype=%s",
+                            idx, pname, [f'{v:.6f}' for v in fp],
+                            list(p.shape), p.dtype,
                         )
                     for bname, b in adapter.named_buffers():
                         fp = b.data.flatten()[:4].tolist()
-                        print(
-                            f"[ReFT VLLM buffer] layer {idx} "
-                            f"{bname}: {[f'{v:.6f}' for v in fp]}  "
-                            f"shape={list(b.shape)} dtype={b.dtype}",
-                            file=sys.stderr, flush=True,
+                        logger.debug(
+                            "[VLLM buffer] layer %d %s: %s shape=%s dtype=%s",
+                            idx, bname, [f'{v:.6f}' for v in fp],
+                            list(b.shape), b.dtype,
                         )
-                # Snapshot R_cache fingerprint before refresh
-                r_before_fp = None
-                if hasattr(adapter, "_R_cache"):
-                    flat = adapter._R_cache.data.flatten()
-                    r_before_fp = flat[:8].tolist()
                 adapter.refresh_inference_caches()
-                r_after_fp = None
-                if hasattr(adapter, "_R_cache"):
-                    flat = adapter._R_cache.data.flatten()
-                    r_after_fp = flat[:8].tolist()
                 refreshed.append(idx)
-                if r_before_fp is not None:
-                    changed = r_before_fp != r_after_fp
-                    print(
-                        f"[ReFT cache refresh] layer {idx}: "
-                        f"{'CHANGED' if changed else 'same'} "
-                        f"(first vals: {[f'{v:.6f}' for v in r_after_fp[:4]]})",
-                        file=sys.stderr, flush=True,
-                    )
-        print(
-            f"[ReFT cache refresh] refreshed {len(refreshed)} adapters: {refreshed}",
-            file=sys.stderr, flush=True,
-        )
+        logger.debug("Refreshed %d ReFT adapter caches: %s", len(refreshed), refreshed)
 
