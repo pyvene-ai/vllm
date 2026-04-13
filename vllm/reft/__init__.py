@@ -359,9 +359,20 @@ def _read_spec_file() -> Optional[dict]:
     if adapter_states is not None and sample is not None:
         import copy
         adapters = {}
+        allowed_missing = {"_R_cache", "_w2_pinv_cache", "_w2_ridge_cache"}
         for idx, sd in adapter_states.items():
             a = copy.deepcopy(sample)
-            a.load_state_dict(sd)
+            missing, unexpected = a.load_state_dict(sd, strict=False)
+            real_missing = [k for k in missing if k not in allowed_missing]
+            if real_missing or unexpected:
+                logger.warning(
+                    "adapter_states[%s] load: missing=%s unexpected=%s",
+                    idx, real_missing, unexpected,
+                )
+            if hasattr(a, "install_inference_caches"):
+                a.install_inference_caches()
+            if hasattr(a, "refresh_inference_caches"):
+                a.refresh_inference_caches()
             adapters[int(idx)] = a
         spec["adapters"] = adapters
 
