@@ -103,7 +103,8 @@ def _maybe_log_reft_layer_init(
 # Graph-safe cache helpers (mirrors vllm_config/vllm_reft_layer.py)
 # ---------------------------------------------------------------------------
 
-def _install_adapter_caches(adapter: nn.Module) -> None:
+def _install_adapter_caches(adapter: nn.Module,
+                            model_dtype: torch.dtype = torch.bfloat16) -> None:
     """Install inference caches on an adapter via the standard protocol.
 
     Calls ``adapter.install_inference_caches()`` if the method exists.
@@ -113,7 +114,12 @@ def _install_adapter_caches(adapter: nn.Module) -> None:
     vLLM never needs to know about specific adapter formulas.
     """
     if hasattr(adapter, "install_inference_caches"):
-        adapter.install_inference_caches()
+        import inspect
+        sig = inspect.signature(adapter.install_inference_caches)
+        if "model_dtype" in sig.parameters:
+            adapter.install_inference_caches(model_dtype=model_dtype)
+        else:
+            adapter.install_inference_caches()
 
 
 # ---------------------------------------------------------------------------
@@ -550,10 +556,16 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 # Use per-layer adapter when available to preserve the correct
                 # parametrization base buffer; fall back to sample_adapter.
                 source = per_layer_adapters.get(layer_idx, sample_adapter)
-                adapter_copy = copy.deepcopy(source).to(dev)
+                # Cast to model dtype so linear layers and matmuls don't
+                # allocate temporaries during CUDA graph capture.
+                model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
+                if model_dtype is None:
+                    model_dtype = torch.bfloat16
+                adapter_copy = copy.deepcopy(source).to(
+                    device=dev, dtype=model_dtype)
 
                 # Install CUDA-graph-safe caches via the adapter's own protocol.
-                _install_adapter_caches(adapter_copy)
+                _install_adapter_caches(adapter_copy, model_dtype=model_dtype)
                 _init_reft_debug_buffers(self, dev)
                 hidden_size = getattr(config, "hidden_size", 896)
                 _init_reft_capture_buffers(self, hidden_size, dev)
@@ -678,13 +690,21 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                     dev = torch.device("cuda" if torch.cuda.is_available()
                                        else "cpu")
                 source = per_layer_adapters.get(layer_idx, sample_adapter)
-                adapter_copy = copy.deepcopy(source).to(dev)
-
-                _install_adapter_caches(adapter_copy)
-                _init_reft_debug_buffers(self, dev)
+                # Cast to model dtype (bfloat16) so learned_source and
+                # matmuls don't allocate float32 temporaries during CUDA
+                # graph capture.  _apply override keeps rotate_layer in
+                # float32 for numerical precision.
                 llama_config = getattr(vllm_config, "model_config", vllm_config)
                 hf_config = getattr(llama_config, "hf_config",
                                     getattr(llama_config, "config", config))
+                model_dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
+                if model_dtype is None:
+                    model_dtype = torch.bfloat16
+                adapter_copy = copy.deepcopy(source).to(
+                    device=dev, dtype=model_dtype)
+
+                _install_adapter_caches(adapter_copy, model_dtype=model_dtype)
+                _init_reft_debug_buffers(self, dev)
                 hidden_size = getattr(hf_config, "hidden_size", 4096)
                 _init_reft_capture_buffers(self, hidden_size, dev)
 
