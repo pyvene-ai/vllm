@@ -365,6 +365,15 @@ def _reft_apply_position_mask_op(
     num_tokens: int,
 ) -> torch.Tensor:
     """Custom op: apply ReFT position mask using live attn_metadata."""
+    # FULL CUDA graph capture is used for decode-only batches. During
+    # capture we cannot inspect attn_metadata (CPU syncs are illegal).
+    # Decode-only means no prefill tokens, so "prefill"/"first"/"last"
+    # masks are all zeros; "all" passes through unchanged.
+    if torch.cuda.is_current_stream_capturing():
+        if position == "all":
+            return delta
+        return torch.zeros_like(delta)
+
     from vllm.forward_context import get_forward_context
     forward_context = get_forward_context()
     attn_metadata = forward_context.attn_metadata
