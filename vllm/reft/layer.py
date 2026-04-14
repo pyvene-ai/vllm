@@ -146,7 +146,6 @@ def _resolve_attn_metadata(attn_metadata):
     return attn_metadata
 
 
-@torch.compiler.disable
 def _get_prefill_info(attn_metadata) -> tuple[
     Optional[int], int, int, Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -241,7 +240,6 @@ def _prefill_request_indices(
     return is_boundary.cumsum(0)
 
 
-@torch.compiler.disable
 def _compute_position_mask(
     positions: torch.Tensor,
     position: str,
@@ -337,7 +335,6 @@ def _compute_position_mask(
     return None
 
 
-@torch.compiler.disable
 def _apply_position_mask(
     delta: torch.Tensor,
     positions: torch.Tensor,
@@ -351,6 +348,61 @@ def _apply_position_mask(
     if mask is None:
         return delta, None
     return (delta * mask.unsqueeze(-1)).contiguous(), mask
+
+
+# ---------------------------------------------------------------------------
+# Custom op for position masking (Dynamo splitting op)
+# ---------------------------------------------------------------------------
+# Registered as a vLLM custom op so TorchDynamo's piecewise compilation
+# treats it as a graph break.  All Python control flow in
+# _compute_position_mask / _get_prefill_info runs eagerly inside the op,
+# avoiding the issue where Dynamo bakes in the wrong branch at trace time.
+
+def _reft_apply_position_mask_op(
+    delta: torch.Tensor,
+    positions: torch.Tensor,
+    position: str,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Custom op: apply ReFT position mask using live attn_metadata."""
+    from vllm.forward_context import get_forward_context
+    forward_context = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    mask = _compute_position_mask(
+        positions, position, delta.dtype, num_tokens, attn_metadata)
+    if mask is None:
+        return delta
+    return (delta * mask.unsqueeze(-1)).contiguous()
+
+
+def _reft_apply_position_mask_fake(
+    delta: torch.Tensor,
+    positions: torch.Tensor,
+    position: str,
+    num_tokens: int,
+) -> torch.Tensor:
+    return torch.empty_like(delta).contiguous()
+
+
+try:
+    from vllm.utils import direct_register_custom_op
+    try:
+        _tag_cudagraph_unsafe = (torch._C.Tag.cudagraph_unsafe,)
+    except AttributeError:
+        _tag_cudagraph_unsafe = ()
+
+    direct_register_custom_op(
+        op_name="reft_apply_position_mask",
+        op_func=_reft_apply_position_mask_op,
+        fake_impl=_reft_apply_position_mask_fake,
+        tags=_tag_cudagraph_unsafe,
+    )
+    _REFT_CUSTOM_OP_AVAILABLE = True
+except Exception:
+    _REFT_CUSTOM_OP_AVAILABLE = False
+    logger.warning(
+        "[ReFT-vLLM] Failed to register reft_apply_position_mask custom op. "
+        "Compilation (level>=3) may miscompile position masking.")
 
 
 def _maybe_log_mask_debug(
@@ -743,13 +795,17 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
             delta = adapter._compute_delta(
                 h_full.unsqueeze(0)).squeeze(0)  # (n, H)
 
-            ctx = get_forward_context()
-            attn_metadata = getattr(ctx, "attn_metadata", None)
             reft_position = self._reft_position
-            delta, mask = _apply_position_mask(
-                delta, positions, reft_position,
-                hidden_states.dtype, positions.shape[0], attn_metadata,
-            )
+            if _REFT_CUSTOM_OP_AVAILABLE:
+                delta = torch.ops.vllm.reft_apply_position_mask(
+                    delta, positions, reft_position, positions.shape[0])
+            else:
+                ctx = get_forward_context()
+                attn_metadata = getattr(ctx, "attn_metadata", None)
+                delta, _mask = _apply_position_mask(
+                    delta, positions, reft_position,
+                    hidden_states.dtype, positions.shape[0], attn_metadata,
+                )
 
             hidden_states = delta
             residual = h_full
@@ -858,13 +914,17 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             delta = adapter._compute_delta(
                 h_full.unsqueeze(0)).squeeze(0)
 
-            ctx = get_forward_context()
-            attn_metadata = getattr(ctx, "attn_metadata", None)
             reft_position = self._reft_position
-            delta, mask = _apply_position_mask(
-                delta, positions, reft_position,
-                hidden_states.dtype, positions.shape[0], attn_metadata,
-            )
+            if _REFT_CUSTOM_OP_AVAILABLE:
+                delta = torch.ops.vllm.reft_apply_position_mask(
+                    delta, positions, reft_position, positions.shape[0])
+            else:
+                ctx = get_forward_context()
+                attn_metadata = getattr(ctx, "attn_metadata", None)
+                delta, _mask = _apply_position_mask(
+                    delta, positions, reft_position,
+                    hidden_states.dtype, positions.shape[0], attn_metadata,
+                )
 
             hidden_states = delta
             residual = h_full
