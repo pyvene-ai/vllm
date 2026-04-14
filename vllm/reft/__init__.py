@@ -137,10 +137,6 @@ def set_reft_spec(spec: Optional[dict[str, Any]]) -> None:
     """**Deprecated.** Use ``LLM(model=..., reft_config=spec_to_reft_config(spec))``
     and let VllmConfig carry the config to model constructors instead.
     """
-    warnings.warn(
-        "set_reft_spec() is deprecated. Pass reft_config= to LLM() instead.",
-        DeprecationWarning, stacklevel=2,
-    )
     _reft_spec_local.spec = spec
     if spec is not None:
         _write_spec_file(spec)
@@ -163,10 +159,6 @@ def get_reft_spec() -> Optional[dict[str, Any]]:
 
 def clear_reft_spec() -> None:
     """**Deprecated.** No longer needed when using VllmConfig.reft_config."""
-    warnings.warn(
-        "clear_reft_spec() is deprecated. Use VllmConfig.reft_config instead.",
-        DeprecationWarning, stacklevel=2,
-    )
     _reft_spec_local.spec = None
     _remove_spec_file()
 
