@@ -361,6 +361,7 @@ class CompilationConfig:
         "vllm.plamo2_mamba_mixer",
         "vllm.gdn_attention",
         "vllm.sparse_attn_indexer",
+        "vllm.reft_apply_position_mask",
     ]
 
     def compute_hash(self) -> str:
