@@ -48,6 +48,41 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 _reft_mask_debug_counts: dict[tuple[str, int, str, str], int] = {}
 _reft_init_debug_count = 0
+_reft_nan_check_enabled: Optional[bool] = None
+
+
+def _nan_check_enabled() -> bool:
+    """Return True if VLLM_REFT_NAN_CHECK=1 is set."""
+    global _reft_nan_check_enabled
+    if _reft_nan_check_enabled is None:
+        _reft_nan_check_enabled = os.environ.get(
+            "VLLM_REFT_NAN_CHECK", "").lower() in {"1", "true", "yes"}
+    return _reft_nan_check_enabled
+
+
+def _check_nan(tensor: torch.Tensor, label: str, layer_idx: int) -> bool:
+    """If tensor has NaN/Inf, log details and return True."""
+    if not _nan_check_enabled():
+        return False
+    has_nan = torch.isnan(tensor).any().item()
+    has_inf = torch.isinf(tensor).any().item()
+    if has_nan or has_inf:
+        num_nan = torch.isnan(tensor).sum().item()
+        num_inf = torch.isinf(tensor).sum().item()
+        total = tensor.numel()
+        logger.error(
+            "[ReFT NaN check] layer=%d label=%s has_nan=%s has_inf=%s "
+            "num_nan=%d num_inf=%d total=%d shape=%s dtype=%s "
+            "abs_max=%.6g abs_mean=%.6g",
+            layer_idx, label, has_nan, has_inf,
+            num_nan, num_inf, total, list(tensor.shape), tensor.dtype,
+            tensor[~torch.isnan(tensor) & ~torch.isinf(tensor)].abs().max().item()
+            if (total - num_nan - num_inf) > 0 else float('nan'),
+            tensor[~torch.isnan(tensor) & ~torch.isinf(tensor)].abs().mean().item()
+            if (total - num_nan - num_inf) > 0 else float('nan'),
+        )
+        return True
+    return False
 
 
 def _reft_mask_debug_enabled() -> bool:
@@ -377,6 +412,8 @@ def _reft_apply_adapter_op(
     if adapter is None:
         return torch.zeros_like(h_full)
 
+    _check_nan(h_full, "h_full_input", layer_idx)
+
     from vllm.forward_context import get_forward_context
     attn_metadata = get_forward_context().attn_metadata
     resolved = _resolve_attn_metadata(attn_metadata)
@@ -395,8 +432,10 @@ def _reft_apply_adapter_op(
             and 0 < num_prefill_tokens < num_tokens):
         num_decode_tokens = num_tokens - num_prefill_tokens
         h_prefill = h_full[num_decode_tokens:]
+        _check_nan(h_prefill, "h_prefill_input", layer_idx)
         delta_prefill = adapter._compute_delta(
             h_prefill.unsqueeze(0)).squeeze(0)
+        _check_nan(delta_prefill, "delta_after_compute_delta(mixed)", layer_idx)
 
         if position == "prefill":
             delta = torch.zeros_like(h_full)
@@ -412,14 +451,17 @@ def _reft_apply_adapter_op(
             ).contiguous()
         delta = torch.zeros_like(h_full)
         delta[num_decode_tokens:] = delta_prefill
+        _check_nan(delta, "delta_after_mask(mixed)", layer_idx)
         return delta
 
     # Full batch (all prefill, or position="all").
     delta = adapter._compute_delta(h_full.unsqueeze(0)).squeeze(0)
+    _check_nan(delta, "delta_after_compute_delta(full)", layer_idx)
     mask = _compute_position_mask(
         positions, position, h_full.dtype, num_tokens, attn_metadata)
     if mask is not None:
         delta = (delta * mask.unsqueeze(-1)).contiguous()
+    _check_nan(delta, "delta_final(full)", layer_idx)
     return delta
 
 
@@ -838,13 +880,22 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
             hidden_states: torch.Tensor,
             residual,
         ):
+            _layer_idx = getattr(self, "_reft_layer_idx", -1)
+            _check_nan(hidden_states, "hidden_states_pre_super", _layer_idx)
+            if residual is not None:
+                _check_nan(residual, "residual_pre_super", _layer_idx)
+
             hidden_states, residual = super().forward(
                 positions, hidden_states, residual)
+
+            _check_nan(hidden_states, "hidden_states_post_super", _layer_idx)
+            _check_nan(residual, "residual_post_super", _layer_idx)
 
             if getattr(self, "reft_adapter", None) is None:
                 return hidden_states, residual
 
             h_full = hidden_states + residual
+            _check_nan(h_full, "h_full", _layer_idx)
 
             if _REFT_CUSTOM_OP_AVAILABLE:
                 delta = torch.ops.vllm.reft_apply_adapter(
@@ -853,6 +904,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
             else:
                 delta = self.reft_adapter._compute_delta(
                     h_full.unsqueeze(0)).squeeze(0)
+                _check_nan(delta, "delta_after_compute_delta(fallback)", _layer_idx)
                 ctx = get_forward_context()
                 attn_metadata = getattr(ctx, "attn_metadata", None)
                 delta, _mask = _apply_position_mask(
@@ -860,6 +912,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                     hidden_states.dtype, positions.shape[0], attn_metadata,
                 )
 
+            _check_nan(delta, "delta_final", _layer_idx)
             hidden_states = delta
             residual = h_full
             return hidden_states, residual
@@ -957,13 +1010,22 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             hidden_states: torch.Tensor,
             residual,
         ):
+            _layer_idx = getattr(self, "_reft_layer_idx", -1)
+            _check_nan(hidden_states, "hidden_states_pre_super", _layer_idx)
+            if residual is not None:
+                _check_nan(residual, "residual_pre_super", _layer_idx)
+
             hidden_states, residual = super().forward(
                 positions, hidden_states, residual)
+
+            _check_nan(hidden_states, "hidden_states_post_super", _layer_idx)
+            _check_nan(residual, "residual_post_super", _layer_idx)
 
             if getattr(self, "reft_adapter", None) is None:
                 return hidden_states, residual
 
             h_full = hidden_states + residual
+            _check_nan(h_full, "h_full", _layer_idx)
 
             if _REFT_CUSTOM_OP_AVAILABLE:
                 delta = torch.ops.vllm.reft_apply_adapter(
@@ -972,6 +1034,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             else:
                 delta = self.reft_adapter._compute_delta(
                     h_full.unsqueeze(0)).squeeze(0)
+                _check_nan(delta, "delta_after_compute_delta(fallback)", _layer_idx)
                 ctx = get_forward_context()
                 attn_metadata = getattr(ctx, "attn_metadata", None)
                 delta, _mask = _apply_position_mask(
@@ -979,6 +1042,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                     hidden_states.dtype, positions.shape[0], attn_metadata,
                 )
 
+            _check_nan(delta, "delta_final", _layer_idx)
             hidden_states = delta
             residual = h_full
             return hidden_states, residual
