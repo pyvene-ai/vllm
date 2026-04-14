@@ -146,6 +146,7 @@ def _resolve_attn_metadata(attn_metadata):
     return attn_metadata
 
 
+@torch.compiler.disable
 def _get_prefill_info(attn_metadata) -> tuple[
     Optional[int], int, int, Optional[torch.Tensor], Optional[torch.Tensor]
 ]:
@@ -240,6 +241,7 @@ def _prefill_request_indices(
     return is_boundary.cumsum(0)
 
 
+@torch.compiler.disable
 def _compute_position_mask(
     positions: torch.Tensor,
     position: str,
@@ -335,6 +337,7 @@ def _compute_position_mask(
     return None
 
 
+@torch.compiler.disable
 def _apply_position_mask(
     delta: torch.Tensor,
     positions: torch.Tensor,
@@ -732,8 +735,6 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
             hidden_states, residual = super().forward(
                 positions, hidden_states, residual)
 
-            # Use normal attribute lookup here so TorchDynamo can trace the
-            # forward path; explicit object.__getattribute__ is unsupported.
             adapter = getattr(self, "reft_adapter", None)
             if adapter is None:
                 return hidden_states, residual
@@ -750,10 +751,6 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 hidden_states.dtype, positions.shape[0], attn_metadata,
             )
 
-            # Distribute (h_full + delta) across hidden_states and residual
-            # so the next layer's fused add+rmsnorm computes
-            # rmsnorm(delta + h_full) in a single addition — matching
-            # the HF path exactly without a wasted zero-add.
             hidden_states = delta
             residual = h_full
             return hidden_states, residual
@@ -869,10 +866,6 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 hidden_states.dtype, positions.shape[0], attn_metadata,
             )
 
-            # Distribute (h_full + delta) across hidden_states and residual
-            # so the next layer's fused add+rmsnorm computes
-            # rmsnorm(delta + h_full) in a single addition — matching
-            # the HF path exactly without a wasted zero-add.
             hidden_states = delta
             residual = h_full
             return hidden_states, residual
