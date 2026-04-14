@@ -447,12 +447,15 @@ try:
         tags=_tag_cudagraph_unsafe,
     )
     _REFT_CUSTOM_OP_AVAILABLE = True
-except Exception:
+    logger.info("[ReFT-vLLM] Registered reft_apply_adapter custom op (cudagraph_unsafe)")
+except Exception as e:
     _REFT_CUSTOM_OP_AVAILABLE = False
+    logger.warning("[ReFT-vLLM] Failed to register reft_apply_adapter custom op: %s", e)
 
 # Allow disabling the custom op for debugging.
 if os.environ.get("VLLM_REFT_NO_CUSTOM_OP", "").lower() in {"1", "true", "yes"}:
     _REFT_CUSTOM_OP_AVAILABLE = False
+    logger.info("[ReFT-vLLM] Custom op disabled via VLLM_REFT_NO_CUSTOM_OP")
 
 
 def _maybe_log_mask_debug(
