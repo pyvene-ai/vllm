@@ -469,11 +469,15 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
 
         self.quant_config = quant_config
 
-        # If a ReFT spec was registered via vllm.reft.set_reft_spec(), use
-        # ReFT-aware decoder layers so CUDA graphs capture the adapter path.
-        from vllm.reft import get_reft_spec
+        # If reft_config is set on VllmConfig, use ReFT-aware decoder layers
+        # so CUDA graphs capture the adapter path.  Falls back to the
+        # deprecated get_reft_spec() for TRL training hooks that set global state.
+        from vllm.reft import reft_config_to_spec, get_reft_spec
         from vllm.reft.layer import make_reft_qwen2_layer
-        reft_spec = get_reft_spec()
+        reft_spec = reft_config_to_spec(
+            getattr(vllm_config, "reft_config", None))
+        if reft_spec is None:
+            reft_spec = get_reft_spec()
         decoder_layer_type = (make_reft_qwen2_layer(reft_spec)
                               if reft_spec is not None else Qwen2DecoderLayer)
 

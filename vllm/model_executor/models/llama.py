@@ -534,13 +534,17 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         self.config = config
         self.lora_config = lora_config
 
-        # If a ReFT spec was registered via vllm.reft.set_reft_spec(), use
-        # ReFT-aware decoder layers so CUDA graphs capture the adapter path.
+        # If reft_config is set on VllmConfig, use ReFT-aware decoder layers
+        # so CUDA graphs capture the adapter path.  Falls back to the
+        # deprecated get_reft_spec() for TRL training hooks that set global state.
         # The caller-supplied layer_type takes precedence (e.g. Eagle3 draft).
         if layer_type is LlamaDecoderLayer:
-            from vllm.reft import get_reft_spec
+            from vllm.reft import reft_config_to_spec, get_reft_spec
             from vllm.reft.layer import make_reft_llama_layer
-            reft_spec = get_reft_spec()
+            reft_spec = reft_config_to_spec(
+                getattr(vllm_config, "reft_config", None))
+            if reft_spec is None:
+                reft_spec = get_reft_spec()
             if reft_spec is not None:
                 layer_type = make_reft_llama_layer(reft_spec)
 

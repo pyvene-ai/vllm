@@ -136,6 +136,10 @@ class VllmConfig:
     """The configurations for distributed KV cache transfer."""
     kv_events_config: Optional[KVEventsConfig] = None
     """The configurations for event publishing."""
+    reft_config: Optional[dict] = None
+    """ReFT adapter configuration. Serializable blueprint dict that flows
+    through LLM() → EngineArgs → VllmConfig → model constructors, replacing
+    the old set_reft_spec() global-state pattern. Multiprocess-safe."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.

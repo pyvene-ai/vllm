@@ -2,29 +2,27 @@
 
 This package owns everything required to run ReFT-adapted models in vLLM:
 
-  * Thread-local spec injection so model constructors can pick up a ReFT spec
-    without the caller needing to thread it through every kwarg.
-  * Cross-process fallback via a temp file so that vLLM v1's spawn-based
-    worker processes (which do NOT inherit threading.local state) also see
-    the spec when ``Qwen2ForCausalLM.__init__`` is called in a worker.
+  * ``VllmConfig.reft_config`` — serializable blueprint dict that flows from
+    ``LLM()`` → ``EngineArgs`` → ``VllmConfig`` → model constructors.
+    Multiprocess-safe — no global state required.
+  * ``spec_to_reft_config()`` / ``reft_config_to_spec()`` — convert between
+    live reft_spec (with nn.Module adapters) and serializable config dicts.
   * ReFT-aware decoder layer factories (see layer.py).
 
-Usage (from trainer code):
-    import vllm.reft as vllm_reft
+Usage (preferred — via VllmConfig)::
 
-    vllm_reft.set_reft_spec({
-        "layer_indices": [0, 4, 8, ...],
-        "position": "prefill",          # "prefill" | "first" | "last"
-        "sample_adapter": adapter,      # nn.Module – architecture template
-    })
-    try:
-        llm = LLM(model=model_name, ...)  # model constructor reads the spec
-    finally:
-        vllm_reft.clear_reft_spec()
+    from vllm.reft import spec_to_reft_config
 
-    # Adapter weights are synced via TRL's standard sync_weights() pipeline.
-    # After sync, call llm.collective_rpc("refresh_reft_caches") to recompute
-    # derived inference caches.
+    reft_spec = reft_model.export_vllm_reft_spec()
+    llm = LLM(model=model_name, reft_config=spec_to_reft_config(reft_spec))
+
+Or simply::
+
+    llm = reft_model.build_vllm(model_name, **kwargs)
+
+The deprecated ``set_reft_spec()`` / ``clear_reft_spec()`` global-state API
+is still supported as a fallback (used by TRL training hooks) but should not
+be used in new code.
 """
 
 import logging
@@ -36,6 +34,9 @@ from typing import Any, Optional
 logger = logging.getLogger("vllm.reft")
 
 __all__ = [
+    "reft_config_to_spec",
+    "spec_to_reft_config",
+    # Deprecated global-state API (backward compat only):
     "set_reft_spec",
     "get_reft_spec",
     "clear_reft_spec",
@@ -52,25 +53,94 @@ _reft_spec_local = threading.local()
 _SPEC_FILE_ENV_KEY = "_VLLM_REFT_SPEC_FILE"
 
 
-def set_reft_spec(spec: Optional[dict[str, Any]]) -> None:
-    """Store *spec* as the active ReFT spec for this thread.
+import warnings
 
-    Must be called before the vLLM ``LLM(...)`` constructor so that model
-    constructors (``Qwen2ForCausalLM``, ``LlamaForCausalLM``, …) can read it
-    and create ReFT-aware decoder layers.
 
-    The spec is also serialised to a temporary file whose path is stored in
-    the ``_VLLM_REFT_SPEC_FILE`` environment variable.  Spawned worker
-    processes inherit env vars but not threading.local, so they can still
-    recover the spec via ``get_reft_spec()``.
+# ---------------------------------------------------------------------------
+# VllmConfig-based API (preferred — multiprocess-safe, no global state)
+# ---------------------------------------------------------------------------
 
-    spec keys:
-        layer_indices   list[int]   – which decoder layers get adapters
-        position        str         – "prefill" | "first" | "last"
-        sample_adapter  nn.Module   – one adapter instance (architecture only;
-                                      actual weights are loaded later via
-                                      ``LLM.sync_reft_state``)
+def spec_to_reft_config(reft_spec: dict[str, Any]) -> dict[str, Any]:
+    """Convert a live *reft_spec* (with nn.Module adapters) to a serializable
+    dict suitable for ``VllmConfig.reft_config``.
+
+    The result contains only plain Python types and CPU tensors, so it can be
+    pickled across processes by vLLM's multiprocessing machinery.
     """
+    config: dict[str, Any] = {}
+    config["layer_indices"] = list(reft_spec["layer_indices"])
+    config["position"] = reft_spec["position"]
+
+    # Serialize sample_adapter → blueprint
+    adapter = reft_spec.get("sample_adapter")
+    if adapter is not None and not isinstance(adapter, dict):
+        config["sample_adapter"] = _adapter_to_blueprint(adapter)
+    elif adapter is not None:
+        config["sample_adapter"] = adapter  # already a blueprint
+
+    # Serialize per-layer adapters → CPU state_dicts
+    adapters = reft_spec.get("adapters")
+    if adapters is not None:
+        config["adapter_states"] = {
+            idx: {k: v.detach().cpu() for k, v in a.state_dict().items()}
+            for idx, a in adapters.items()
+        }
+
+    # Pass through any extra keys (e.g. debug_mask)
+    for k in reft_spec:
+        if k not in ("layer_indices", "position", "sample_adapter", "adapters"):
+            config[k] = reft_spec[k]
+
+    return config
+
+
+def reft_config_to_spec(reft_config: Optional[dict[str, Any]],
+                        ) -> Optional[dict[str, Any]]:
+    """Convert a serialized ``VllmConfig.reft_config`` back into a live
+    *reft_spec* with reconstructed nn.Module adapters.
+
+    Returns ``None`` if *reft_config* is ``None``.
+    """
+    if reft_config is None:
+        return None
+
+    import copy
+
+    spec: dict[str, Any] = dict(reft_config)
+
+    # Reconstruct sample_adapter from blueprint
+    adapter = spec.get("sample_adapter")
+    if isinstance(adapter, dict) and adapter.get("__type__") == "AdapterBlueprint":
+        spec["sample_adapter"] = _blueprint_to_adapter(adapter)
+
+    # Reconstruct per-layer adapters from saved state dicts
+    adapter_states = spec.pop("adapter_states", None)
+    sample = spec.get("sample_adapter")
+    if adapter_states is not None and sample is not None:
+        adapters: dict[int, Any] = {}
+        for idx, sd in adapter_states.items():
+            a = copy.deepcopy(sample)
+            a.load_state_dict(sd)
+            if hasattr(a, "install_inference_caches"):
+                a.install_inference_caches()
+            adapters[int(idx)] = a
+        spec["adapters"] = adapters
+
+    return spec
+
+
+# ---------------------------------------------------------------------------
+# Deprecated global-state API (kept for backward compatibility)
+# ---------------------------------------------------------------------------
+
+def set_reft_spec(spec: Optional[dict[str, Any]]) -> None:
+    """**Deprecated.** Use ``LLM(model=..., reft_config=spec_to_reft_config(spec))``
+    and let VllmConfig carry the config to model constructors instead.
+    """
+    warnings.warn(
+        "set_reft_spec() is deprecated. Pass reft_config= to LLM() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     _reft_spec_local.spec = spec
     if spec is not None:
         _write_spec_file(spec)
@@ -92,7 +162,11 @@ def get_reft_spec() -> Optional[dict[str, Any]]:
 
 
 def clear_reft_spec() -> None:
-    """Clear the active ReFT spec for this thread and remove the temp file."""
+    """**Deprecated.** No longer needed when using VllmConfig.reft_config."""
+    warnings.warn(
+        "clear_reft_spec() is deprecated. Use VllmConfig.reft_config instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     _reft_spec_local.spec = None
     _remove_spec_file()
 
