@@ -351,46 +351,86 @@ def _apply_position_mask(
 
 
 # ---------------------------------------------------------------------------
-# Custom op for position masking (Dynamo splitting op)
+# Adapter registry & custom op (Dynamo splitting op)
 # ---------------------------------------------------------------------------
-# Registered as a vLLM custom op so TorchDynamo's piecewise compilation
-# treats it as a graph break.  All Python control flow in
-# _compute_position_mask / _get_prefill_info runs eagerly inside the op,
-# avoiding the issue where Dynamo bakes in the wrong branch at trace time.
+# The custom op wraps both adapter._compute_delta() AND position masking
+# in a single cudagraph_unsafe boundary.  This prevents CUDA graph capture
+# from baking in stale adapter weights — after sync_weights() updates the
+# adapter parameters, the custom op always uses the current weights.
 
-def _reft_apply_position_mask_op(
-    delta: torch.Tensor,
+_REFT_ADAPTER_REGISTRY: dict[int, nn.Module] = {}
+
+
+def _reft_apply_adapter_op(
+    h_full: torch.Tensor,
     positions: torch.Tensor,
     position: str,
     num_tokens: int,
+    layer_idx: int,
 ) -> torch.Tensor:
-    """Custom op: apply ReFT position mask using live attn_metadata."""
-    # FULL CUDA graph capture is used for decode-only batches. During
-    # capture we cannot inspect attn_metadata (CPU syncs are illegal).
-    # Decode-only means no prefill tokens, so "prefill"/"first"/"last"
-    # masks are all zeros; "all" passes through unchanged.
+    """Compute adapter delta and apply position mask (runs eagerly)."""
+    # CUDA graph capture is decode-only; ReFT is a no-op for decode tokens.
     if torch.cuda.is_current_stream_capturing():
-        if position == "all":
-            return delta
-        return torch.zeros_like(delta)
+        return torch.zeros_like(h_full)
+
+    adapter = _REFT_ADAPTER_REGISTRY.get(layer_idx)
+    if adapter is None:
+        return torch.zeros_like(h_full)
 
     from vllm.forward_context import get_forward_context
-    forward_context = get_forward_context()
-    attn_metadata = forward_context.attn_metadata
-    mask = _compute_position_mask(
-        positions, position, delta.dtype, num_tokens, attn_metadata)
-    if mask is None:
+    attn_metadata = get_forward_context().attn_metadata
+    resolved = _resolve_attn_metadata(attn_metadata)
+    (num_prefill_tokens, num_decodes, num_prefills,
+     query_start_loc, seq_lens) = _get_prefill_info(resolved)
+
+    # Pure decode batch: skip adapter entirely.
+    if (position != "all"
+            and num_prefill_tokens is not None
+            and num_prefill_tokens == 0):
+        return torch.zeros_like(h_full)
+
+    # Mixed batch: only run adapter on prefill tokens (at end of batch).
+    if (position != "all"
+            and num_prefill_tokens is not None
+            and 0 < num_prefill_tokens < num_tokens):
+        num_decode_tokens = num_tokens - num_prefill_tokens
+        h_prefill = h_full[num_decode_tokens:]
+        delta_prefill = adapter._compute_delta(
+            h_prefill.unsqueeze(0)).squeeze(0)
+
+        if position == "prefill":
+            delta = torch.zeros_like(h_full)
+            delta[num_decode_tokens:] = delta_prefill
+            return delta
+
+        # first/last: apply mask within the prefill region.
+        mask = _compute_position_mask(
+            positions, position, h_full.dtype, num_tokens, attn_metadata)
+        if mask is not None:
+            delta_prefill = (
+                delta_prefill * mask[num_decode_tokens:].unsqueeze(-1)
+            ).contiguous()
+        delta = torch.zeros_like(h_full)
+        delta[num_decode_tokens:] = delta_prefill
         return delta
-    return (delta * mask.unsqueeze(-1)).contiguous()
+
+    # Full batch (all prefill, or position="all").
+    delta = adapter._compute_delta(h_full.unsqueeze(0)).squeeze(0)
+    mask = _compute_position_mask(
+        positions, position, h_full.dtype, num_tokens, attn_metadata)
+    if mask is not None:
+        delta = (delta * mask.unsqueeze(-1)).contiguous()
+    return delta
 
 
-def _reft_apply_position_mask_fake(
-    delta: torch.Tensor,
+def _reft_apply_adapter_fake(
+    h_full: torch.Tensor,
     positions: torch.Tensor,
     position: str,
     num_tokens: int,
+    layer_idx: int,
 ) -> torch.Tensor:
-    return torch.empty_like(delta).contiguous()
+    return torch.empty_like(h_full).contiguous()
 
 
 try:
@@ -401,17 +441,18 @@ try:
         _tag_cudagraph_unsafe = ()
 
     direct_register_custom_op(
-        op_name="reft_apply_position_mask",
-        op_func=_reft_apply_position_mask_op,
-        fake_impl=_reft_apply_position_mask_fake,
+        op_name="reft_apply_adapter",
+        op_func=_reft_apply_adapter_op,
+        fake_impl=_reft_apply_adapter_fake,
         tags=_tag_cudagraph_unsafe,
     )
     _REFT_CUSTOM_OP_AVAILABLE = True
 except Exception:
     _REFT_CUSTOM_OP_AVAILABLE = False
-    logger.warning(
-        "[ReFT-vLLM] Failed to register reft_apply_position_mask custom op. "
-        "Compilation (level>=3) may miscompile position masking.")
+
+# Allow disabling the custom op for debugging.
+if os.environ.get("VLLM_REFT_NO_CUSTOM_OP", "").lower() in {"1", "true", "yes"}:
+    _REFT_CUSTOM_OP_AVAILABLE = False
 
 
 def _maybe_log_mask_debug(
@@ -765,6 +806,7 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 self.reft_adapter = adapter_copy
                 object.__setattr__(self, "_reft_layer_idx", layer_idx)
                 object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
+                _REFT_ADAPTER_REGISTRY[layer_idx] = adapter_copy
                 logger.debug(
                     "[ReFT-vLLM] Attached adapter to Qwen2 layer %d "
                     "(adapter_type=%s, has_R_cache=%s)",
@@ -796,23 +838,22 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
             hidden_states, residual = super().forward(
                 positions, hidden_states, residual)
 
-            adapter = getattr(self, "reft_adapter", None)
-            if adapter is None:
+            if getattr(self, "reft_adapter", None) is None:
                 return hidden_states, residual
 
             h_full = hidden_states + residual
-            delta = adapter._compute_delta(
-                h_full.unsqueeze(0)).squeeze(0)  # (n, H)
 
-            reft_position = self._reft_position
             if _REFT_CUSTOM_OP_AVAILABLE:
-                delta = torch.ops.vllm.reft_apply_position_mask(
-                    delta, positions, reft_position, positions.shape[0])
+                delta = torch.ops.vllm.reft_apply_adapter(
+                    h_full, positions, self._reft_position,
+                    positions.shape[0], self._reft_layer_idx)
             else:
+                delta = self.reft_adapter._compute_delta(
+                    h_full.unsqueeze(0)).squeeze(0)
                 ctx = get_forward_context()
                 attn_metadata = getattr(ctx, "attn_metadata", None)
                 delta, _mask = _apply_position_mask(
-                    delta, positions, reft_position,
+                    delta, positions, self._reft_position,
                     hidden_states.dtype, positions.shape[0], attn_metadata,
                 )
 
@@ -885,6 +926,7 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 self.reft_adapter = adapter_copy
                 object.__setattr__(self, "_reft_layer_idx", layer_idx)
                 object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
+                _REFT_ADAPTER_REGISTRY[layer_idx] = adapter_copy
                 logger.debug(
                     "[ReFT-vLLM] Attached adapter to Llama layer %d "
                     "(adapter_type=%s, has_R_cache=%s)",
@@ -915,23 +957,22 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
             hidden_states, residual = super().forward(
                 positions, hidden_states, residual)
 
-            adapter = getattr(self, "reft_adapter", None)
-            if adapter is None:
+            if getattr(self, "reft_adapter", None) is None:
                 return hidden_states, residual
 
             h_full = hidden_states + residual
-            delta = adapter._compute_delta(
-                h_full.unsqueeze(0)).squeeze(0)
 
-            reft_position = self._reft_position
             if _REFT_CUSTOM_OP_AVAILABLE:
-                delta = torch.ops.vllm.reft_apply_position_mask(
-                    delta, positions, reft_position, positions.shape[0])
+                delta = torch.ops.vllm.reft_apply_adapter(
+                    h_full, positions, self._reft_position,
+                    positions.shape[0], self._reft_layer_idx)
             else:
+                delta = self.reft_adapter._compute_delta(
+                    h_full.unsqueeze(0)).squeeze(0)
                 ctx = get_forward_context()
                 attn_metadata = getattr(ctx, "attn_metadata", None)
                 delta, _mask = _apply_position_mask(
-                    delta, positions, reft_position,
+                    delta, positions, self._reft_position,
                     hidden_states.dtype, positions.shape[0], attn_metadata,
                 )
 
