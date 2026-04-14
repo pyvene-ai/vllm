@@ -79,6 +79,36 @@ class WorkerBase:
         if hasattr(model, "refresh_reft_caches"):
             model.refresh_reft_caches()
 
+    def sync_reft_weights(self, weight_dict: dict[int, dict[str, bytes]],
+                          refresh_caches: bool = True) -> int:
+        """Load ReFT adapter weights and optionally refresh caches.
+
+        Called via ``collective_rpc("sync_reft_weights", args=(weight_dict,))``
+        from pyreft's ``sync_to_vllm`` or ``build_vllm_from_checkpoint``.
+
+        Args:
+            weight_dict: Mapping from layer index to serialized state_dict.
+                Values are ``{param_name: tensor}`` dicts with tensors on CPU.
+            refresh_caches: Whether to recompute inference caches after loading.
+
+        Returns:
+            Number of adapter layers synced.
+        """
+        model = self.get_model()
+        count = 0
+        for idx, state_dict in weight_dict.items():
+            adapter = getattr(model.model.layers[idx], "reft_adapter", None)
+            if adapter is None:
+                continue
+            device = next(adapter.parameters()).device
+            sd = {k: v.to(device) for k, v in state_dict.items()}
+            adapter.load_state_dict(sd)
+            count += 1
+        if refresh_caches and count:
+            if hasattr(model, "refresh_reft_caches"):
+                model.refresh_reft_caches()
+        return count
+
     def get_reft_debug_stats(self) -> dict:
         """Return per-layer ReFT debug stats from the model."""
         model = self.get_model()
