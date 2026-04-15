@@ -479,29 +479,11 @@ def _reft_apply_adapter_fake(
     return torch.empty_like(h_full).contiguous()
 
 
-try:
-    from vllm.utils import direct_register_custom_op
-    try:
-        _tag_cudagraph_unsafe = (torch._C.Tag.cudagraph_unsafe,)
-    except AttributeError:
-        _tag_cudagraph_unsafe = ()
-
-    direct_register_custom_op(
-        op_name="reft_apply_adapter",
-        op_func=_reft_apply_adapter_op,
-        fake_impl=_reft_apply_adapter_fake,
-        tags=_tag_cudagraph_unsafe,
-    )
-    _REFT_CUSTOM_OP_AVAILABLE = True
-    logger.info("[ReFT-vLLM] Registered reft_apply_adapter custom op (cudagraph_unsafe)")
-except Exception as e:
-    _REFT_CUSTOM_OP_AVAILABLE = False
-    logger.warning("[ReFT-vLLM] Failed to register reft_apply_adapter custom op: %s", e)
-
-# Allow disabling the custom op for debugging.
-if os.environ.get("VLLM_REFT_NO_CUSTOM_OP", "").lower() in {"1", "true", "yes"}:
-    _REFT_CUSTOM_OP_AVAILABLE = False
-    logger.info("[ReFT-vLLM] Custom op disabled via VLLM_REFT_NO_CUSTOM_OP")
+# NOTE: The reft_apply_adapter custom op was removed.  Position masking
+# now uses a pre-computed buffer updated by the model runner before each
+# forward pass.  The adapter's _compute_delta runs inline in the compiled
+# forward — no splitting ops, no graph breaks.
+_REFT_CUSTOM_OP_AVAILABLE = False
 
 
 def _maybe_log_mask_debug(
