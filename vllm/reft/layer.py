@@ -568,6 +568,59 @@ def _maybe_log_mask_debug(
 
 
 _CAPTURE_MAX_TOKENS = 2048  # pre-allocated buffer size
+_REFT_MASK_FALLBACK_SIZE = 131072  # fallback if model runner doesn't init
+
+
+def _init_reft_position_mask_buffer(module: nn.Module,
+                                    max_tokens: int,
+                                    device: torch.device) -> None:
+    """Pre-allocate the position mask buffer used by the compiled forward.
+
+    The buffer lives at a fixed address so CUDA graph replays read updated
+    values after .copy_() / .fill_() calls.  The model runner updates it
+    before each forward pass.
+    """
+    if hasattr(module, "_reft_position_mask"):
+        return
+    module.register_buffer(
+        "_reft_position_mask",
+        torch.zeros(max_tokens, dtype=torch.float32, device=device),
+        persistent=False,
+    )
+
+
+def update_reft_position_masks(
+    reft_layers: list[nn.Module],
+    positions: torch.Tensor,
+    attn_metadata,
+    num_tokens: int,
+) -> None:
+    """Compute and store ReFT position masks on each layer's buffer.
+
+    Called from the model runner (not compiled) before each model forward.
+    Uses the existing ``_compute_position_mask`` logic which handles all
+    attention backends and chunked prefill correctly.
+    """
+    if not reft_layers:
+        return
+
+    for layer in reft_layers:
+        buf = getattr(layer, "_reft_position_mask", None)
+        if buf is None:
+            continue
+        pos = getattr(layer, "_reft_position", "prefill")
+        if pos in ("all", "all_tokens"):
+            buf[:num_tokens].fill_(1.0)
+        else:
+            mask = _compute_position_mask(
+                positions, pos, torch.float32, num_tokens, attn_metadata)
+            if mask is None:
+                buf[:num_tokens].fill_(1.0)
+            else:
+                buf[:num_tokens].copy_(mask)
+        # Zero the tail so stale data from a larger prior batch
+        # doesn't leak if something indexes past num_tokens.
+        buf[num_tokens:].zero_()
 
 
 def _init_reft_capture_buffers(module: nn.Module, hidden_size: int,
@@ -847,6 +900,10 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 _init_reft_debug_buffers(self, dev)
                 hidden_size = getattr(config, "hidden_size", 896)
                 _init_reft_capture_buffers(self, hidden_size, dev)
+                # Position mask buffer — will be resized by model runner
+                # if needed; use fallback size for standalone/test usage.
+                _init_reft_position_mask_buffer(
+                    self, _REFT_MASK_FALLBACK_SIZE, dev)
 
                 # Register as a proper nn.Module submodule so that
                 # named_parameters() sees adapter weights and TRL's
@@ -899,6 +956,15 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
             # as LoRA).
             delta = self.reft_adapter._compute_delta(
                 h_full.unsqueeze(0)).squeeze(0)
+
+            # Position mask: pre-computed by the model runner into a
+            # fixed-address buffer.  Pure tensor slice + multiply —
+            # no graph breaks, no splitting ops.  During CUDA graph
+            # decode replay the buffer is all zeros → delta = 0.
+            mask_buf = getattr(self, "_reft_position_mask", None)
+            if mask_buf is not None:
+                N = delta.shape[0]
+                delta = delta * mask_buf[:N].unsqueeze(-1).to(delta.dtype)
 
             hidden_states = delta
             residual = h_full
@@ -965,6 +1031,8 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 _init_reft_debug_buffers(self, dev)
                 hidden_size = getattr(hf_config, "hidden_size", 4096)
                 _init_reft_capture_buffers(self, hidden_size, dev)
+                _init_reft_position_mask_buffer(
+                    self, _REFT_MASK_FALLBACK_SIZE, dev)
 
                 self.reft_adapter = adapter_copy
                 object.__setattr__(self, "_reft_layer_idx", layer_idx)
@@ -1007,6 +1075,12 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
 
             delta = self.reft_adapter._compute_delta(
                 h_full.unsqueeze(0)).squeeze(0)
+
+            # Position mask (same as Qwen2 path above).
+            mask_buf = getattr(self, "_reft_position_mask", None)
+            if mask_buf is not None:
+                N = delta.shape[0]
+                delta = delta * mask_buf[:N].unsqueeze(-1).to(delta.dtype)
 
             hidden_states = delta
             residual = h_full

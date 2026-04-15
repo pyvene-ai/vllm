@@ -2282,6 +2282,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if ubatch_slices is not None:
             num_input_tokens = ubatch_slices[0].num_tokens
 
+        # Update ReFT position masks before the forward pass.
+        # This runs outside compilation / CUDA graphs so Python
+        # control flow is fine.  The masks are written into fixed-
+        # address buffers that the compiled forward reads.
+        # Use num_scheduled_tokens (actual, not padded) for the mask.
+        if self._reft_layers:
+            from vllm.reft.layer import update_reft_position_masks
+            actual_positions = positions[:num_scheduled_tokens]
+            update_reft_position_masks(
+                self._reft_layers, actual_positions, attn_metadata,
+                num_scheduled_tokens)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (set_forward_context(
@@ -2654,6 +2666,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self.model_memory_usage / GiB_bytes,
                     time_after_load - time_before_load)
         prepare_communication_buffer_for_model(self.model)
+
+        # Discover ReFT layers for position mask updates.
+        self._reft_layers: list[nn.Module] = []
+        for module in self.model.modules():
+            if (hasattr(module, "reft_adapter")
+                    and module.reft_adapter is not None):
+                self._reft_layers.append(module)
+        if self._reft_layers:
+            logger.info("[ReFT] Found %d ReFT layers for position masking",
+                        len(self._reft_layers))
 
         self.is_multimodal_pruning_enabled = (supports_multimodal_pruning(
             self.model) and self.model_config.multimodal_config.
