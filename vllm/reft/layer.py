@@ -902,8 +902,13 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                 if model_dtype is None:
                     model_dtype = torch.bfloat16
                 adapter_copy = copy.deepcopy(source).to(dev)
-                if hasattr(adapter_copy, "learned_source"):
-                    adapter_copy.learned_source.to(dtype=model_dtype)
+                # Cast all nn.Linear layers to model dtype so matmuls
+                # don't allocate float32 temporaries during CUDA graph
+                # capture.  rotate_layer stays float32 (Householder
+                # parametrization requires it).
+                for child in adapter_copy.modules():
+                    if isinstance(child, nn.Linear):
+                        child.to(dtype=model_dtype)
 
                 # Install CUDA-graph-safe caches via the adapter's own protocol.
                 _install_adapter_caches(adapter_copy, model_dtype=model_dtype)
@@ -1028,14 +1033,14 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
                 model_dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
                 if model_dtype is None:
                     model_dtype = torch.bfloat16
-                # Move to device only (not dtype) — rotate_layer's
-                # Householder parametrization requires all-float32.
                 adapter_copy = copy.deepcopy(source).to(dev)
-                # Cast learned_source to model dtype so nn.Linear
-                # forward doesn't allocate float32 temporaries during
-                # CUDA graph capture.
-                if hasattr(adapter_copy, "learned_source"):
-                    adapter_copy.learned_source.to(dtype=model_dtype)
+                # Cast all nn.Linear layers to model dtype so matmuls
+                # don't allocate float32 temporaries during CUDA graph
+                # capture.  rotate_layer stays float32 (Householder
+                # parametrization requires it).
+                for child in adapter_copy.modules():
+                    if isinstance(child, nn.Linear):
+                        child.to(dtype=model_dtype)
 
                 _install_adapter_caches(adapter_copy, model_dtype=model_dtype)
                 _init_reft_debug_buffers(self, dev)
