@@ -892,19 +892,13 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
 
             h_full = hidden_states + residual
 
-            if _REFT_CUSTOM_OP_AVAILABLE:
-                delta = torch.ops.vllm.reft_apply_adapter(
-                    h_full, positions, self._reft_position,
-                    positions.shape[0], self._reft_layer_idx)
-            else:
-                delta = self.reft_adapter._compute_delta(
-                    h_full.unsqueeze(0)).squeeze(0)
-                ctx = get_forward_context()
-                attn_metadata = getattr(ctx, "attn_metadata", None)
-                delta, _mask = _apply_position_mask(
-                    delta, positions, self._reft_position,
-                    hidden_states.dtype, positions.shape[0], attn_metadata,
-                )
+            # Inline adapter computation — pure tensor ops, fully
+            # compilable.  No custom op, no graph splitting.
+            # Adapter weights live at fixed addresses; in-place
+            # .copy_() updates are visible to graph replays (same
+            # as LoRA).
+            delta = self.reft_adapter._compute_delta(
+                h_full.unsqueeze(0)).squeeze(0)
 
             hidden_states = delta
             residual = h_full
@@ -1011,19 +1005,8 @@ def make_reft_llama_layer(reft_spec: dict) -> type:
 
             h_full = hidden_states + residual
 
-            if _REFT_CUSTOM_OP_AVAILABLE:
-                delta = torch.ops.vllm.reft_apply_adapter(
-                    h_full, positions, self._reft_position,
-                    positions.shape[0], self._reft_layer_idx)
-            else:
-                delta = self.reft_adapter._compute_delta(
-                    h_full.unsqueeze(0)).squeeze(0)
-                ctx = get_forward_context()
-                attn_metadata = getattr(ctx, "attn_metadata", None)
-                delta, _mask = _apply_position_mask(
-                    delta, positions, self._reft_position,
-                    hidden_states.dtype, positions.shape[0], attn_metadata,
-                )
+            delta = self.reft_adapter._compute_delta(
+                h_full.unsqueeze(0)).squeeze(0)
 
             hidden_states = delta
             residual = h_full
