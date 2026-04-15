@@ -600,27 +600,37 @@ def update_reft_position_masks(
     Called from the model runner (not compiled) before each model forward.
     Uses the existing ``_compute_position_mask`` logic which handles all
     attention backends and chunked prefill correctly.
+
+    Groups layers by position so each unique mask is computed only once
+    (avoids 23 redundant GPU→CPU syncs for a 24-layer model).
     """
     if not reft_layers:
         return
 
+    # Group layers by position string.
+    by_position: dict[str, list[nn.Module]] = {}
     for layer in reft_layers:
-        buf = getattr(layer, "_reft_position_mask", None)
-        if buf is None:
-            continue
         pos = getattr(layer, "_reft_position", "prefill")
+        by_position.setdefault(pos, []).append(layer)
+
+    for pos, layers in by_position.items():
         if pos in ("all", "all_tokens"):
-            buf[:num_tokens].fill_(1.0)
+            mask = None
         else:
             mask = _compute_position_mask(
                 positions, pos, torch.float32, num_tokens, attn_metadata)
+
+        for layer in layers:
+            buf = getattr(layer, "_reft_position_mask", None)
+            if buf is None:
+                continue
             if mask is None:
                 buf[:num_tokens].fill_(1.0)
             else:
                 buf[:num_tokens].copy_(mask)
-        # Zero the tail so stale data from a larger prior batch
-        # doesn't leak if something indexes past num_tokens.
-        buf[num_tokens:].zero_()
+            # Zero the tail so stale data from a larger prior batch
+            # doesn't leak if something indexes past num_tokens.
+            buf[num_tokens:].zero_()
 
 
 def _init_reft_capture_buffers(module: nn.Module, hidden_size: int,
