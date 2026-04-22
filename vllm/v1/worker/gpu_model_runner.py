@@ -2295,6 +2295,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             token_reft_ids = torch.from_numpy(
                 self.input_batch.make_reft_inputs(
                     num_scheduled_tokens_np)).to(self.device)
+            # Backward compat: when reft_config= bakes in adapter id=1
+            # at construction time, users don't pass ReFTRequest so all
+            # token IDs are 0.  Default those to 1 so the adapter fires.
+            if self._reft_builtin_adapter:
+                token_reft_ids[token_reft_ids == 0] = 1
             update_multi_reft_position_masks(
                 self._reft_layers, token_reft_ids, actual_positions,
                 attn_metadata, num_scheduled_tokens)
@@ -2677,9 +2682,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         for module in self.model.modules():
             if hasattr(module, "reft_adapters"):
                 self._reft_layers.append(module)
+        # If reft_config= was used (single-adapter baked in at construction),
+        # adapter id=1 is present but users won't pass ReFTRequest.  We
+        # default untagged tokens to id=1 so the adapter fires.
+        self._reft_builtin_adapter = (
+            any("1" in layer.reft_adapters for layer in self._reft_layers)
+            and getattr(self.vllm_config, "reft_config", None) is not None
+        )
         if self._reft_layers:
             logger.info("[ReFT] Found %d ReFT layers for multi-adapter "
-                        "position masking", len(self._reft_layers))
+                        "position masking (builtin_adapter=%s)",
+                        len(self._reft_layers), self._reft_builtin_adapter)
 
         self.is_multimodal_pruning_enabled = (supports_multimodal_pruning(
             self.model) and self.model_config.multimodal_config.
