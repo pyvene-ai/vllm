@@ -59,24 +59,44 @@ _SPEC_FILE_ENV_KEY = "_VLLM_REFT_SPEC_FILE"
 import warnings
 
 
-def _ensure_tensors(state_dict: dict) -> dict:
-    """Convert any plain lists/nested lists in a state_dict back to tensors.
+def _serialize_state_dict(state_dict: dict) -> dict:
+    """Convert a state_dict's tensors to a format safe for any serializer.
 
-    When a config dict passes through msgspec serialization (e.g. via
-    ``collective_rpc``), tensors are silently converted to Python lists.
-    This function restores them.  Non-numeric values (strings, etc.) are
-    passed through unchanged.
+    Each tensor becomes ``{"__reft_t": True, "data": <nested list>,
+    "dtype": "float32", "shape": [...]}``.  This survives both pickle
+    (used by VllmConfig) and msgspec (used by collective_rpc).
+
+    ReFT adapters are tiny (~100 KB) so ``.tolist()`` overhead is negligible.
+    """
+    import torch
+    out = {}
+    for k, v in state_dict.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = {
+                "__reft_t": True,
+                "data": v.detach().float().cpu().tolist(),
+                "dtype": str(v.dtype).split(".")[-1],  # "bfloat16"
+                "shape": list(v.shape),
+            }
+        else:
+            out[k] = v
+    return out
+
+
+def _deserialize_state_dict(state_dict: dict) -> dict:
+    """Reconstruct tensors from the format produced by ``_serialize_state_dict``.
+
+    Also handles raw tensors (no-op) for backward compatibility with configs
+    that were serialized before this change.
     """
     import torch
     out = {}
     for k, v in state_dict.items():
         if isinstance(v, torch.Tensor):
             out[k] = v
-        elif isinstance(v, (list, tuple)):
-            try:
-                out[k] = torch.tensor(v)
-            except (ValueError, TypeError):
-                out[k] = v
+        elif isinstance(v, dict) and v.get("__reft_t"):
+            dtype = getattr(torch, v["dtype"], torch.float32)
+            out[k] = torch.tensor(v["data"], dtype=dtype).reshape(v["shape"])
         else:
             out[k] = v
     return out
@@ -104,11 +124,11 @@ def spec_to_reft_config(reft_spec: dict[str, Any]) -> dict[str, Any]:
     elif adapter is not None:
         config["sample_adapter"] = adapter  # already a blueprint
 
-    # Serialize per-layer adapters → CPU state_dicts
+    # Serialize per-layer adapters → portable state_dicts
     adapters = reft_spec.get("adapters")
     if adapters is not None:
         config["adapter_states"] = {
-            idx: {k: v.detach().cpu() for k, v in a.state_dict().items()}
+            idx: _serialize_state_dict(a.state_dict())
             for idx, a in adapters.items()
         }
 
@@ -146,7 +166,7 @@ def reft_config_to_spec(reft_config: Optional[dict[str, Any]],
         adapters: dict[int, Any] = {}
         for idx, sd in adapter_states.items():
             a = copy.deepcopy(sample)
-            a.load_state_dict(_ensure_tensors(sd))
+            a.load_state_dict(_deserialize_state_dict(sd))
             if hasattr(a, "install_inference_caches"):
                 a.install_inference_caches()
             adapters[int(idx)] = a
@@ -285,11 +305,7 @@ def _adapter_to_blueprint(adapter) -> dict:
     # warmup.  Without this, the blueprint adapter is constructed with random
     # init weights, and post-init sync_reft_state() updates them in-place —
     # but compiled/captured graphs may not reflect the in-place updates.
-    import torch
-    adapter_state = {
-        k: v.detach().cpu()
-        for k, v in adapter.state_dict().items()
-    }
+    adapter_state = _serialize_state_dict(adapter.state_dict())
 
     blueprint = {
         "__type__": "AdapterBlueprint",
@@ -356,7 +372,7 @@ def _blueprint_to_adapter(blueprint: dict):
     # Load trained weights if available in the blueprint.
     saved_state = blueprint.get("state_dict")
     if saved_state:
-        adapter.load_state_dict(_ensure_tensors(saved_state))
+        adapter.load_state_dict(_deserialize_state_dict(saved_state))
         if hasattr(adapter, "install_inference_caches"):
             adapter.install_inference_caches()
 
@@ -439,7 +455,7 @@ def _read_spec_file() -> Optional[dict]:
         adapters = {}
         for idx, sd in adapter_states.items():
             a = copy.deepcopy(sample)
-            a.load_state_dict(_ensure_tensors(sd))
+            a.load_state_dict(_deserialize_state_dict(sd))
             if hasattr(a, "install_inference_caches"):
                 a.install_inference_caches()
             adapters[int(idx)] = a
