@@ -64,7 +64,8 @@ def _ensure_tensors(state_dict: dict) -> dict:
 
     When a config dict passes through msgspec serialization (e.g. via
     ``collective_rpc``), tensors are silently converted to Python lists.
-    This function restores them.
+    This function restores them.  Non-numeric values (strings, etc.) are
+    passed through unchanged.
     """
     import torch
     out = {}
@@ -72,7 +73,10 @@ def _ensure_tensors(state_dict: dict) -> dict:
         if isinstance(v, torch.Tensor):
             out[k] = v
         elif isinstance(v, (list, tuple)):
-            out[k] = torch.tensor(v)
+            try:
+                out[k] = torch.tensor(v)
+            except (ValueError, TypeError):
+                out[k] = v
         else:
             out[k] = v
     return out
