@@ -896,10 +896,20 @@ def _multi_reft_forward(
     combined masks (adapter membership AND position mask) to zero out
     irrelevant deltas.  The iteration order is fixed (dict order), so the
     compute graph is static for CUDA graph capture.
+
+    Pure-decode optimisation: if ``_reft_all_masks_zero`` is set by the
+    model runner (all combined masks are zero, e.g. a decode-only batch
+    with position=prefill adapters), skip adapter computation entirely.
     """
     hidden_states, residual = super_forward(positions, hidden_states, residual)
 
     if not hasattr(layer_self, "reft_adapters") or len(layer_self.reft_adapters) == 0:
+        return hidden_states, residual
+
+    # Skip adapter computation when all masks are zero (pure decode batch
+    # with prefill/first/last adapters).  The flag is set by
+    # update_multi_reft_position_masks before each forward pass.
+    if getattr(layer_self, "_reft_all_masks_zero", False):
         return hidden_states, residual
 
     h_full = hidden_states + residual
@@ -944,6 +954,7 @@ def update_multi_reft_position_masks(
     for layer in reft_layers:
         if not hasattr(layer, "reft_adapters"):
             continue
+        all_zero = True
         for str_id in layer.reft_adapters:
             int_id = int(str_id)
             # Adapter membership mask
@@ -972,6 +983,12 @@ def update_multi_reft_position_masks(
                 layer._reft_combined_masks[int_id] = buf
             buf[:num_tokens].copy_(combined[:num_tokens])
             buf[num_tokens:].zero_()
+            if all_zero and combined[:num_tokens].any():
+                all_zero = False
+        # Tell the forward pass to skip adapter computation entirely
+        # when no tokens in the batch need any adapter (e.g. pure decode
+        # with prefill-only adapters).
+        layer._reft_all_masks_zero = all_zero
 
 
 # ---------------------------------------------------------------------------
