@@ -59,6 +59,25 @@ _SPEC_FILE_ENV_KEY = "_VLLM_REFT_SPEC_FILE"
 import warnings
 
 
+def _ensure_tensors(state_dict: dict) -> dict:
+    """Convert any plain lists/nested lists in a state_dict back to tensors.
+
+    When a config dict passes through msgspec serialization (e.g. via
+    ``collective_rpc``), tensors are silently converted to Python lists.
+    This function restores them.
+    """
+    import torch
+    out = {}
+    for k, v in state_dict.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v
+        elif isinstance(v, (list, tuple)):
+            out[k] = torch.tensor(v)
+        else:
+            out[k] = v
+    return out
+
+
 # ---------------------------------------------------------------------------
 # VllmConfig-based API (preferred — multiprocess-safe, no global state)
 # ---------------------------------------------------------------------------
@@ -123,7 +142,7 @@ def reft_config_to_spec(reft_config: Optional[dict[str, Any]],
         adapters: dict[int, Any] = {}
         for idx, sd in adapter_states.items():
             a = copy.deepcopy(sample)
-            a.load_state_dict(sd)
+            a.load_state_dict(_ensure_tensors(sd))
             if hasattr(a, "install_inference_caches"):
                 a.install_inference_caches()
             adapters[int(idx)] = a
@@ -333,7 +352,7 @@ def _blueprint_to_adapter(blueprint: dict):
     # Load trained weights if available in the blueprint.
     saved_state = blueprint.get("state_dict")
     if saved_state:
-        adapter.load_state_dict(saved_state)
+        adapter.load_state_dict(_ensure_tensors(saved_state))
         if hasattr(adapter, "install_inference_caches"):
             adapter.install_inference_caches()
 
@@ -416,7 +435,7 @@ def _read_spec_file() -> Optional[dict]:
         adapters = {}
         for idx, sd in adapter_states.items():
             a = copy.deepcopy(sample)
-            a.load_state_dict(sd)
+            a.load_state_dict(_ensure_tensors(sd))
             if hasattr(a, "install_inference_caches"):
                 a.install_inference_caches()
             adapters[int(idx)] = a
