@@ -599,6 +599,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                reft_request=new_req_data.reft_request,
             )
             self.requests[req_id] = req_state
 
@@ -2288,11 +2289,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # address buffers that the compiled forward reads.
         # Use num_scheduled_tokens (actual, not padded) for the mask.
         if self._reft_layers:
-            from vllm.reft.layer import update_reft_position_masks
+            from vllm.reft.layer import update_multi_reft_position_masks
             actual_positions = positions[:num_scheduled_tokens]
-            update_reft_position_masks(
-                self._reft_layers, actual_positions, attn_metadata,
-                num_scheduled_tokens)
+            # Build per-token adapter ID mapping from InputBatch
+            token_reft_ids = torch.from_numpy(
+                self.input_batch.make_reft_inputs(
+                    num_scheduled_tokens_np)).to(self.device)
+            update_multi_reft_position_masks(
+                self._reft_layers, token_reft_ids, actual_positions,
+                attn_metadata, num_scheduled_tokens)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -2670,12 +2675,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Discover ReFT layers for position mask updates.
         self._reft_layers: list[nn.Module] = []
         for module in self.model.modules():
-            if (hasattr(module, "reft_adapter")
-                    and module.reft_adapter is not None):
+            if hasattr(module, "reft_adapters"):
                 self._reft_layers.append(module)
         if self._reft_layers:
-            logger.info("[ReFT] Found %d ReFT layers for position masking",
-                        len(self._reft_layers))
+            logger.info("[ReFT] Found %d ReFT layers for multi-adapter "
+                        "position masking", len(self._reft_layers))
 
         self.is_multimodal_pruning_enabled = (supports_multimodal_pruning(
             self.model) and self.model_config.multimodal_config.

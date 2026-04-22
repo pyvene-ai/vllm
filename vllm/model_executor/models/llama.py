@@ -534,19 +534,20 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         self.config = config
         self.lora_config = lora_config
 
-        # If reft_config is set on VllmConfig, use ReFT-aware decoder layers
-        # so CUDA graphs capture the adapter path.  Falls back to the
-        # deprecated get_reft_spec() for TRL training hooks that set global state.
-        # The caller-supplied layer_type takes precedence (e.g. Eagle3 draft).
+        # If reft_config is set or enable_reft is True, use ReFT-aware decoder
+        # layers.  The caller-supplied layer_type takes precedence (e.g. Eagle3).
         if layer_type is LlamaDecoderLayer:
             from vllm.reft import reft_config_to_spec, get_reft_spec
             from vllm.reft.layer import make_reft_llama_layer
+            enable_reft = getattr(vllm_config, "enable_reft", False)
             reft_spec = reft_config_to_spec(
                 getattr(vllm_config, "reft_config", None))
             if reft_spec is None:
                 reft_spec = get_reft_spec()
             if reft_spec is not None:
                 layer_type = make_reft_llama_layer(reft_spec)
+            elif enable_reft:
+                layer_type = make_reft_llama_layer(None)
 
         self.model = self._init_model(vllm_config=vllm_config,
                                       prefix=maybe_prefix(prefix, "model"),
@@ -597,8 +598,8 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         stats["__summary__"] = {
             "model_type": type(self).__name__,
             "num_layers": len(layers),
-            "adapter_attr_layers": sum(
-                getattr(layer, "reft_adapter", None) is not None
+            "adapter_layers": sum(
+                hasattr(layer, "reft_adapters") and len(layer.reft_adapters) > 0
                 for layer in layers),
             "debug_enabled_layers": sum(
                 bool(getattr(layer, "_reft_debug_enabled", False))
@@ -654,7 +655,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         # not from the HF checkpoint.  Mark them as loaded so the
         # checkpoint validator in default_loader.py does not raise.
         for name, _ in self.named_parameters():
-            if ".reft_adapter." in name:
+            if ".reft_adapter." in name or ".reft_adapters." in name:
                 loaded.add(name)
         return loaded
 
@@ -665,10 +666,11 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         ``sync_weights()`` pushes new adapter parameters.
         """
         for layer in self.model.layers:
-            adapter = getattr(layer, "reft_adapter", None)
-            if adapter is not None and hasattr(adapter,
-                                               "refresh_inference_caches"):
-                adapter.refresh_inference_caches()
+            if not hasattr(layer, "reft_adapters"):
+                continue
+            for adapter in layer.reft_adapters.values():
+                if hasattr(adapter, "refresh_inference_caches"):
+                    adapter.refresh_inference_caches()
 
     # This function is used to remap the mistral format as
     # used by Mistral and Llama <=2

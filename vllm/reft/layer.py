@@ -836,32 +836,173 @@ def _collect_layer_reft_debug_stats(layer: nn.Module) -> Optional[dict]:
 # Qwen2 ReFT-aware decoder layer factory
 # ---------------------------------------------------------------------------
 
-def make_reft_qwen2_layer(reft_spec: dict) -> type:
-    """Return a Qwen2DecoderLayer subclass that applies ReFT adapters.
+# ---------------------------------------------------------------------------
+# Shared multi-adapter forward logic
+# ---------------------------------------------------------------------------
 
-    The returned class is drop-in for the *decoder_layer_type* argument of
-    ``Qwen2Model``.  Each instance with a layer index in
-    ``reft_spec["layer_indices"]`` gets its own deep-copied adapter; all other
-    instances pass through unchanged.
+def _prepare_adapter(source: nn.Module, dev: torch.device,
+                     model_dtype: torch.dtype) -> nn.Module:
+    """Deep-copy an adapter, cast linears to model dtype, install caches."""
+    adapter_copy = copy.deepcopy(source).to(dev)
+    for child in adapter_copy.modules():
+        if isinstance(child, nn.Linear):
+            child.to(dtype=model_dtype)
+    _install_adapter_caches(adapter_copy, model_dtype=model_dtype)
+    return adapter_copy
 
-    Args:
-        reft_spec: dict with keys
-            layer_indices  list[int]  – which layers get adapters
-            position       str        – "prefill" | "first" | "last"
-            sample_adapter nn.Module  – architecture template (weights synced
-                                        later via load_reft_state)
+
+def _init_multi_reft_state(layer: nn.Module, dev: torch.device,
+                           hidden_size: int) -> None:
+    """Initialise the multi-adapter bookkeeping on a decoder layer.
+
+    Sets up:
+      - ``reft_adapters``  (nn.ModuleDict) keyed by ``str(reft_int_id)``
+      - ``_reft_adapter_positions`` (dict) adapter_id -> position string
+      - ``_reft_combined_masks`` (dict) adapter_id -> pre-allocated mask buffer
+    """
+    layer.reft_adapters = nn.ModuleDict()
+    layer._reft_adapter_positions: dict[int, str] = {}
+    layer._reft_combined_masks: dict[int, torch.Tensor] = {}
+    _init_reft_debug_buffers(layer, dev)
+    _init_reft_capture_buffers(layer, hidden_size, dev)
+
+
+def _add_adapter_to_layer(layer: nn.Module, reft_int_id: int,
+                          adapter: nn.Module, position: str,
+                          dev: torch.device) -> None:
+    """Register an adapter on a decoder layer (in-place)."""
+    key = str(reft_int_id)
+    layer.reft_adapters[key] = adapter
+    layer._reft_adapter_positions[reft_int_id] = position
+    # Pre-allocate combined mask buffer
+    layer._reft_combined_masks[reft_int_id] = torch.zeros(
+        _REFT_MASK_FALLBACK_SIZE, dtype=torch.float32, device=dev)
+    # Backward compat: keep reft_adapter pointing to first loaded adapter
+    if not hasattr(layer, "reft_adapter") or layer.reft_adapter is None:
+        layer.reft_adapter = adapter
+
+
+def _multi_reft_forward(
+    layer_self,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual,
+    *,
+    super_forward,
+):
+    """Shared multi-adapter forward pass for Qwen2 and Llama layers.
+
+    Graph-safe approach: iterates ALL loaded adapters, using pre-computed
+    combined masks (adapter membership AND position mask) to zero out
+    irrelevant deltas.  The iteration order is fixed (dict order), so the
+    compute graph is static for CUDA graph capture.
+    """
+    hidden_states, residual = super_forward(positions, hidden_states, residual)
+
+    if not hasattr(layer_self, "reft_adapters") or len(layer_self.reft_adapters) == 0:
+        return hidden_states, residual
+
+    h_full = hidden_states + residual
+    delta = torch.zeros_like(hidden_states)
+
+    for str_id, adapter in layer_self.reft_adapters.items():
+        int_id = int(str_id)
+        adapter_delta = adapter._compute_delta(
+            h_full.unsqueeze(0)).squeeze(0)
+        mask_buf = layer_self._reft_combined_masks.get(int_id)
+        if mask_buf is not None:
+            N = adapter_delta.shape[0]
+            adapter_delta = adapter_delta * mask_buf[:N].unsqueeze(-1).to(
+                adapter_delta.dtype)
+        delta = delta + adapter_delta
+
+    hidden_states = delta
+    residual = h_full
+    return hidden_states, residual
+
+
+def update_multi_reft_position_masks(
+    reft_layers: list[nn.Module],
+    token_reft_ids: torch.Tensor,
+    positions: torch.Tensor,
+    attn_metadata,
+    num_tokens: int,
+) -> None:
+    """Pre-compute combined masks for all adapters on all ReFT layers.
+
+    For each adapter on each layer, the combined mask is:
+        (token belongs to this adapter) AND (position satisfies adapter's mode)
+
+    Called from the model runner before each forward pass.
+    """
+    if not reft_layers:
+        return
+
+    # Cache position masks by position string to avoid redundant computation.
+    pos_mask_cache: dict[str, Optional[torch.Tensor]] = {}
+
+    for layer in reft_layers:
+        if not hasattr(layer, "reft_adapters"):
+            continue
+        for str_id in layer.reft_adapters:
+            int_id = int(str_id)
+            # Adapter membership mask
+            adapter_mask = (token_reft_ids == int_id).float()
+            # Position mask (cached by position string)
+            pos = layer._reft_adapter_positions.get(int_id, "prefill")
+            if pos not in pos_mask_cache:
+                if pos in ("all", "all_tokens"):
+                    pos_mask_cache[pos] = None
+                else:
+                    pos_mask_cache[pos] = _compute_position_mask(
+                        positions, pos, torch.float32, num_tokens,
+                        attn_metadata)
+            pos_mask = pos_mask_cache[pos]
+            # Combined mask
+            if pos_mask is not None:
+                combined = adapter_mask * pos_mask
+            else:
+                combined = adapter_mask
+            # Write into pre-allocated buffer
+            buf = layer._reft_combined_masks.get(int_id)
+            if buf is None or buf.shape[0] < num_tokens:
+                buf = torch.zeros(max(num_tokens, _REFT_MASK_FALLBACK_SIZE),
+                                  dtype=torch.float32,
+                                  device=positions.device)
+                layer._reft_combined_masks[int_id] = buf
+            buf[:num_tokens].copy_(combined[:num_tokens])
+            buf[num_tokens:].zero_()
+
+
+# ---------------------------------------------------------------------------
+# Qwen2 ReFT-aware decoder layer factory
+# ---------------------------------------------------------------------------
+
+def make_reft_qwen2_layer(reft_spec: Optional[dict] = None) -> type:
+    """Return a Qwen2DecoderLayer subclass that supports multi-ReFT adapters.
+
+    If *reft_spec* is provided (single-adapter backward compat), the initial
+    adapter is loaded at construction time with ``reft_int_id=1``.
+    If *reft_spec* is ``None`` (``enable_reft=True`` mode), layers are created
+    with empty adapter dicts ready for dynamic loading.
     """
     from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer
-    from vllm.forward_context import get_forward_context
 
-    layer_indices_set = frozenset(reft_spec["layer_indices"])
-    position = reft_spec["position"]
-    sample_adapter: nn.Module = reft_spec["sample_adapter"]
-    per_layer_adapters: dict = reft_spec.get("adapters", {})
-    debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
+    if reft_spec is not None:
+        layer_indices_set = frozenset(reft_spec["layer_indices"])
+        position = reft_spec["position"]
+        sample_adapter: Optional[nn.Module] = reft_spec["sample_adapter"]
+        per_layer_adapters: dict = reft_spec.get("adapters", {})
+        debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
+    else:
+        layer_indices_set = frozenset()
+        position = "prefill"
+        sample_adapter = None
+        per_layer_adapters = {}
+        debug_mask_enabled = False
 
     class ReFTQwen2DecoderLayer(Qwen2DecoderLayer):
-        """Qwen2DecoderLayer with optional ReFT adapter delta."""
+        """Qwen2DecoderLayer with multi-ReFT adapter support."""
 
         def __init__(self, config, cache_config=None, quant_config=None,
                      prefix=""):
@@ -869,103 +1010,40 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
                              quant_config=quant_config, prefix=prefix)
 
             layer_idx = _extract_layer_idx(prefix)
-            if layer_idx is not None and layer_idx in layer_indices_set:
-                try:
-                    dev = next(self.parameters()).device
-                except StopIteration:
-                    dev = torch.device("cuda" if torch.cuda.is_available()
-                                       else "cpu")
-                # Use per-layer adapter when available to preserve the correct
-                # parametrization base buffer; fall back to sample_adapter.
+            try:
+                dev = next(self.parameters()).device
+            except StopIteration:
+                dev = torch.device("cuda" if torch.cuda.is_available()
+                                   else "cpu")
+
+            model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
+            if model_dtype is None:
+                model_dtype = torch.bfloat16
+            hidden_size = getattr(config, "hidden_size", 896)
+
+            object.__setattr__(self, "_reft_layer_idx",
+                               layer_idx if layer_idx is not None else -1)
+            object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
+            self.reft_adapter = None  # backward compat attribute
+
+            _init_multi_reft_state(self, dev, hidden_size)
+
+            # Load initial adapter from reft_spec (backward compat, id=1)
+            if (layer_idx is not None and layer_idx in layer_indices_set
+                    and sample_adapter is not None):
                 source = per_layer_adapters.get(layer_idx, sample_adapter)
-                # Cast to model dtype so linear layers and matmuls don't
-                # allocate temporaries during CUDA graph capture.
-                model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
-                if model_dtype is None:
-                    model_dtype = torch.bfloat16
-                adapter_copy = copy.deepcopy(source).to(dev)
-                # Cast all nn.Linear layers to model dtype so matmuls
-                # don't allocate float32 temporaries during CUDA graph
-                # capture.  rotate_layer stays float32 (Householder
-                # parametrization requires it).
-                for child in adapter_copy.modules():
-                    if isinstance(child, nn.Linear):
-                        child.to(dtype=model_dtype)
-
-                # Install CUDA-graph-safe caches via the adapter's own protocol.
-                _install_adapter_caches(adapter_copy, model_dtype=model_dtype)
-                _init_reft_debug_buffers(self, dev)
-                hidden_size = getattr(config, "hidden_size", 896)
-                _init_reft_capture_buffers(self, hidden_size, dev)
-                # Position mask buffer — will be resized by model runner
-                # if needed; use fallback size for standalone/test usage.
-                _init_reft_position_mask_buffer(
-                    self, _REFT_MASK_FALLBACK_SIZE, dev)
-
-                # Register as a proper nn.Module submodule so that
-                # named_parameters() sees adapter weights and TRL's
-                # sync_weights() can push them through the standard
-                # update_named_param / load_weights path.
-                self.reft_adapter = adapter_copy
-                object.__setattr__(self, "_reft_layer_idx", layer_idx)
-                object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
+                adapter_copy = _prepare_adapter(source, dev, model_dtype)
+                _add_adapter_to_layer(self, 1, adapter_copy, position, dev)
                 _REFT_ADAPTER_REGISTRY[layer_idx] = adapter_copy
                 logger.debug(
-                    "[ReFT-vLLM] Attached adapter to Qwen2 layer %d "
-                    "(adapter_type=%s, has_R_cache=%s)",
-                    layer_idx,
-                    type(adapter_copy).__name__,
-                    hasattr(adapter_copy, "_R_cache"),
-                )
-            else:
-                object.__setattr__(self, "_reft_layer_idx", -1)
-                object.__setattr__(self, "_reft_debug_enabled", False)
+                    "[ReFT-vLLM] Attached initial adapter to Qwen2 layer %d "
+                    "(adapter_type=%s)", layer_idx,
+                    type(adapter_copy).__name__)
 
-            # Store position string as a normal attribute (not a parameter).
-            object.__setattr__(self, "_reft_position", position)
-            _maybe_log_reft_layer_init(
-                arch="qwen2",
-                layer_idx=getattr(self, "_reft_layer_idx", -1),
-                attached=getattr(self, "reft_adapter", None) is not None,
-                debug_enabled=bool(getattr(self, "_reft_debug_enabled", False)),
-                position=position,
-                adapter=getattr(self, "reft_adapter", None),
-            )
-
-        def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            residual,
-        ):
-            hidden_states, residual = super().forward(
-                positions, hidden_states, residual)
-
-            if getattr(self, "reft_adapter", None) is None:
-                return hidden_states, residual
-
-            h_full = hidden_states + residual
-
-            # Inline adapter computation — pure tensor ops, fully
-            # compilable.  No custom op, no graph splitting.
-            # Adapter weights live at fixed addresses; in-place
-            # .copy_() updates are visible to graph replays (same
-            # as LoRA).
-            delta = self.reft_adapter._compute_delta(
-                h_full.unsqueeze(0)).squeeze(0)
-
-            # Position mask: pre-computed by the model runner into a
-            # fixed-address buffer.  Pure tensor slice + multiply —
-            # no graph breaks, no splitting ops.  During CUDA graph
-            # decode replay the buffer is all zeros → delta = 0.
-            mask_buf = getattr(self, "_reft_position_mask", None)
-            if mask_buf is not None:
-                N = delta.shape[0]
-                delta = delta * mask_buf[:N].unsqueeze(-1).to(delta.dtype)
-
-            hidden_states = delta
-            residual = h_full
-            return hidden_states, residual
+        def forward(self, positions, hidden_states, residual):
+            return _multi_reft_forward(
+                self, positions, hidden_states, residual,
+                super_forward=super().forward)
 
         def get_reft_debug_stats(self) -> Optional[dict]:
             return _collect_layer_reft_debug_stats(self)
@@ -979,109 +1057,71 @@ def make_reft_qwen2_layer(reft_spec: dict) -> type:
 # Llama ReFT-aware decoder layer factory
 # ---------------------------------------------------------------------------
 
-def make_reft_llama_layer(reft_spec: dict) -> type:
-    """Return a LlamaDecoderLayer subclass that applies ReFT adapters.
+def make_reft_llama_layer(reft_spec: Optional[dict] = None) -> type:
+    """Return a LlamaDecoderLayer subclass that supports multi-ReFT adapters.
 
-    Analogous to ``make_reft_qwen2_layer`` but for the Llama/Mistral/Mixtral
-    architecture family, which passes the full ``vllm_config`` to the layer.
+    Analogous to ``make_reft_qwen2_layer`` but for the Llama architecture.
     """
     from vllm.model_executor.models.llama import LlamaDecoderLayer
-    from vllm.forward_context import get_forward_context
 
-    layer_indices_set = frozenset(reft_spec["layer_indices"])
-    position = reft_spec["position"]
-    sample_adapter: nn.Module = reft_spec["sample_adapter"]
-    per_layer_adapters: dict = reft_spec.get("adapters", {})
-    debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
+    if reft_spec is not None:
+        layer_indices_set = frozenset(reft_spec["layer_indices"])
+        position = reft_spec["position"]
+        sample_adapter: Optional[nn.Module] = reft_spec["sample_adapter"]
+        per_layer_adapters: dict = reft_spec.get("adapters", {})
+        debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
+    else:
+        layer_indices_set = frozenset()
+        position = "prefill"
+        sample_adapter = None
+        per_layer_adapters = {}
+        debug_mask_enabled = False
 
     class ReFTLlamaDecoderLayer(LlamaDecoderLayer):
-        """LlamaDecoderLayer with optional ReFT adapter delta."""
+        """LlamaDecoderLayer with multi-ReFT adapter support."""
 
         def __init__(self, vllm_config, prefix="", config=None):
             super().__init__(vllm_config=vllm_config, prefix=prefix,
                              config=config)
 
             layer_idx = _extract_layer_idx(prefix)
-            if layer_idx is not None and layer_idx in layer_indices_set:
-                try:
-                    dev = next(self.parameters()).device
-                except StopIteration:
-                    dev = torch.device("cuda" if torch.cuda.is_available()
-                                       else "cpu")
+            try:
+                dev = next(self.parameters()).device
+            except StopIteration:
+                dev = torch.device("cuda" if torch.cuda.is_available()
+                                   else "cpu")
+
+            llama_config = getattr(vllm_config, "model_config", vllm_config)
+            hf_config = getattr(llama_config, "hf_config",
+                                getattr(llama_config, "config", config))
+            model_dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
+            if model_dtype is None:
+                model_dtype = torch.bfloat16
+            hidden_size = getattr(hf_config, "hidden_size", 4096)
+
+            object.__setattr__(self, "_reft_layer_idx",
+                               layer_idx if layer_idx is not None else -1)
+            object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
+            self.reft_adapter = None  # backward compat attribute
+
+            _init_multi_reft_state(self, dev, hidden_size)
+
+            # Load initial adapter from reft_spec (backward compat, id=1)
+            if (layer_idx is not None and layer_idx in layer_indices_set
+                    and sample_adapter is not None):
                 source = per_layer_adapters.get(layer_idx, sample_adapter)
-                llama_config = getattr(vllm_config, "model_config", vllm_config)
-                hf_config = getattr(llama_config, "hf_config",
-                                    getattr(llama_config, "config", config))
-                model_dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
-                if model_dtype is None:
-                    model_dtype = torch.bfloat16
-                adapter_copy = copy.deepcopy(source).to(dev)
-                # Cast all nn.Linear layers to model dtype so matmuls
-                # don't allocate float32 temporaries during CUDA graph
-                # capture.  rotate_layer stays float32 (Householder
-                # parametrization requires it).
-                for child in adapter_copy.modules():
-                    if isinstance(child, nn.Linear):
-                        child.to(dtype=model_dtype)
-
-                _install_adapter_caches(adapter_copy, model_dtype=model_dtype)
-                _init_reft_debug_buffers(self, dev)
-                hidden_size = getattr(hf_config, "hidden_size", 4096)
-                _init_reft_capture_buffers(self, hidden_size, dev)
-                _init_reft_position_mask_buffer(
-                    self, _REFT_MASK_FALLBACK_SIZE, dev)
-
-                self.reft_adapter = adapter_copy
-                object.__setattr__(self, "_reft_layer_idx", layer_idx)
-                object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
+                adapter_copy = _prepare_adapter(source, dev, model_dtype)
+                _add_adapter_to_layer(self, 1, adapter_copy, position, dev)
                 _REFT_ADAPTER_REGISTRY[layer_idx] = adapter_copy
                 logger.debug(
-                    "[ReFT-vLLM] Attached adapter to Llama layer %d "
-                    "(adapter_type=%s, has_R_cache=%s)",
-                    layer_idx,
-                    type(adapter_copy).__name__,
-                    hasattr(adapter_copy, "_R_cache"),
-                )
-            else:
-                object.__setattr__(self, "_reft_layer_idx", -1)
-                object.__setattr__(self, "_reft_debug_enabled", False)
+                    "[ReFT-vLLM] Attached initial adapter to Llama layer %d "
+                    "(adapter_type=%s)", layer_idx,
+                    type(adapter_copy).__name__)
 
-            object.__setattr__(self, "_reft_position", position)
-            _maybe_log_reft_layer_init(
-                arch="llama",
-                layer_idx=getattr(self, "_reft_layer_idx", -1),
-                attached=getattr(self, "reft_adapter", None) is not None,
-                debug_enabled=bool(getattr(self, "_reft_debug_enabled", False)),
-                position=position,
-                adapter=getattr(self, "reft_adapter", None),
-            )
-
-        def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            residual,
-        ):
-            hidden_states, residual = super().forward(
-                positions, hidden_states, residual)
-
-            if getattr(self, "reft_adapter", None) is None:
-                return hidden_states, residual
-
-            h_full = hidden_states + residual
-
-            delta = self.reft_adapter._compute_delta(
-                h_full.unsqueeze(0)).squeeze(0)
-
-            # Position mask (same as Qwen2 path above).
-            mask_buf = getattr(self, "_reft_position_mask", None)
-            if mask_buf is not None:
-                N = delta.shape[0]
-                delta = delta * mask_buf[:N].unsqueeze(-1).to(delta.dtype)
-
-            hidden_states = delta
-            residual = h_full
-            return hidden_states, residual
+        def forward(self, positions, hidden_states, residual):
+            return _multi_reft_forward(
+                self, positions, hidden_states, residual,
+                super_forward=super().forward)
 
         def get_reft_debug_stats(self) -> Optional[dict]:
             return _collect_layer_reft_debug_stats(self)

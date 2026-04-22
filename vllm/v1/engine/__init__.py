@@ -11,6 +11,7 @@ import torch
 
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.reft.request import ReFTRequest
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import SchedulerStats
@@ -54,6 +55,7 @@ class EngineCoreRequest(
     eos_token_id: Optional[int]
     arrival_time: float
     lora_request: Optional[LoRARequest]
+    reft_request: Optional[ReFTRequest]
     cache_salt: Optional[str]
     data_parallel_rank: Optional[int]
     prompt_embeds: Optional[torch.Tensor] = None

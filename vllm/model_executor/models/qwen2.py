@@ -469,17 +469,22 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
 
         self.quant_config = quant_config
 
-        # If reft_config is set on VllmConfig, use ReFT-aware decoder layers
-        # so CUDA graphs capture the adapter path.  Falls back to the
-        # deprecated get_reft_spec() for TRL training hooks that set global state.
+        # If reft_config is set or enable_reft is True, use ReFT-aware decoder
+        # layers so CUDA graphs capture the adapter path.
         from vllm.reft import reft_config_to_spec, get_reft_spec
         from vllm.reft.layer import make_reft_qwen2_layer
+        enable_reft = getattr(vllm_config, "enable_reft", False)
         reft_spec = reft_config_to_spec(
             getattr(vllm_config, "reft_config", None))
         if reft_spec is None:
             reft_spec = get_reft_spec()
-        decoder_layer_type = (make_reft_qwen2_layer(reft_spec)
-                              if reft_spec is not None else Qwen2DecoderLayer)
+        if reft_spec is not None:
+            decoder_layer_type = make_reft_qwen2_layer(reft_spec)
+        elif enable_reft:
+            # Multi-ReFT mode: empty adapters, loaded dynamically
+            decoder_layer_type = make_reft_qwen2_layer(None)
+        else:
+            decoder_layer_type = Qwen2DecoderLayer
 
         self.model = Qwen2Model(vllm_config=vllm_config,
                                 prefix=maybe_prefix(prefix, "model"),
@@ -519,8 +524,8 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         stats["__summary__"] = {
             "model_type": type(self).__name__,
             "num_layers": len(layers),
-            "adapter_attr_layers": sum(
-                getattr(layer, "reft_adapter", None) is not None
+            "adapter_layers": sum(
+                hasattr(layer, "reft_adapters") and len(layer.reft_adapters) > 0
                 for layer in layers),
             "debug_enabled_layers": sum(
                 bool(getattr(layer, "_reft_debug_enabled", False))
@@ -561,7 +566,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         loaded = loader.load_weights(weights)
         # Mark adapter params as loaded for checkpoint validator
         for name, _ in self.named_parameters():
-            if ".reft_adapter." in name:
+            if ".reft_adapter." in name or ".reft_adapters." in name:
                 loaded.add(name)
         return loaded
 
@@ -569,7 +574,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         """Return param/buffer fingerprints for ReFT adapters.
 
         Used by diagnostic scripts to verify weight sync in server mode.
-        Returns a dict keyed by layer index, each containing param and buffer
+        Returns a dict keyed by layer index, each containing per-adapter
         fingerprints (name, shape, dtype, first 4 flattened values).
         """
         result = {}
@@ -578,23 +583,27 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
             n = len(layers)
             layer_indices = [0, n // 2, n - 1]
         for idx in layer_indices:
-            adapter = getattr(layers[idx], "reft_adapter", None)
-            if adapter is None:
+            layer = layers[idx]
+            if not hasattr(layer, "reft_adapters"):
                 continue
-            layer_fp = {"params": {}, "buffers": {}}
-            for pname, p in adapter.named_parameters():
-                layer_fp["params"][pname] = {
-                    "shape": list(p.shape),
-                    "dtype": str(p.dtype),
-                    "first4": p.data.detach().float().flatten()[:4].tolist(),
-                }
-            for bname, b in adapter.named_buffers():
-                layer_fp["buffers"][bname] = {
-                    "shape": list(b.shape),
-                    "dtype": str(b.dtype),
-                    "first4": b.data.detach().float().flatten()[:4].tolist(),
-                }
-            result[idx] = layer_fp
+            layer_fp = {}
+            for str_id, adapter in layer.reft_adapters.items():
+                adapter_fp = {"params": {}, "buffers": {}}
+                for pname, p in adapter.named_parameters():
+                    adapter_fp["params"][pname] = {
+                        "shape": list(p.shape),
+                        "dtype": str(p.dtype),
+                        "first4": p.data.detach().float().flatten()[:4].tolist(),
+                    }
+                for bname, b in adapter.named_buffers():
+                    adapter_fp["buffers"][bname] = {
+                        "shape": list(b.shape),
+                        "dtype": str(b.dtype),
+                        "first4": b.data.detach().float().flatten()[:4].tolist(),
+                    }
+                layer_fp[str_id] = adapter_fp
+            if layer_fp:
+                result[idx] = layer_fp
         return result
 
     def refresh_reft_caches(self) -> None:
@@ -605,25 +614,12 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         """
         refreshed = []
         for idx, layer in enumerate(self.model.layers):
-            adapter = getattr(layer, "reft_adapter", None)
-            if adapter is not None and hasattr(adapter,
-                                               "refresh_inference_caches"):
-                if logger.isEnabledFor(logging.DEBUG) and idx in (0, 12, 23):
-                    for pname, p in adapter.named_parameters():
-                        fp = p.data.flatten()[:4].tolist()
-                        logger.debug(
-                            "[VLLM params] layer %d %s: %s shape=%s dtype=%s",
-                            idx, pname, [f'{v:.6f}' for v in fp],
-                            list(p.shape), p.dtype,
-                        )
-                    for bname, b in adapter.named_buffers():
-                        fp = b.data.flatten()[:4].tolist()
-                        logger.debug(
-                            "[VLLM buffer] layer %d %s: %s shape=%s dtype=%s",
-                            idx, bname, [f'{v:.6f}' for v in fp],
-                            list(b.shape), b.dtype,
-                        )
-                adapter.refresh_inference_caches()
-                refreshed.append(idx)
-        logger.debug("Refreshed %d ReFT adapter caches: %s", len(refreshed), refreshed)
+            if not hasattr(layer, "reft_adapters"):
+                continue
+            for str_id, adapter in layer.reft_adapters.items():
+                if hasattr(adapter, "refresh_inference_caches"):
+                    adapter.refresh_inference_caches()
+                    refreshed.append((idx, str_id))
+        logger.debug("Refreshed %d ReFT adapter caches: %s",
+                      len(refreshed), refreshed)
 

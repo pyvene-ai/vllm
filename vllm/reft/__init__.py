@@ -33,7 +33,10 @@ from typing import Any, Optional
 
 logger = logging.getLogger("vllm.reft")
 
+from vllm.reft.request import ReFTRequest
+
 __all__ = [
+    "ReFTRequest",
     "reft_config_to_spec",
     "spec_to_reft_config",
     # Deprecated global-state API (backward compat only):

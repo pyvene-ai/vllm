@@ -140,6 +140,9 @@ class VllmConfig:
     """ReFT adapter configuration. Serializable blueprint dict that flows
     through LLM() → EngineArgs → VllmConfig → model constructors, replacing
     the old set_reft_spec() global-state pattern. Multiprocess-safe."""
+    enable_reft: bool = False
+    """Enable multi-ReFT adapter serving. When True, the model is constructed
+    with ReFT-aware decoder layers that support dynamic adapter loading."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.

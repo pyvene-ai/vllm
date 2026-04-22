@@ -11,6 +11,7 @@ from typing_extensions import deprecated
 
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItems
+from vllm.reft.request import ReFTRequest
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import length_from_prompt_token_ids_or_embeds, swap_dict_values
@@ -43,6 +44,7 @@ class CachedRequestState:
     mrope_position_delta: Optional[int] = None
 
     lora_request: Optional[LoRARequest] = None
+    reft_request: Optional[ReFTRequest] = None
     prompt_embeds: Optional[torch.Tensor] = None
 
     def __post_init__(self):
@@ -232,6 +234,12 @@ class InputBatch:
                                              dtype=np.int32)
         self.lora_id_to_request_ids: dict[int, set[str]] = {}
         self.lora_id_to_lora_request: dict[int, LoRARequest] = {}
+
+        # reft related
+        self.request_reft_mapping = np.zeros((self.max_num_reqs, ),
+                                             dtype=np.int32)
+        self.reft_id_to_request_ids: dict[int, set[str]] = {}
+        self.reft_id_to_reft_request: dict[int, ReFTRequest] = {}
 
         # req_index -> generator
         # NOTE(woosuk): The indices of the requests that do not have their own
@@ -443,6 +451,18 @@ class InputBatch:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
 
+        # Add request reft ID
+        if request.reft_request:
+            reft_id = request.reft_request.reft_int_id
+            if reft_id not in self.reft_id_to_request_ids:
+                self.reft_id_to_request_ids[reft_id] = set()
+
+            self.request_reft_mapping[req_index] = reft_id
+            self.reft_id_to_request_ids[reft_id].add(request.req_id)
+            self.reft_id_to_reft_request[reft_id] = request.reft_request
+        else:
+            self.request_reft_mapping[req_index] = 0
+
         return req_index
 
     def remove_request(self, req_id: str) -> Optional[int]:
@@ -472,6 +492,16 @@ class InputBatch:
                 del self.lora_id_to_request_ids[lora_id]
                 del self.lora_id_to_lora_request[lora_id]
             self.request_lora_mapping[req_index] = 0
+
+        # ReFT
+        reft_id = self.request_reft_mapping[req_index]
+        if reft_id != 0:
+            reft_req_ids = self.reft_id_to_request_ids[reft_id]
+            reft_req_ids.discard(req_id)
+            if not reft_req_ids:
+                del self.reft_id_to_request_ids[reft_id]
+                del self.reft_id_to_reft_request[reft_id]
+            self.request_reft_mapping[req_index] = 0
 
         if self.is_pooling_model:
             self.pooling_params.pop(req_id, None)
@@ -543,6 +573,9 @@ class InputBatch:
 
         self.request_lora_mapping[i1], self.request_lora_mapping[i2] = \
             self.request_lora_mapping[i2], self.request_lora_mapping[i1]
+
+        self.request_reft_mapping[i1], self.request_reft_mapping[i2] = \
+            self.request_reft_mapping[i2], self.request_reft_mapping[i1]
 
         if self.is_pooling_model:
             # Sampling and logits parameters don't apply to pooling models.
@@ -643,6 +676,9 @@ class InputBatch:
             self.block_table.move_row(last_req_index, empty_index)
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[
+                last_req_index]
+
+            self.request_reft_mapping[empty_index] = self.request_reft_mapping[
                 last_req_index]
 
             if self.is_pooling_model:
@@ -823,6 +859,19 @@ class InputBatch:
             self.lora_id_to_lora_request.values())
 
         return prompt_lora_mapping, token_lora_mapping, active_lora_requests
+
+    def make_reft_inputs(
+        self, num_scheduled_tokens: np.ndarray
+    ) -> np.ndarray:
+        """Build per-token reft_int_id mapping from per-request mapping.
+
+        Returns:
+            token_reft_mapping: 1-D int32 numpy array of shape
+                (sum(num_scheduled_tokens),).  Each element is the
+                ``reft_int_id`` for that token (0 = no adapter).
+        """
+        req_reft_mapping = self.request_reft_mapping[:self.num_reqs]
+        return req_reft_mapping.repeat(num_scheduled_tokens)
 
     @property
     def num_reqs(self) -> int:
