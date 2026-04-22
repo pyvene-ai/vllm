@@ -224,6 +224,32 @@ class VllmConfig:
             vllm_factors.append(self.kv_transfer_config.compute_hash())
         else:
             vllm_factors.append("None")
+        if self.reft_config:
+            # ReFT adapter tensor shapes are baked into compiled graph inputs
+            # (e.g. learned_source bias shape baked in by assert_size_stride),
+            # so two runs with different adapter ranks / structure must not
+            # share a compile cache. Hash param shapes directly — any kwarg
+            # that changes a tensor size is picked up automatically. Weight
+            # values are excluded since they don't alter the graph.
+            rc = self.reft_config
+            sa = rc.get("sample_adapter") if isinstance(rc, dict) else None
+            sa_state = sa.get("state_dict", {}) if isinstance(sa, dict) else {}
+            sa_kwargs = sa.get("kwargs", {}) if isinstance(sa, dict) else {}
+            reft_factors = {
+                "layer_indices": (sorted(rc.get("layer_indices", []))
+                                  if isinstance(rc, dict) else None),
+                "position": rc.get("position") if isinstance(rc, dict) else None,
+                "adapter_cls": (f"{sa.get('__module__')}.{sa.get('__qualname__')}"
+                                if isinstance(sa, dict) else None),
+                "dtype": sa_kwargs.get("dtype"),
+                "param_shapes": {k: tuple(v.shape) for k, v in sa_state.items()},
+            }
+            vllm_factors.append(hashlib.md5(
+                json.dumps(reft_factors, sort_keys=True, default=str).encode(),
+                usedforsecurity=False,
+            ).hexdigest())
+        else:
+            vllm_factors.append("None")
         if self.additional_config:
             if isinstance(additional_config := self.additional_config, dict):
                 additional_config_hash = hashlib.md5(
