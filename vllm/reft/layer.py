@@ -948,13 +948,35 @@ def update_multi_reft_position_masks(
     if not reft_layers:
         return
 
+    # Detect pure-decode batch from metadata (no GPU sync needed).
+    # If no prefill tokens and all adapters use non-"all" positions,
+    # skip mask computation and adapter forward entirely.
+    resolved_meta = _resolve_attn_metadata(attn_metadata)
+    (num_prefill_tokens, _, _, _, _) = _get_prefill_info(resolved_meta)
+    is_pure_decode = (num_prefill_tokens is not None
+                      and num_prefill_tokens == 0)
+
+    if is_pure_decode:
+        # Check if any adapter uses position="all" (needs decode-time compute)
+        any_all_position = any(
+            pos in ("all", "all_tokens")
+            for layer in reft_layers
+            if hasattr(layer, "_reft_adapter_positions")
+            for pos in layer._reft_adapter_positions.values()
+        )
+        if not any_all_position:
+            # Pure decode + no "all" adapters → skip everything
+            for layer in reft_layers:
+                layer._reft_all_masks_zero = True
+            return
+
     # Cache position masks by position string to avoid redundant computation.
     pos_mask_cache: dict[str, Optional[torch.Tensor]] = {}
 
     for layer in reft_layers:
         if not hasattr(layer, "reft_adapters"):
             continue
-        all_zero = True
+        layer._reft_all_masks_zero = False
         for str_id in layer.reft_adapters:
             int_id = int(str_id)
             # Adapter membership mask
@@ -983,12 +1005,6 @@ def update_multi_reft_position_masks(
                 layer._reft_combined_masks[int_id] = buf
             buf[:num_tokens].copy_(combined[:num_tokens])
             buf[num_tokens:].zero_()
-            if all_zero and combined[:num_tokens].any():
-                all_zero = False
-        # Tell the forward pass to skip adapter computation entirely
-        # when no tokens in the batch need any adapter (e.g. pure decode
-        # with prefill-only adapters).
-        layer._reft_all_masks_zero = all_zero
 
 
 # ---------------------------------------------------------------------------
