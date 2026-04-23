@@ -2682,12 +2682,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         for module in self.model.modules():
             if hasattr(module, "reft_adapters"):
                 self._reft_layers.append(module)
-        # If reft_config= was used (single-adapter baked in at construction),
-        # adapter id=1 is present but users won't pass ReFTRequest.  We
-        # default untagged tokens to id=1 so the adapter fires.
-        self._reft_builtin_adapter = (
-            any("1" in layer.reft_adapters for layer in self._reft_layers)
-            and getattr(self.vllm_config, "reft_config", None) is not None
+        # If a single adapter (id=1) was baked in at construction time
+        # (via reft_config= or set_reft_spec()), users won't pass
+        # ReFTRequest per request.  Default untagged tokens to id=1 so
+        # the adapter fires.  Detect by checking if adapter "1" exists
+        # on any layer — works for both the VllmConfig path and the
+        # deprecated global-state path used by TRL training hooks.
+        self._reft_builtin_adapter = any(
+            "1" in layer.reft_adapters for layer in self._reft_layers
         )
         if self._reft_layers:
             logger.info("[ReFT] Found %d ReFT layers for multi-adapter "
