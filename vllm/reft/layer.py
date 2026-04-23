@@ -995,6 +995,8 @@ def update_multi_reft_position_masks(
             continue
         for str_id in layer.reft_adapters:
             int_id = int(str_id)
+            if int_id not in layer._reft_active_ids:
+                continue
             # Adapter membership mask
             adapter_mask = (token_reft_ids == int_id).float()
             # Position mask (cached by position string)
