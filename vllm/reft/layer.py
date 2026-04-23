@@ -892,31 +892,34 @@ def _multi_reft_forward(
 ):
     """Shared multi-adapter forward pass for Qwen2 and Llama layers.
 
-    Graph-safe approach: iterates ALL loaded adapters, using pre-computed
-    combined masks (adapter membership AND position mask) to zero out
-    irrelevant deltas.  The iteration order is fixed (dict order), so the
-    compute graph is static for CUDA graph capture.
+    Only iterates adapters that are active in the current batch (set by
+    ``update_multi_reft_position_masks`` before each forward).  Inactive
+    adapters are skipped entirely — no ``_compute_delta``, no masking.
 
-    Pure-decode optimisation: if ``_reft_all_masks_zero`` is set by the
-    model runner (all combined masks are zero, e.g. a decode-only batch
-    with position=prefill adapters), skip adapter computation entirely.
+    Pure-decode optimisation: if ``_reft_all_masks_zero`` is set (e.g.
+    decode-only batch with prefill adapters), skip everything.
     """
     hidden_states, residual = super_forward(positions, hidden_states, residual)
 
     if not hasattr(layer_self, "reft_adapters") or len(layer_self.reft_adapters) == 0:
         return hidden_states, residual
 
-    # Skip adapter computation when all masks are zero (pure decode batch
-    # with prefill/first/last adapters).  The flag is set by
-    # update_multi_reft_position_masks before each forward pass.
+    # Skip when all masks are zero (pure decode with non-"all" adapters).
     if getattr(layer_self, "_reft_all_masks_zero", False):
         return hidden_states, residual
+
+    # Only iterate adapters that have at least one token in this batch.
+    # _reft_active_ids is a Python set computed by
+    # update_multi_reft_position_masks (outside compilation, no GPU sync).
+    active_ids = getattr(layer_self, "_reft_active_ids", None)
 
     h_full = hidden_states + residual
     delta = torch.zeros_like(hidden_states)
 
     for str_id, adapter in layer_self.reft_adapters.items():
         int_id = int(str_id)
+        if active_ids is not None and int_id not in active_ids:
+            continue
         adapter_delta = adapter._compute_delta(
             h_full.unsqueeze(0)).squeeze(0)
         mask_buf = layer_self._reft_combined_masks.get(int_id)
@@ -970,13 +973,26 @@ def update_multi_reft_position_masks(
                 layer._reft_all_masks_zero = True
             return
 
+    # Compute the set of adapter IDs actually referenced in this batch.
+    # One .unique() call on a small 1-D int tensor — fast, no GPU sync
+    # needed since we only use the result as a Python set for membership
+    # checks in the forward pass.
+    active_ids_tensor = token_reft_ids.unique()
+    batch_active_ids: set[int] = set(active_ids_tensor.tolist())
+    batch_active_ids.discard(0)  # 0 = no adapter
+
     # Cache position masks by position string to avoid redundant computation.
     pos_mask_cache: dict[str, Optional[torch.Tensor]] = {}
 
     for layer in reft_layers:
         if not hasattr(layer, "reft_adapters"):
             continue
-        layer._reft_all_masks_zero = False
+        # Intersect batch-active IDs with this layer's loaded adapters.
+        layer._reft_active_ids = batch_active_ids & {
+            int(s) for s in layer.reft_adapters}
+        layer._reft_all_masks_zero = len(layer._reft_active_ids) == 0
+        if layer._reft_all_masks_zero:
+            continue
         for str_id in layer.reft_adapters:
             int_id = int(str_id)
             # Adapter membership mask
