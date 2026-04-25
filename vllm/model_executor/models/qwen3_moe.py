@@ -369,7 +369,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
 @support_torch_compile
 class Qwen3MoeModel(nn.Module):
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self,
+                 *,
+                 vllm_config: VllmConfig,
+                 prefix: str = "",
+                 decoder_layer_type: type[nn.Module] = Qwen3MoeDecoderLayer):
         super().__init__()
 
         config = vllm_config.model_config.hf_text_config
@@ -388,8 +392,8 @@ class Qwen3MoeModel(nn.Module):
             prefix=f"{prefix}.embed_tokens")
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config,
-                                                prefix=prefix),
+            lambda prefix: decoder_layer_type(vllm_config=vllm_config,
+                                              prefix=prefix),
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -590,8 +594,23 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+
+        # If reft_config is set on VllmConfig, swap in ReFT-aware decoder
+        # layers so CUDA graphs capture the adapter path.  Falls back to
+        # the deprecated get_reft_spec() global state used by TRL hooks.
+        from vllm.reft import reft_config_to_spec, get_reft_spec
+        from vllm.reft.layer import make_reft_qwen3_moe_layer
+        reft_spec = reft_config_to_spec(
+            getattr(vllm_config, "reft_config", None))
+        if reft_spec is None:
+            reft_spec = get_reft_spec()
+        decoder_layer_type = (make_reft_qwen3_moe_layer(reft_spec)
+                              if reft_spec is not None
+                              else Qwen3MoeDecoderLayer)
+
         self.model = Qwen3MoeModel(vllm_config=vllm_config,
-                                   prefix=maybe_prefix(prefix, "model"))
+                                   prefix=maybe_prefix(prefix, "model"),
+                                   decoder_layer_type=decoder_layer_type)
         self.lm_head = ParallelLMHead(config.vocab_size,
                                       config.hidden_size,
                                       quant_config=quant_config,
@@ -686,7 +705,81 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        # ReFT adapter params are not in the checkpoint; mark them loaded so
+        # the checkpoint validator does not flag them as missing.
+        for name, _ in self.named_parameters():
+            if ".reft_adapter." in name:
+                loaded.add(name)
+        return loaded
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
+
+    # ------------------------------------------------------------------ #
+    # ReFT helpers (mirror qwen2.py / llama.py).  No-ops when no adapter. #
+    # ------------------------------------------------------------------ #
+
+    def get_reft_debug_stats(self) -> dict:
+        """Return serializable per-layer ReFT debug stats, if enabled."""
+        stats: dict = {}
+        layers = list(self.model.layers)
+        stats["__summary__"] = {
+            "model_type": type(self).__name__,
+            "num_layers": len(layers),
+            "adapter_attr_layers": sum(
+                getattr(layer, "reft_adapter", None) is not None
+                for layer in layers),
+            "debug_enabled_layers": sum(
+                bool(getattr(layer, "_reft_debug_enabled", False))
+                for layer in layers),
+        }
+        for layer_idx, layer in enumerate(layers):
+            if hasattr(layer, "get_reft_debug_stats"):
+                layer_stats = layer.get_reft_debug_stats()
+                if layer_stats is not None:
+                    stats[layer_idx] = layer_stats
+        return stats
+
+    def get_reft_weight_fingerprints(self, layer_indices=None) -> dict:
+        """Per-layer adapter param/buffer fingerprints for sync diagnostics."""
+        result = {}
+        layers = list(self.model.layers)
+        if layer_indices is None:
+            n = len(layers)
+            layer_indices = [0, n // 2, n - 1]
+        for idx in layer_indices:
+            adapter = getattr(layers[idx], "reft_adapter", None)
+            if adapter is None:
+                continue
+            layer_fp = {"params": {}, "buffers": {}}
+            for pname, p in adapter.named_parameters():
+                layer_fp["params"][pname] = {
+                    "shape": list(p.shape),
+                    "dtype": str(p.dtype),
+                    "first4": p.data.detach().float().flatten()[:4].tolist(),
+                }
+            for bname, b in adapter.named_buffers():
+                layer_fp["buffers"][bname] = {
+                    "shape": list(b.shape),
+                    "dtype": str(b.dtype),
+                    "first4": b.data.detach().float().flatten()[:4].tolist(),
+                }
+            result[idx] = layer_fp
+        return result
+
+    def refresh_reft_caches(self) -> None:
+        """Recompute derived ReFT caches after adapter weights are updated.
+
+        Called via ``collective_rpc("refresh_reft_caches")`` after TRL's
+        ``sync_weights()`` pushes new adapter parameters.
+        """
+        refreshed = []
+        for idx, layer in enumerate(self.model.layers):
+            adapter = getattr(layer, "reft_adapter", None)
+            if adapter is not None and hasattr(adapter,
+                                               "refresh_inference_caches"):
+                adapter.refresh_inference_caches()
+                refreshed.append(idx)
+        logger.debug("Refreshed %d ReFT adapter caches: %s",
+                     len(refreshed), refreshed)
