@@ -143,6 +143,12 @@ class VllmConfig:
     enable_reft: bool = False
     """Enable multi-ReFT adapter serving. When True, the model is constructed
     with ReFT-aware decoder layers that support dynamic adapter loading."""
+    max_refts: int = 256
+    """Maximum number of distinct ReFT adapters simultaneously active on GPU.
+    Default is high because ReFT adapters are tiny (~16K params/layer)."""
+    max_cpu_refts: int = 1024
+    """Maximum number of ReFT adapters cached on CPU. Adapters are lazily
+    loaded to GPU when needed and LRU-evicted when at ``max_refts``."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.

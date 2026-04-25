@@ -2300,6 +2300,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # token IDs are 0.  Default those to 1 so the adapter fires.
             if self._reft_builtin_adapter:
                 token_reft_ids[token_reft_ids == 0] = 1
+            # Ensure all adapters needed for this batch are on GPU.
+            if self.reft_manager is not None:
+                batch_ids = set(token_reft_ids.unique().tolist()) - {0}
+                self.reft_manager.ensure_active(batch_ids)
             update_multi_reft_position_masks(
                 self._reft_layers, token_reft_ids, actual_positions,
                 attn_metadata, num_scheduled_tokens)
@@ -2691,10 +2695,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self._reft_builtin_adapter = any(
             "1" in layer.reft_adapters for layer in self._reft_layers
         )
+        # Instantiate centralized ReFT adapter manager with LRU eviction.
+        self.reft_manager: Optional["ReFTModelManager"] = None
+        if self.vllm_config.enable_reft and self._reft_layers:
+            from vllm.reft.models import ReFTModelManager
+            self.reft_manager = ReFTModelManager(
+                reft_layers=self._reft_layers,
+                max_refts=self.vllm_config.max_refts,
+                max_cpu_refts=self.vllm_config.max_cpu_refts,
+                device=self.device,
+            )
         if self._reft_layers:
             logger.info("[ReFT] Found %d ReFT layers for multi-adapter "
-                        "position masking (builtin_adapter=%s)",
-                        len(self._reft_layers), self._reft_builtin_adapter)
+                        "position masking (builtin_adapter=%s, manager=%s)",
+                        len(self._reft_layers), self._reft_builtin_adapter,
+                        self.reft_manager is not None)
 
         self.is_multimodal_pruning_enabled = (supports_multimodal_pruning(
             self.model) and self.model_config.multimodal_config.

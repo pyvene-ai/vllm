@@ -125,12 +125,24 @@ class WorkerBase:
             self.refresh_reft_caches(reft_int_id)
         return count
 
+    def _get_reft_manager(self):
+        """Try to get the ReFTModelManager from the model runner, if any."""
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            return getattr(model_runner, "reft_manager", None)
+        return None
+
     def load_reft_adapter(self, reft_int_id: int, adapter_config: dict,
                           position: str = "prefill") -> int:
         """Load a new ReFT adapter into all relevant layers.
 
         Called via ``collective_rpc("load_reft_adapter",
         args=(reft_int_id, adapter_config, position))``.
+
+        If a :class:`~vllm.reft.models.ReFTModelManager` is available (the
+        ``enable_reft`` path), the adapter is registered and activated through
+        the manager's LRU cache.  Otherwise falls back to direct per-layer
+        loading.
 
         Args:
             reft_int_id: Unique integer ID for this adapter (>= 1).
@@ -140,10 +152,27 @@ class WorkerBase:
         Returns:
             Number of layers the adapter was loaded into.
         """
-        import copy as _copy
+        # Delegate to centralized manager when available.
+        manager = self._get_reft_manager()
+        if manager is not None:
+            from vllm.reft import reft_config_to_spec
+            from vllm.reft.models import ReFTModel
+            spec = reft_config_to_spec(adapter_config)
+            if spec is None:
+                return 0
+            reft_model = ReFTModel(
+                id=reft_int_id,
+                position=position,
+                adapter_config=adapter_config,
+                layer_indices=frozenset(spec.get("layer_indices", ())),
+            )
+            manager.add_adapter(reft_model)
+            manager.activate_adapter(reft_int_id)
+            return len(reft_model.layer_indices)
+
+        # Fallback: direct per-layer loading (backward compat).
         from vllm.reft import reft_config_to_spec
-        from vllm.reft.layer import (_prepare_adapter, _add_adapter_to_layer,
-                                     _install_adapter_caches)
+        from vllm.reft.layer import _prepare_adapter, _add_adapter_to_layer
 
         spec = reft_config_to_spec(adapter_config)
         if spec is None:
@@ -171,9 +200,19 @@ class WorkerBase:
     def unload_reft_adapter(self, reft_int_id: int) -> int:
         """Remove a ReFT adapter from all layers.
 
+        Delegates to the :class:`~vllm.reft.models.ReFTModelManager` when
+        available, otherwise falls back to direct per-layer removal.
+
         Returns:
             Number of layers the adapter was removed from.
         """
+        # Delegate to centralized manager when available.
+        manager = self._get_reft_manager()
+        if manager is not None:
+            was_removed = manager.remove_adapter(reft_int_id)
+            return 1 if was_removed else 0
+
+        # Fallback: direct per-layer removal (backward compat).
         model = self.get_model()
         key = str(reft_int_id)
         count = 0

@@ -327,6 +327,15 @@ class Scheduler(SchedulerInterface):
                 if req.lora_request and req.lora_request.lora_int_id > 0)
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        # Record the ReFT adapters in scheduled_running_reqs
+        scheduled_refts: set[int] = set()
+        if self.vllm_config.enable_reft:
+            scheduled_refts = set(
+                req.reft_request.reft_int_id
+                for req in scheduled_running_reqs
+                if req.reft_request and req.reft_request.reft_int_id > 0)
+            assert len(scheduled_refts) <= self.vllm_config.max_refts
+
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
@@ -369,6 +378,18 @@ class Scheduler(SchedulerInterface):
                     (len(scheduled_loras) == self.lora_config.max_loras and
                      request.lora_request.lora_int_id not in scheduled_loras)):
                     # Scheduling would exceed max_loras, skip.
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
+                # Check that adding the request still respects the max_refts
+                # constraint.
+                if (self.vllm_config.enable_reft and request.reft_request
+                        and (len(scheduled_refts)
+                             == self.vllm_config.max_refts
+                             and request.reft_request.reft_int_id
+                             not in scheduled_refts)):
+                    # Scheduling would exceed max_refts, skip.
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
@@ -518,6 +539,9 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
+                if (self.vllm_config.enable_reft and request.reft_request
+                        and request.reft_request.reft_int_id > 0):
+                    scheduled_refts.add(request.reft_request.reft_int_id)
                 req_to_new_blocks[request.request_id] = (
                     self.kv_cache_manager.get_blocks(request.request_id))
                 num_scheduled_tokens[request.request_id] = num_new_tokens

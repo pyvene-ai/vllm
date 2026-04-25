@@ -33,9 +33,12 @@ from typing import Any, Optional
 
 logger = logging.getLogger("vllm.reft")
 
+from vllm.reft.models import ReFTModel, ReFTModelManager
 from vllm.reft.request import ReFTRequest
 
 __all__ = [
+    "ReFTModel",
+    "ReFTModelManager",
     "ReFTRequest",
     "reft_config_to_spec",
     "spec_to_reft_config",
