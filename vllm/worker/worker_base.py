@@ -91,12 +91,15 @@ class WorkerBase:
                     adapter.install_inference_caches()
 
     def sync_reft_weights(self, weight_dict: dict[int, dict[str, bytes]],
-                          reft_int_id: int = 1,
-                          refresh_caches: bool = True) -> int:
+                          refresh_caches: bool = True,
+                          reft_int_id: int = 1) -> int:
         """Load ReFT adapter weights for a specific adapter ID.
 
         Called via ``collective_rpc("sync_reft_weights",
-        args=(weight_dict, reft_int_id))`` from pyreft's ``sync_to_vllm``.
+        args=(weight_dict,), kwargs=...)`` from pyreft's ``sync_to_vllm`` and
+        from trl's vllm_generation. The 2nd positional arg is
+        ``refresh_caches`` (so trl's ``args=(weight_dict, False)`` correctly
+        disables cache refresh during step-time sync).
 
         Args:
             weight_dict: Mapping from layer index to serialized state_dict.
