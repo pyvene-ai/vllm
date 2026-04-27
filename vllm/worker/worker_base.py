@@ -114,7 +114,7 @@ class WorkerBase:
             layer = model.model.layers[idx]
             if not hasattr(layer, "reft_adapters"):
                 continue
-            adapter = layer.reft_adapters.get(key)
+            adapter = layer.reft_adapters[key] if key in layer.reft_adapters else None
             if adapter is None:
                 continue
             device = next(adapter.parameters()).device
