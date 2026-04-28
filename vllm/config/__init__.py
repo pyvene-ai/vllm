@@ -244,6 +244,17 @@ class VllmConfig:
             sa = rc.get("sample_adapter") if isinstance(rc, dict) else None
             sa_state = sa.get("state_dict", {}) if isinstance(sa, dict) else {}
             sa_kwargs = sa.get("kwargs", {}) if isinstance(sa, dict) else {}
+
+            def _shape_of(v):
+                # state_dict values are either raw tensors (live spec) or
+                # serialized {"__reft_t": True, "shape": [...], ...} dicts
+                # (post-spec_to_reft_config).
+                if isinstance(v, dict) and v.get("__reft_t"):
+                    return tuple(v.get("shape", ()))
+                if hasattr(v, "shape"):
+                    return tuple(v.shape)
+                return None
+
             reft_factors = {
                 "layer_indices": (sorted(rc.get("layer_indices", []))
                                   if isinstance(rc, dict) else None),
@@ -251,7 +262,7 @@ class VllmConfig:
                 "adapter_cls": (f"{sa.get('__module__')}.{sa.get('__qualname__')}"
                                 if isinstance(sa, dict) else None),
                 "dtype": sa_kwargs.get("dtype"),
-                "param_shapes": {k: tuple(v.shape) for k, v in sa_state.items()},
+                "param_shapes": {k: _shape_of(v) for k, v in sa_state.items()},
             }
             vllm_factors.append(hashlib.md5(
                 json.dumps(reft_factors, sort_keys=True, default=str).encode(),
