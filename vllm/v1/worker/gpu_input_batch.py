@@ -232,6 +232,9 @@ class InputBatch:
         # lora related
         self.request_lora_mapping = np.zeros((self.max_num_reqs, ),
                                              dtype=np.int32)
+        # lora_position: 0 = "all" (default), 1 = "prefill"
+        self.request_lora_position = np.zeros((self.max_num_reqs, ),
+                                              dtype=np.int8)
         self.lora_id_to_request_ids: dict[int, set[str]] = {}
         self.lora_id_to_lora_request: dict[int, LoRARequest] = {}
 
@@ -445,11 +448,14 @@ class InputBatch:
                 self.lora_id_to_request_ids[lora_id] = set()
 
             self.request_lora_mapping[req_index] = lora_id
+            self.request_lora_position[req_index] = (
+                1 if request.lora_request.lora_position == "prefill" else 0)
             self.lora_id_to_request_ids[lora_id].add(request.req_id)
             self.lora_id_to_lora_request[lora_id] = request.lora_request
         else:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
+            self.request_lora_position[req_index] = 0
 
         # Add request reft ID
         if request.reft_request:
@@ -492,6 +498,7 @@ class InputBatch:
                 del self.lora_id_to_request_ids[lora_id]
                 del self.lora_id_to_lora_request[lora_id]
             self.request_lora_mapping[req_index] = 0
+            self.request_lora_position[req_index] = 0
 
         # ReFT
         reft_id = self.request_reft_mapping[req_index]
@@ -573,6 +580,8 @@ class InputBatch:
 
         self.request_lora_mapping[i1], self.request_lora_mapping[i2] = \
             self.request_lora_mapping[i2], self.request_lora_mapping[i1]
+        self.request_lora_position[i1], self.request_lora_position[i2] = \
+            self.request_lora_position[i2], self.request_lora_position[i1]
 
         self.request_reft_mapping[i1], self.request_reft_mapping[i2] = \
             self.request_reft_mapping[i2], self.request_reft_mapping[i1]
@@ -677,6 +686,8 @@ class InputBatch:
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[
                 last_req_index]
+            self.request_lora_position[empty_index] = \
+                self.request_lora_position[last_req_index]
 
             self.request_reft_mapping[empty_index] = self.request_reft_mapping[
                 last_req_index]
@@ -851,10 +862,33 @@ class InputBatch:
             3. lora_requests: Set of relevant LoRA requests.
         """
 
-        req_lora_mapping = self.request_lora_mapping[:self.num_reqs]
-        prompt_lora_mapping = tuple(req_lora_mapping)
-        token_lora_mapping = tuple(
-            req_lora_mapping.repeat(num_scheduled_tokens))
+        num_reqs = self.num_reqs
+        req_lora_mapping = self.request_lora_mapping[:num_reqs]
+        req_lora_position = self.request_lora_position[:num_reqs]
+
+        has_prefill_only = np.any(req_lora_position == 1)
+
+        if has_prefill_only:
+            # A request is in decode phase when all prompt tokens are computed
+            is_decode = (self.num_computed_tokens_cpu[:num_reqs]
+                         >= self.num_prompt_tokens[:num_reqs])
+            should_mask = (req_lora_position == 1) & is_decode
+
+            # Zero out prompt_lora_mapping for decode-phase prefill-only reqs
+            prompt_array = req_lora_mapping.copy()
+            prompt_array[should_mask] = 0
+            prompt_lora_mapping = tuple(prompt_array)
+
+            # Zero out token_lora_mapping for those same reqs
+            token_array = req_lora_mapping.repeat(num_scheduled_tokens)
+            per_token_mask = should_mask.repeat(num_scheduled_tokens)
+            token_array[per_token_mask] = 0
+            token_lora_mapping = tuple(token_array)
+        else:
+            prompt_lora_mapping = tuple(req_lora_mapping)
+            token_lora_mapping = tuple(
+                req_lora_mapping.repeat(num_scheduled_tokens))
+
         active_lora_requests: set[LoRARequest] = set(
             self.lora_id_to_lora_request.values())
 
