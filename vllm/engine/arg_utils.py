@@ -471,6 +471,9 @@ class EngineArgs:
         get_field(VllmConfig, "additional_config")
 
     reft_config: Optional[dict] = None
+    enable_reft: bool = False
+    max_refts: int = 256
+    max_cpu_refts: int = 1024
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str = LoadConfig.pt_load_map_location
@@ -1446,6 +1449,9 @@ class EngineArgs:
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
             reft_config=self.reft_config,
+            enable_reft=self.enable_reft,
+            max_refts=self.max_refts,
+            max_cpu_refts=self.max_cpu_refts,
         )
 
         return config

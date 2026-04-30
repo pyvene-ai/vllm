@@ -140,6 +140,15 @@ class VllmConfig:
     """ReFT adapter configuration. Serializable blueprint dict that flows
     through LLM() → EngineArgs → VllmConfig → model constructors, replacing
     the old set_reft_spec() global-state pattern. Multiprocess-safe."""
+    enable_reft: bool = False
+    """Enable multi-ReFT adapter serving. When True, the model is constructed
+    with ReFT-aware decoder layers that support dynamic adapter loading."""
+    max_refts: int = 256
+    """Maximum number of distinct ReFT adapters simultaneously active on GPU.
+    Default is high because ReFT adapters are tiny (~16K params/layer)."""
+    max_cpu_refts: int = 1024
+    """Maximum number of ReFT adapters cached on CPU. Adapters are lazily
+    loaded to GPU when needed and LRU-evicted when at ``max_refts``."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.
@@ -235,6 +244,17 @@ class VllmConfig:
             sa = rc.get("sample_adapter") if isinstance(rc, dict) else None
             sa_state = sa.get("state_dict", {}) if isinstance(sa, dict) else {}
             sa_kwargs = sa.get("kwargs", {}) if isinstance(sa, dict) else {}
+
+            def _shape_of(v):
+                # state_dict values are either raw tensors (live spec) or
+                # serialized {"__reft_t": True, "shape": [...], ...} dicts
+                # (post-spec_to_reft_config).
+                if isinstance(v, dict) and v.get("__reft_t"):
+                    return tuple(v.get("shape", ()))
+                if hasattr(v, "shape"):
+                    return tuple(v.shape)
+                return None
+
             reft_factors = {
                 "layer_indices": (sorted(rc.get("layer_indices", []))
                                   if isinstance(rc, dict) else None),
@@ -242,7 +262,7 @@ class VllmConfig:
                 "adapter_cls": (f"{sa.get('__module__')}.{sa.get('__qualname__')}"
                                 if isinstance(sa, dict) else None),
                 "dtype": sa_kwargs.get("dtype"),
-                "param_shapes": {k: tuple(v.shape) for k, v in sa_state.items()},
+                "param_shapes": {k: _shape_of(v) for k, v in sa_state.items()},
             }
             vllm_factors.append(hashlib.md5(
                 json.dumps(reft_factors, sort_keys=True, default=str).encode(),

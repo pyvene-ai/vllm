@@ -6,6 +6,7 @@ from typing import (Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar,
                     Union)
 
 import cloudpickle
+import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -68,36 +69,55 @@ class WorkerBase:
         """Apply a function on the model inside this worker."""
         return fn(self.get_model())
 
-    def refresh_reft_caches(self) -> None:
+    def refresh_reft_caches(self, reft_int_id: Optional[int] = None) -> None:
         """Recompute derived ReFT caches after adapter weights are updated.
 
         Called via ``collective_rpc("refresh_reft_caches")`` after TRL's
         ``sync_weights()`` pushes new adapter parameters through
         ``load_weights()``.
+
+        Args:
+            reft_int_id: If given, only refresh caches for this adapter.
+                If None, refresh all adapters.
         """
         model = self.get_model()
-        if hasattr(model, "refresh_reft_caches"):
-            model.refresh_reft_caches()
+        for layer in model.model.layers:
+            if not hasattr(layer, "reft_adapters"):
+                continue
+            for str_id, adapter in layer.reft_adapters.items():
+                if reft_int_id is not None and int(str_id) != reft_int_id:
+                    continue
+                if hasattr(adapter, "install_inference_caches"):
+                    adapter.install_inference_caches()
 
     def sync_reft_weights(self, weight_dict: dict[int, dict[str, bytes]],
-                          refresh_caches: bool = True) -> int:
-        """Load ReFT adapter weights and optionally refresh caches.
+                          refresh_caches: bool = True,
+                          reft_int_id: int = 1) -> int:
+        """Load ReFT adapter weights for a specific adapter ID.
 
-        Called via ``collective_rpc("sync_reft_weights", args=(weight_dict,))``
-        from pyreft's ``sync_to_vllm`` or ``build_vllm_from_checkpoint``.
+        Called via ``collective_rpc("sync_reft_weights",
+        args=(weight_dict,), kwargs=...)`` from pyreft's ``sync_to_vllm`` and
+        from trl's vllm_generation. The 2nd positional arg is
+        ``refresh_caches`` (so trl's ``args=(weight_dict, False)`` correctly
+        disables cache refresh during step-time sync).
 
         Args:
             weight_dict: Mapping from layer index to serialized state_dict.
                 Values are ``{param_name: tensor}`` dicts with tensors on CPU.
+            reft_int_id: Which adapter to update (default 1 for backward compat).
             refresh_caches: Whether to recompute inference caches after loading.
 
         Returns:
             Number of adapter layers synced.
         """
         model = self.get_model()
+        key = str(reft_int_id)
         count = 0
         for idx, state_dict in weight_dict.items():
-            adapter = getattr(model.model.layers[idx], "reft_adapter", None)
+            layer = model.model.layers[idx]
+            if not hasattr(layer, "reft_adapters"):
+                continue
+            adapter = layer.reft_adapters[key] if key in layer.reft_adapters else None
             if adapter is None:
                 continue
             device = next(adapter.parameters()).device
@@ -105,8 +125,112 @@ class WorkerBase:
             adapter.load_state_dict(sd)
             count += 1
         if refresh_caches and count:
-            if hasattr(model, "refresh_reft_caches"):
-                model.refresh_reft_caches()
+            self.refresh_reft_caches(reft_int_id)
+        return count
+
+    def _get_reft_manager(self):
+        """Try to get the ReFTModelManager from the model runner, if any."""
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            return getattr(model_runner, "reft_manager", None)
+        return None
+
+    def load_reft_adapter(self, reft_int_id: int, adapter_config: dict,
+                          position: str = "prefill") -> int:
+        """Load a new ReFT adapter into all relevant layers.
+
+        Called via ``collective_rpc("load_reft_adapter",
+        args=(reft_int_id, adapter_config, position))``.
+
+        If a :class:`~vllm.reft.models.ReFTModelManager` is available (the
+        ``enable_reft`` path), the adapter is registered and activated through
+        the manager's LRU cache.  Otherwise falls back to direct per-layer
+        loading.
+
+        Args:
+            reft_int_id: Unique integer ID for this adapter (>= 1).
+            adapter_config: Serializable config dict (from spec_to_reft_config).
+            position: Position mode for this adapter.
+
+        Returns:
+            Number of layers the adapter was loaded into.
+        """
+        # Delegate to centralized manager when available.
+        manager = self._get_reft_manager()
+        if manager is not None:
+            from vllm.reft import reft_config_to_spec
+            from vllm.reft.models import ReFTModel
+            spec = reft_config_to_spec(adapter_config)
+            if spec is None:
+                return 0
+            reft_model = ReFTModel(
+                id=reft_int_id,
+                position=position,
+                adapter_config=adapter_config,
+                layer_indices=frozenset(spec.get("layer_indices", ())),
+            )
+            manager.add_adapter(reft_model)
+            manager.activate_adapter(reft_int_id)
+            return len(reft_model.layer_indices)
+
+        # Fallback: direct per-layer loading (backward compat).
+        from vllm.reft import reft_config_to_spec
+        from vllm.reft.layer import _prepare_adapter, _add_adapter_to_layer
+
+        spec = reft_config_to_spec(adapter_config)
+        if spec is None:
+            return 0
+
+        model = self.get_model()
+        count = 0
+        for layer_idx in spec["layer_indices"]:
+            layer = model.model.layers[layer_idx]
+            if not hasattr(layer, "reft_adapters"):
+                continue
+            try:
+                dev = next(layer.parameters()).device
+            except StopIteration:
+                dev = torch.device("cuda")
+            source = spec.get("adapters", {}).get(layer_idx,
+                                                   spec["sample_adapter"])
+            model_dtype = torch.bfloat16
+            adapter_copy = _prepare_adapter(source, dev, model_dtype)
+            _add_adapter_to_layer(layer, reft_int_id, adapter_copy,
+                                  position, dev)
+            count += 1
+        return count
+
+    def unload_reft_adapter(self, reft_int_id: int) -> int:
+        """Remove a ReFT adapter from all layers.
+
+        Delegates to the :class:`~vllm.reft.models.ReFTModelManager` when
+        available, otherwise falls back to direct per-layer removal.
+
+        Returns:
+            Number of layers the adapter was removed from.
+        """
+        # Delegate to centralized manager when available.
+        manager = self._get_reft_manager()
+        if manager is not None:
+            was_removed = manager.remove_adapter(reft_int_id)
+            return 1 if was_removed else 0
+
+        # Fallback: direct per-layer removal (backward compat).
+        model = self.get_model()
+        key = str(reft_int_id)
+        count = 0
+        for layer in model.model.layers:
+            if not hasattr(layer, "reft_adapters"):
+                continue
+            if key in layer.reft_adapters:
+                del layer.reft_adapters[key]
+                layer._reft_adapter_positions.pop(reft_int_id, None)
+                layer._reft_combined_masks.pop(reft_int_id, None)
+                # Update backward compat reft_adapter reference
+                if layer.reft_adapter is not None:
+                    remaining = list(layer.reft_adapters.values())
+                    layer.reft_adapter = remaining[0] if remaining else None
+                count += 1
         return count
 
     def get_reft_debug_stats(self) -> dict:

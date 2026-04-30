@@ -17,6 +17,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.reft.request import ReFTRequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
@@ -220,6 +221,7 @@ class LLMEngine:
         tokenization_kwargs: Optional[dict[str, Any]] = None,
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
+        reft_request: Optional[ReFTRequest] = None,
     ) -> None:
         # Validate the request_id type.
         if not isinstance(request_id, str):
@@ -229,7 +231,8 @@ class LLMEngine:
         # Process raw inputs into the request.
         prompt_str, request = self.processor.process_inputs(
             request_id, prompt, params, arrival_time, lora_request,
-            tokenization_kwargs, trace_headers, priority)
+            tokenization_kwargs, trace_headers, priority,
+            reft_request=reft_request)
 
         n = params.n if isinstance(params, SamplingParams) else 1
 
