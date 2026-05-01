@@ -1223,43 +1223,41 @@ def make_reft_qwen3_moe_layer(reft_spec: Optional[dict] = None) -> type:
             super().__init__(vllm_config=vllm_config, prefix=prefix)
 
             layer_idx = _extract_layer_idx(prefix)
-            if layer_idx is not None and layer_idx in layer_indices_set:
-                try:
-                    dev = next(self.parameters()).device
-                except StopIteration:
-                    dev = torch.device("cuda" if torch.cuda.is_available()
-                                       else "cpu")
+            try:
+                dev = next(self.parameters()).device
+            except StopIteration:
+                dev = torch.device("cuda" if torch.cuda.is_available()
+                                   else "cpu")
+
+            hf_config = vllm_config.model_config.hf_text_config
+            model_dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
+            if model_dtype is None:
+                model_dtype = torch.bfloat16
+            hidden_size = getattr(hf_config, "hidden_size", 4096)
+
+            object.__setattr__(self, "_reft_layer_idx",
+                               layer_idx if layer_idx is not None else -1)
+            object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
+            self.reft_adapter = None  # backward compat attribute
+
+            # Unconditionally install the multi-adapter scaffolding so the
+            # gpu_model_runner's `hasattr(module, "reft_adapters")` discovery
+            # finds every Qwen3MoE decoder layer — without this the bench /
+            # serving path that loads adapters dynamically (enable_reft=True
+            # without a baked-in reft_spec) gets `loaded into 0 layers`.
+            _init_multi_reft_state(self, dev, hidden_size)
+
+            # Load initial adapter from reft_spec (backward compat, id=1)
+            if (layer_idx is not None and layer_idx in layer_indices_set
+                    and sample_adapter is not None):
                 source = per_layer_adapters.get(layer_idx, sample_adapter)
-                hf_config = vllm_config.model_config.hf_text_config
-                model_dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
-                if model_dtype is None:
-                    model_dtype = torch.bfloat16
-                adapter_copy = copy.deepcopy(source).to(dev)
-                for child in adapter_copy.modules():
-                    if isinstance(child, nn.Linear):
-                        child.to(dtype=model_dtype)
-
-                _install_adapter_caches(adapter_copy, model_dtype=model_dtype)
-                _init_reft_debug_buffers(self, dev)
-                hidden_size = getattr(hf_config, "hidden_size", 4096)
-                _init_reft_capture_buffers(self, hidden_size, dev)
-                _init_reft_position_mask_buffer(
-                    self, _REFT_MASK_FALLBACK_SIZE, dev)
-
-                self.reft_adapter = adapter_copy
-                object.__setattr__(self, "_reft_layer_idx", layer_idx)
-                object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
+                adapter_copy = _prepare_adapter(source, dev, model_dtype)
+                _add_adapter_to_layer(self, 1, adapter_copy, position, dev)
                 _REFT_ADAPTER_REGISTRY[layer_idx] = adapter_copy
                 logger.debug(
-                    "[ReFT-vLLM] Attached adapter to Qwen3MoE layer %d "
-                    "(adapter_type=%s, has_R_cache=%s)",
-                    layer_idx,
-                    type(adapter_copy).__name__,
-                    hasattr(adapter_copy, "_R_cache"),
-                )
-            else:
-                object.__setattr__(self, "_reft_layer_idx", -1)
-                object.__setattr__(self, "_reft_debug_enabled", False)
+                    "[ReFT-vLLM] Attached initial adapter to Qwen3MoE layer "
+                    "%d (adapter_type=%s)", layer_idx,
+                    type(adapter_copy).__name__)
 
             object.__setattr__(self, "_reft_position", position)
             _maybe_log_reft_layer_init(
@@ -1271,31 +1269,10 @@ def make_reft_qwen3_moe_layer(reft_spec: Optional[dict] = None) -> type:
                 adapter=getattr(self, "reft_adapter", None),
             )
 
-        def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            residual,
-        ):
-            hidden_states, residual = super().forward(
-                positions, hidden_states, residual)
-
-            if getattr(self, "reft_adapter", None) is None:
-                return hidden_states, residual
-
-            h_full = hidden_states + residual
-
-            delta = self.reft_adapter._compute_delta(
-                h_full.unsqueeze(0)).squeeze(0)
-
-            mask_buf = getattr(self, "_reft_position_mask", None)
-            if mask_buf is not None:
-                N = delta.shape[0]
-                delta = delta * mask_buf[:N].unsqueeze(-1).to(delta.dtype)
-
-            hidden_states = delta
-            residual = h_full
-            return hidden_states, residual
+        def forward(self, positions, hidden_states, residual):
+            return _multi_reft_forward(
+                self, positions, hidden_states, residual,
+                super_forward=super().forward)
 
         def get_reft_debug_stats(self) -> Optional[dict]:
             return _collect_layer_reft_debug_stats(self)
