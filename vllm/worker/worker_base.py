@@ -69,6 +69,61 @@ class WorkerBase:
         """Apply a function on the model inside this worker."""
         return fn(self.get_model())
 
+    def sync_lora_weights(self, state_dict: dict[str, torch.Tensor],
+                          peft_config: dict, lora_int_id: int = 1) -> bool:
+        """Sync LoRA adapter weights from in-memory tensors. No disk I/O.
+
+        Called via ``collective_rpc("sync_lora_weights",
+        args=(state_dict, peft_config, lora_int_id))``.
+
+        Args:
+            state_dict: PEFT-format state dict, e.g.
+                ``{"base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight": tensor, ...}``
+            peft_config: Serialized PEFT LoraConfig dict (r, lora_alpha,
+                target_modules, etc.).
+            lora_int_id: Adapter ID to register under.
+
+        Returns:
+            True if weights were synced successfully.
+        """
+        from vllm.lora.models import LoRAModel
+        from vllm.lora.peft_helper import PEFTHelper
+
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None or not hasattr(model_runner, "lora_manager"):
+            logger.warning("sync_lora_weights: no lora_manager on model_runner")
+            return False
+
+        worker_mgr = model_runner.lora_manager
+        model_mgr = worker_mgr._adapter_manager
+
+        # Remove old version if registered
+        if lora_int_id in worker_mgr.list_adapters():
+            model_mgr.remove_adapter(lora_int_id)
+
+        # Build PEFTHelper from config dict
+        peft_helper = PEFTHelper.from_dict(peft_config)
+
+        # Build LoRAModel from tensors (handles name mapping internally)
+        lora_model = LoRAModel.from_lora_tensors(
+            lora_model_id=lora_int_id,
+            tensors=state_dict,
+            peft_helper=peft_helper,
+            device="cpu",
+            dtype=worker_mgr.lora_config.lora_dtype,
+            target_embedding_padding=worker_mgr.vocab_size
+            + worker_mgr.lora_config.lora_extra_vocab_size,
+            embedding_modules=worker_mgr.embedding_modules,
+            embedding_padding_modules=worker_mgr.embedding_padding_modules,
+        )
+
+        # Register and activate via the model manager (bypasses disk loading)
+        model_mgr.add_adapter(lora_model)
+        model_mgr.activate_adapter(lora_int_id)
+        logger.debug("sync_lora_weights: loaded adapter %d (%d modules)",
+                      lora_int_id, len(lora_model.loras))
+        return True
+
     def refresh_reft_caches(self, reft_int_id: Optional[int] = None) -> None:
         """Recompute derived ReFT caches after adapter weights are updated.
 
