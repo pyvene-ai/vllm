@@ -1186,7 +1186,7 @@ def make_reft_llama_layer(reft_spec: Optional[dict] = None) -> type:
 # Qwen3 MoE ReFT-aware decoder layer factory
 # ---------------------------------------------------------------------------
 
-def make_reft_qwen3_moe_layer(reft_spec: dict) -> type:
+def make_reft_qwen3_moe_layer(reft_spec: Optional[dict] = None) -> type:
     """Return a Qwen3MoeDecoderLayer subclass that applies ReFT adapters.
 
     MoE-agnostic: the residual-stream delta is applied AFTER the full layer
@@ -1195,15 +1195,26 @@ def make_reft_qwen3_moe_layer(reft_spec: dict) -> type:
 
     Mirrors ``make_reft_llama_layer``; Qwen3MoeDecoderLayer.__init__ has the
     same ``(vllm_config, prefix)`` signature and the same
-    ``(positions, hidden_states, residual)`` forward contract.
+    ``(positions, hidden_states, residual)`` forward contract. Pass
+    reft_spec=None to get a layer that registers the multi-adapter
+    ModuleDict scaffolding without baking in a default adapter — the
+    bench / serving path then loads adapters dynamically via the
+    `load_reft_adapter` collective_rpc.
     """
     from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
 
-    layer_indices_set = frozenset(reft_spec["layer_indices"])
-    position = reft_spec["position"]
-    sample_adapter: nn.Module = reft_spec["sample_adapter"]
-    per_layer_adapters: dict = reft_spec.get("adapters", {})
-    debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
+    if reft_spec is not None:
+        layer_indices_set = frozenset(reft_spec["layer_indices"])
+        position = reft_spec["position"]
+        sample_adapter: Optional[nn.Module] = reft_spec["sample_adapter"]
+        per_layer_adapters: dict = reft_spec.get("adapters", {})
+        debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
+    else:
+        layer_indices_set = frozenset()
+        position = "prefill"
+        sample_adapter = None
+        per_layer_adapters = {}
+        debug_mask_enabled = False
 
     class ReFTQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
         """Qwen3MoeDecoderLayer with optional ReFT adapter delta."""

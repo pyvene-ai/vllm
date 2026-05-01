@@ -595,18 +595,24 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
         self.config = config
         self.quant_config = quant_config
 
-        # If reft_config is set on VllmConfig, swap in ReFT-aware decoder
-        # layers so CUDA graphs capture the adapter path.  Falls back to
-        # the deprecated get_reft_spec() global state used by TRL hooks.
+        # If reft_config is set on VllmConfig, or enable_reft=True is set
+        # on EngineArgs (bench-driven multi-adapter path), swap in
+        # ReFT-aware decoder layers so CUDA graphs capture the adapter
+        # path. Falls back to the deprecated get_reft_spec() global state
+        # used by TRL hooks.
         from vllm.reft import reft_config_to_spec, get_reft_spec
         from vllm.reft.layer import make_reft_qwen3_moe_layer
+        enable_reft = getattr(vllm_config, "enable_reft", False)
         reft_spec = reft_config_to_spec(
             getattr(vllm_config, "reft_config", None))
         if reft_spec is None:
             reft_spec = get_reft_spec()
-        decoder_layer_type = (make_reft_qwen3_moe_layer(reft_spec)
-                              if reft_spec is not None
-                              else Qwen3MoeDecoderLayer)
+        if reft_spec is not None:
+            decoder_layer_type = make_reft_qwen3_moe_layer(reft_spec)
+        elif enable_reft:
+            decoder_layer_type = make_reft_qwen3_moe_layer(None)
+        else:
+            decoder_layer_type = Qwen3MoeDecoderLayer
 
         self.model = Qwen3MoeModel(vllm_config=vllm_config,
                                    prefix=maybe_prefix(prefix, "model"),
