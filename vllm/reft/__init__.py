@@ -65,20 +65,36 @@ import warnings
 def _serialize_state_dict(state_dict: dict) -> dict:
     """Convert a state_dict's tensors to a format safe for any serializer.
 
-    Each tensor becomes ``{"__reft_t": True, "data": <nested list>,
-    "dtype": "float32", "shape": [...]}``.  This survives both pickle
+    Each tensor becomes ``{"__reft_t": True, "data": <bytes>,
+    "dtype": "bfloat16", "shape": [...]}``.  This survives both pickle
     (used by VllmConfig) and msgspec (used by collective_rpc).
 
-    ReFT adapters are tiny (~100 KB) so ``.tolist()`` overhead is negligible.
+    Uses ``numpy().tobytes()`` instead of ``.tolist()`` because a large
+    nested Python list is ~100x bigger and ~50x slower to construct/pickle
+    than the equivalent contiguous bytes blob.  At hidden=8192 × rank=8
+    × 80 layers × 128 adapters, the .tolist() path turned into a
+    multi-minute serialization stall + IPC backpressure that hung
+    multi-adapter sweeps mid-loop.
     """
     import torch
     out = {}
     for k, v in state_dict.items():
         if isinstance(v, torch.Tensor):
+            t = v.detach().cpu().contiguous()
+            # bf16 has no numpy dtype; round-trip through fp32 bytes for
+            # cross-process transport, then cast back on the receiving side.
+            saved_dtype = str(v.dtype).split(".")[-1]  # "bfloat16"
+            if t.dtype == torch.bfloat16:
+                wire = t.float()
+                wire_dtype_np = "float32"
+            else:
+                wire = t
+                wire_dtype_np = str(t.dtype).split(".")[-1]
             out[k] = {
                 "__reft_t": True,
-                "data": v.detach().float().cpu().tolist(),
-                "dtype": str(v.dtype).split(".")[-1],  # "bfloat16"
+                "data": wire.numpy().tobytes(),
+                "dtype": saved_dtype,
+                "wire_dtype": wire_dtype_np,
                 "shape": list(v.shape),
             }
         else:
@@ -89,17 +105,30 @@ def _serialize_state_dict(state_dict: dict) -> dict:
 def _deserialize_state_dict(state_dict: dict) -> dict:
     """Reconstruct tensors from the format produced by ``_serialize_state_dict``.
 
-    Also handles raw tensors (no-op) for backward compatibility with configs
-    that were serialized before this change.
+    Handles three encodings for backward compatibility:
+      - raw torch tensors (no-op)
+      - new bytes-encoded entries (``data`` is a bytes blob with
+        ``wire_dtype`` describing the wire format)
+      - legacy list-encoded entries (``data`` is a nested Python list)
     """
+    import numpy as np
     import torch
     out = {}
     for k, v in state_dict.items():
         if isinstance(v, torch.Tensor):
             out[k] = v
         elif isinstance(v, dict) and v.get("__reft_t"):
-            dtype = getattr(torch, v["dtype"], torch.float32)
-            out[k] = torch.tensor(v["data"], dtype=dtype).reshape(v["shape"])
+            target_dtype = getattr(torch, v["dtype"], torch.float32)
+            data = v["data"]
+            if isinstance(data, (bytes, bytearray, memoryview)):
+                wire_np = getattr(np, v.get("wire_dtype", v["dtype"]), np.float32)
+                arr = np.frombuffer(data, dtype=wire_np).reshape(v["shape"])
+                # `arr` may share memory with the input bytes; copy so the
+                # resulting tensor is writable and outlives the bytes object.
+                out[k] = torch.from_numpy(arr.copy()).to(dtype=target_dtype)
+            else:
+                # Legacy list-encoded path.
+                out[k] = torch.tensor(data, dtype=target_dtype).reshape(v["shape"])
         else:
             out[k] = v
     return out
