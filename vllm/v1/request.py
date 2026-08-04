@@ -39,6 +39,8 @@ class Request:
         mm_features: Optional[list[MultiModalFeatureSpec]] = None,
         lora_request: Optional["LoRARequest"] = None,
         reft_request: Optional["ReFTRequest"] = None,
+        decode_lora_request: Optional["LoRARequest"] = None,
+        decode_reft_request: Optional["ReFTRequest"] = None,
         structured_output_request: Optional["StructuredOutputRequest"] = None,
         cache_salt: Optional[str] = None,
         priority: int = 0,
@@ -55,6 +57,8 @@ class Request:
         self.eos_token_id = eos_token_id
         self.lora_request = lora_request
         self.reft_request = reft_request
+        self.decode_lora_request = decode_lora_request
+        self.decode_reft_request = decode_reft_request
         self.structured_output_request = structured_output_request
         self.arrival_time = arrival_time if arrival_time is not None else \
             time.time()
@@ -142,6 +146,8 @@ class Request:
             arrival_time=request.arrival_time,
             lora_request=request.lora_request,
             reft_request=request.reft_request,
+            decode_lora_request=request.decode_lora_request,
+            decode_reft_request=request.decode_reft_request,
             structured_output_request=StructuredOutputRequest(
                 sampling_params=request.sampling_params) \
                     if request.sampling_params else None,

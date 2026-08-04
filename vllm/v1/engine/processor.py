@@ -220,6 +220,29 @@ class Processor:
                 "with its own tokenizer, consider specifying `--tokenizer "
                 "[lora_path]` to use the LoRA tokenizer.")
 
+    def _validate_decode_lora(
+            self, lora_request: Optional[LoRARequest],
+            decode_lora_request: Optional[LoRARequest]) -> None:
+        if decode_lora_request is None:
+            return
+
+        self._validate_lora(decode_lora_request)
+
+        if decode_lora_request.lora_position != "decode":
+            raise ValueError(
+                "decode_lora_request must have lora_position='decode', got "
+                f"{decode_lora_request.lora_position!r}")
+        if lora_request is not None:
+            if lora_request.lora_position != "prefill":
+                raise ValueError(
+                    "When decode_lora_request is set, lora_request must have "
+                    "lora_position='prefill' so that exactly one adapter "
+                    f"applies per phase, got {lora_request.lora_position!r}")
+            if lora_request.lora_int_id == decode_lora_request.lora_int_id:
+                raise ValueError(
+                    "lora_request and decode_lora_request must use distinct "
+                    f"lora_int_ids, both got {lora_request.lora_int_id}")
+
     def _validate_structured_output(self, params: SamplingParams) -> None:
         if not params.structured_outputs or not self.structured_outputs_config:
             return
@@ -336,10 +359,13 @@ class Processor:
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
         reft_request: Optional[ReFTRequest] = None,
+        decode_lora_request: Optional[LoRARequest] = None,
+        decode_reft_request: Optional[ReFTRequest] = None,
     ) -> tuple[Optional[str], EngineCoreRequest]:
 
         # TODO(woosuk): Support pooling models.
         self._validate_lora(lora_request)
+        self._validate_decode_lora(lora_request, decode_lora_request)
         self._validate_params(params)
 
         data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
@@ -455,6 +481,8 @@ class Processor:
             arrival_time=arrival_time,
             lora_request=lora_request,
             reft_request=reft_request,
+            decode_lora_request=decode_lora_request,
+            decode_reft_request=decode_reft_request,
             cache_salt=decoder_inputs.get("cache_salt"),
             priority=priority,
             data_parallel_rank=data_parallel_rank,

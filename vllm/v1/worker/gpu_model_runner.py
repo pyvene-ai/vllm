@@ -600,6 +600,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
                 reft_request=new_req_data.reft_request,
+                decode_lora_request=new_req_data.decode_lora_request,
+                decode_reft_request=new_req_data.decode_reft_request,
             )
             self.requests[req_id] = req_state
 

@@ -222,6 +222,8 @@ class LLMEngine:
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         reft_request: Optional[ReFTRequest] = None,
+        decode_lora_request: Optional[LoRARequest] = None,
+        decode_reft_request: Optional[ReFTRequest] = None,
     ) -> None:
         # Validate the request_id type.
         if not isinstance(request_id, str):
@@ -232,7 +234,9 @@ class LLMEngine:
         prompt_str, request = self.processor.process_inputs(
             request_id, prompt, params, arrival_time, lora_request,
             tokenization_kwargs, trace_headers, priority,
-            reft_request=reft_request)
+            reft_request=reft_request,
+            decode_lora_request=decode_lora_request,
+            decode_reft_request=decode_reft_request)
 
         n = params.n if isinstance(params, SamplingParams) else 1
 

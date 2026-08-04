@@ -343,6 +343,10 @@ class LLM:
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         reft_request: Optional[Union[list[ReFTRequest],
                                      ReFTRequest]] = None,
+        decode_lora_request: Optional[Union[list[LoRARequest],
+                                            LoRARequest]] = None,
+        decode_reft_request: Optional[Union[list[ReFTRequest],
+                                            ReFTRequest]] = None,
         priority: Optional[list[int]] = None,
     ) -> list[RequestOutput]:
         """Generates the completions for the input prompts.
@@ -365,6 +369,11 @@ class LLM:
                 it is used to create the progress bar.
                 If `False`, no progress bar is created.
             lora_request: LoRA request to use for generation, if any.
+            decode_lora_request: Optional decode-phase-only LoRA request,
+                paired with a prefill-only `lora_request` on the same
+                prompt.  Must have `lora_position="decode"`.
+            decode_reft_request: Optional decode-phase-only ReFT request,
+                paired with a prefill ReFT adapter on the same prompt.
             priority: The priority of the requests, if any.
                 Only applicable when priority scheduling policy is enabled.
 
@@ -399,6 +408,8 @@ class LLM:
             use_tqdm=use_tqdm,
             lora_request=lora_request,
             reft_request=reft_request,
+            decode_lora_request=decode_lora_request,
+            decode_reft_request=decode_reft_request,
             priority=priority,
         )
 
@@ -1490,6 +1501,10 @@ class LLM:
         lora_request: Optional[Union[Sequence[LoRARequest], LoRARequest]],
         reft_request: Optional[Union[Sequence[ReFTRequest],
                                      ReFTRequest]] = None,
+        decode_lora_request: Optional[Union[Sequence[LoRARequest],
+                                            LoRARequest]] = None,
+        decode_reft_request: Optional[Union[Sequence[ReFTRequest],
+                                            ReFTRequest]] = None,
         priority: Optional[list[int]] = None,
     ) -> None:
         if isinstance(prompts, (str, dict)):
@@ -1507,6 +1522,14 @@ class LLM:
         if isinstance(reft_request,
                       Sequence) and len(reft_request) != num_requests:
             raise ValueError("The lengths of prompts and reft_request "
+                             "must be the same.")
+        if isinstance(decode_lora_request,
+                      Sequence) and len(decode_lora_request) != num_requests:
+            raise ValueError("The lengths of prompts and decode_lora_request "
+                             "must be the same.")
+        if isinstance(decode_reft_request,
+                      Sequence) and len(decode_reft_request) != num_requests:
+            raise ValueError("The lengths of prompts and decode_reft_request "
                              "must be the same.")
 
         for sp in params if isinstance(params, Sequence) else (params, ):
@@ -1544,6 +1567,10 @@ class LLM:
                     lora_request, Sequence) else lora_request,
                 reft_request=reft_request[i] if isinstance(
                     reft_request, Sequence) else reft_request,
+                decode_lora_request=decode_lora_request[i] if isinstance(
+                    decode_lora_request, Sequence) else decode_lora_request,
+                decode_reft_request=decode_reft_request[i] if isinstance(
+                    decode_reft_request, Sequence) else decode_reft_request,
                 priority=priority[i] if priority else 0,
             )
 
@@ -1589,6 +1616,8 @@ class LLM:
         tokenization_kwargs: Optional[dict[str, Any]] = None,
         lora_request: Optional[LoRARequest] = None,
         reft_request: Optional[ReFTRequest] = None,
+        decode_lora_request: Optional[LoRARequest] = None,
+        decode_reft_request: Optional[ReFTRequest] = None,
         priority: int = 0,
     ) -> None:
         request_id = str(next(self.request_counter))
@@ -1600,6 +1629,8 @@ class LLM:
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
             reft_request=reft_request,
+            decode_lora_request=decode_lora_request,
+            decode_reft_request=decode_reft_request,
         )
 
     def _run_engine(

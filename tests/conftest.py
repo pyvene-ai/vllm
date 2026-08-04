@@ -10,6 +10,16 @@ from tblib import pickling_support
 # This should be run before any custom exception subclasses are defined.
 pickling_support.install()
 
+import os as _os
+
+import torch as _torch
+
+if not _torch.cuda.is_available():
+    # No GPUs visible (e.g. a CUDA build on a GPU-less node): force the
+    # CPU platform so unit tests can run.  This must happen before
+    # vllm.platforms.current_platform is first resolved.
+    _os.environ.setdefault("VLLM_FORCE_PLATFORM", "cpu")
+
 import http.server
 import json
 import math

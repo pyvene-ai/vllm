@@ -40,6 +40,28 @@ from vllm.v1.structured_output import StructuredOutputManager
 logger = init_logger(__name__)
 
 
+def _request_lora_ids(request: Request) -> set[int]:
+    """All LoRA adapter ids a request needs (primary + decode-phase)."""
+    ids: set[int] = set()
+    if request.lora_request and request.lora_request.lora_int_id > 0:
+        ids.add(request.lora_request.lora_int_id)
+    decode_lora = getattr(request, "decode_lora_request", None)
+    if decode_lora and decode_lora.lora_int_id > 0:
+        ids.add(decode_lora.lora_int_id)
+    return ids
+
+
+def _request_reft_ids(request: Request) -> set[int]:
+    """All ReFT adapter ids a request needs (primary + decode-phase)."""
+    ids: set[int] = set()
+    if request.reft_request and request.reft_request.reft_int_id > 0:
+        ids.add(request.reft_request.reft_int_id)
+    decode_reft = getattr(request, "decode_reft_request", None)
+    if decode_reft and decode_reft.reft_int_id > 0:
+        ids.add(decode_reft.reft_int_id)
+    return ids
+
+
 class Scheduler(SchedulerInterface):
 
     def __init__(
@@ -319,21 +341,21 @@ class Scheduler(SchedulerInterface):
                     self.encoder_cache_manager.allocate(request, i)
                 encoder_compute_budget = new_encoder_compute_budget
 
-        # Record the LoRAs in scheduled_running_reqs
+        # Record the LoRAs in scheduled_running_reqs (both the primary
+        # and the optional decode-phase adapter count toward max_loras).
         scheduled_loras: set[int] = set()
         if self.lora_config:
             scheduled_loras = set(
-                req.lora_request.lora_int_id for req in scheduled_running_reqs
-                if req.lora_request and req.lora_request.lora_int_id > 0)
+                lora_id for req in scheduled_running_reqs
+                for lora_id in _request_lora_ids(req))
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Record the ReFT adapters in scheduled_running_reqs
         scheduled_refts: set[int] = set()
         if self.vllm_config.enable_reft:
             scheduled_refts = set(
-                req.reft_request.reft_int_id
-                for req in scheduled_running_reqs
-                if req.reft_request and req.reft_request.reft_int_id > 0)
+                reft_id for req in scheduled_running_reqs
+                for reft_id in _request_reft_ids(req))
             assert len(scheduled_refts) <= self.vllm_config.max_refts
 
         # Use a temporary RequestQueue to collect requests that need to be
@@ -373,22 +395,20 @@ class Scheduler(SchedulerInterface):
                         continue
 
                 # Check that adding the request still respects the max_loras
-                # constraint.
-                if (self.lora_config and request.lora_request and
-                    (len(scheduled_loras) == self.lora_config.max_loras and
-                     request.lora_request.lora_int_id not in scheduled_loras)):
+                # constraint (counting both phase adapters).
+                if self.lora_config and (
+                        len(scheduled_loras | _request_lora_ids(request))
+                        > self.lora_config.max_loras):
                     # Scheduling would exceed max_loras, skip.
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
 
                 # Check that adding the request still respects the max_refts
-                # constraint.
-                if (self.vllm_config.enable_reft and request.reft_request
-                        and (len(scheduled_refts)
-                             == self.vllm_config.max_refts
-                             and request.reft_request.reft_int_id
-                             not in scheduled_refts)):
+                # constraint (counting both phase adapters).
+                if self.vllm_config.enable_reft and (
+                        len(scheduled_refts | _request_reft_ids(request))
+                        > self.vllm_config.max_refts):
                     # Scheduling would exceed max_refts, skip.
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
@@ -537,11 +557,10 @@ class Scheduler(SchedulerInterface):
                     raise RuntimeError(
                         f"Invalid request status: {request.status}")
 
-                if self.lora_config and request.lora_request:
-                    scheduled_loras.add(request.lora_request.lora_int_id)
-                if (self.vllm_config.enable_reft and request.reft_request
-                        and request.reft_request.reft_int_id > 0):
-                    scheduled_refts.add(request.reft_request.reft_int_id)
+                if self.lora_config:
+                    scheduled_loras.update(_request_lora_ids(request))
+                if self.vllm_config.enable_reft:
+                    scheduled_refts.update(_request_reft_ids(request))
                 req_to_new_blocks[request.request_id] = (
                     self.kv_cache_manager.get_blocks(request.request_id))
                 num_scheduled_tokens[request.request_id] = num_new_tokens

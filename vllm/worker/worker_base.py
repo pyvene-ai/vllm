@@ -95,11 +95,6 @@ class WorkerBase:
             return False
 
         worker_mgr = model_runner.lora_manager
-        model_mgr = worker_mgr._adapter_manager
-
-        # Remove old version if registered
-        if lora_int_id in worker_mgr.list_adapters():
-            model_mgr.remove_adapter(lora_int_id)
 
         # Build PEFTHelper from config dict
         peft_helper = PEFTHelper.from_dict(peft_config)
@@ -117,9 +112,10 @@ class WorkerBase:
             embedding_padding_modules=worker_mgr.embedding_padding_modules,
         )
 
-        # Register and activate via the model manager (bypasses disk loading)
-        model_mgr.add_adapter(lora_model)
-        model_mgr.activate_adapter(lora_int_id)
+        # Register + activate in-memory (no disk), replacing any stale
+        # version, protecting against LRU eviction, and invalidating the
+        # cached punica mapping.
+        worker_mgr.register_synced_adapter(lora_model)
         logger.debug("sync_lora_weights: loaded adapter %d (%d modules)",
                       lora_int_id, len(lora_model.loras))
         return True

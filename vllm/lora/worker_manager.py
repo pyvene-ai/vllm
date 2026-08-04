@@ -48,6 +48,10 @@ class WorkerLoRAManager:
 
         self.max_position_embeddings = text_config.max_position_embeddings
         self.device = device
+        # Adapters registered from in-memory tensors (no disk backing),
+        # e.g. training-time weight sync.  They must never be silently
+        # dropped and reloaded from their (fake) path.
+        self._synced_adapter_ids: set[int] = set()
         # Lazily initialized by create_lora_manager.
         self._adapter_manager: LoRAModelManager
 
@@ -176,7 +180,10 @@ class WorkerLoRAManager:
                 "than the number of GPU model slots "
                 f"({self._adapter_manager.adapter_slots}).")
         requested_ids = set(models_map)
-        for adapter_id in existing_adapters - requested_ids:
+        # Never drop synced (in-memory) adapters: they cannot be
+        # reloaded from disk when requested again later.
+        for adapter_id in (existing_adapters - requested_ids
+                           - self._synced_adapter_ids):
             self.remove_adapter(adapter_id)
         for adapter_id in requested_ids - existing_adapters:
             self.add_adapter(models_map[adapter_id])
@@ -189,10 +196,48 @@ class WorkerLoRAManager:
         self._adapter_manager.activate_adapter(loaded_adapter.id)
         return loaded
 
+    def register_synced_adapter(self, lora_model: LoRAModel) -> bool:
+        """Register an adapter built from in-memory tensors (no disk IO).
+
+        Replaces any previously registered version of the same id,
+        activates it, and protects it from LRU eviction (a synced
+        adapter cannot be reloaded from its path, so silently evicting
+        it would break later requests that reference it).
+
+        Used by training-time weight sync
+        (``collective_rpc("sync_lora_weights", ...)``).
+        """
+        mgr = self._adapter_manager
+        lora_id = lora_model.id
+
+        # Remove the stale version first so the new weights are copied
+        # into a GPU slot on activation.
+        if lora_id in self.list_adapters():
+            mgr.remove_adapter(lora_id)
+
+        mgr.add_adapter(lora_model)
+        mgr.activate_adapter(lora_id)
+
+        # Pin so LRU eviction never drops a disk-less adapter.  The
+        # plain (non-LRU) manager doesn't evict on its own; there the
+        # protection is the _apply_adapters() exclusion above.
+        if isinstance(mgr, LRUCacheLoRAModelManager):
+            mgr.pin_adapter(lora_id)
+        self._synced_adapter_ids.add(lora_id)
+
+        # remove+add may have changed the slot assignment.  Invalidate
+        # the cached mapping so the next set_active_adapters() call
+        # refreshes the punica metadata even if the batch mapping is
+        # unchanged; otherwise tokens keep routing to the old slot.
+        mgr._last_mapping = None
+        return True
+
     def remove_adapter(self, adapter_id: int) -> bool:
+        self._synced_adapter_ids.discard(adapter_id)
         return self._adapter_manager.remove_adapter(adapter_id)
 
     def remove_all_adapters(self):
+        self._synced_adapter_ids.clear()
         self._adapter_manager.remove_all_adapters()
 
     def list_adapters(self) -> set[int]:
