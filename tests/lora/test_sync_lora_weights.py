@@ -183,6 +183,48 @@ class TestResync:
         assert model_mgr._last_mapping is None
 
 
+class TestGraphReplaySafety:
+    """Training re-syncs must be in-place slot updates: captured CUDA
+    graphs read the punica stacked buffers by address, so sync must
+    neither reallocate them nor force a re-capture."""
+
+    def test_resync_keeps_stacked_buffer_addresses(self, worker_and_mgr):
+        worker, worker_mgr = worker_and_mgr
+        assert _sync(worker, 0.5, lora_int_id=1)
+        model_mgr = worker_mgr._adapter_manager
+        module = model_mgr.modules["layer1.dense1"]
+        ptr_a = module.lora_a_stacked[0].data_ptr()
+        ptr_b = module.lora_b_stacked[0].data_ptr()
+
+        assert _sync(worker, 0.125, lora_int_id=1)
+        assert module.lora_a_stacked[0].data_ptr() == ptr_a
+        assert module.lora_b_stacked[0].data_ptr() == ptr_b
+        assert _stacked_fill_value(model_mgr, 1) == pytest.approx(0.125)
+
+    def test_sync_does_not_invalidate_cudagraphs(self, worker_and_mgr):
+        from vllm.compilation import monitor
+        from vllm.compilation.cuda_graph import _cudagraph_wrappers
+
+        class FakeWrapper:
+
+            def __init__(self):
+                self.concrete_cudagraph_entries = {"d": object()}
+
+        worker, _ = worker_and_mgr
+        w = FakeWrapper()
+        _cudagraph_wrappers.add(w)
+        saved = monitor.cudagraph_capturing_enabled
+        try:
+            monitor.cudagraph_capturing_enabled = False
+            assert _sync(worker, 0.5, lora_int_id=1)
+            assert _sync(worker, 0.25, lora_int_id=1)
+            assert len(w.concrete_cudagraph_entries) == 1
+            assert monitor.cudagraph_capturing_enabled is False
+        finally:
+            monitor.cudagraph_capturing_enabled = saved
+            _cudagraph_wrappers.discard(w)
+
+
 class TestEvictionProtection:
 
     def test_synced_adapters_survive_lru_eviction(self, dist_init,
