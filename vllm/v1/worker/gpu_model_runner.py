@@ -2314,7 +2314,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             update_multi_reft_position_masks(
                 self._reft_layers, token_reft_ids, actual_positions,
                 attn_metadata, num_scheduled_tokens,
-                decode_token_reft_ids=decode_token_reft_ids)
+                decode_token_reft_ids=decode_token_reft_ids,
+                # Gather/scatter uses dynamic member counts, which CUDA
+                # graph replay cannot represent — eager mode only.
+                use_gather=self.vllm_config.model_config.enforce_eager)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.

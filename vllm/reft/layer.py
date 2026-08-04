@@ -783,6 +783,32 @@ def _init_multi_reft_state(layer: nn.Module, dev: torch.device,
     _init_reft_capture_buffers(layer, hidden_size, dev)
 
 
+def _blend_one_adaptation(layer: nn.Module, int_id: int, adapter: nn.Module,
+                          hidden: torch.Tensor) -> torch.Tensor:
+    """Blend one adaptation into *hidden*, via the gather path when
+    member indices were precomputed for this step.
+
+    The gather path (``use_gather=True`` in
+    ``update_multi_reft_position_masks``) runs the adaptation only on
+    its member tokens and scatters results back — O(members) instead of
+    O(batch).  Only enabled in eager mode: the member count is dynamic,
+    which CUDA graphs cannot capture.
+    """
+    member_idx = getattr(layer, "_reft_member_indices", {}).get(int_id)
+    if member_idx is not None:
+        if member_idx.numel() == 0:
+            return hidden
+        member_mask = layer._reft_member_mask_values[int_id]
+        sub = hidden.index_select(0, member_idx)
+        sub_new = apply_adaptation(adapter, sub, member_mask)
+        return hidden.index_copy(0, member_idx, sub_new.to(hidden.dtype))
+
+    mask_buf = layer._reft_combined_masks.get(int_id)
+    num_tokens = hidden.shape[0]
+    mask = mask_buf[:num_tokens] if mask_buf is not None else None
+    return apply_adaptation(adapter, hidden, mask)
+
+
 def _apply_site_adaptations(layer: nn.Module, site: str, output):
     """Blend all active adaptations mounted at *site* into *output*.
 
@@ -800,10 +826,8 @@ def _apply_site_adaptations(layer: nn.Module, site: str, output):
             continue
         if active_ids is not None and int_id not in active_ids:
             continue
-        mask_buf = layer._reft_combined_masks.get(int_id)
-        num_tokens = new_hidden.shape[0]
-        mask = mask_buf[:num_tokens] if mask_buf is not None else None
-        new_hidden = apply_adaptation(adapter, new_hidden, mask)
+        new_hidden = _blend_one_adaptation(layer, int_id, adapter,
+                                           new_hidden)
     if new_hidden is hidden:
         return output
     if isinstance(output, tuple):
@@ -947,10 +971,8 @@ def _multi_reft_forward(
                 and adapter_sites.get(int_id, "block_output")
                 != "block_output"):
             continue  # mounted elsewhere (hooked submodule / block_input)
-        mask_buf = layer_self._reft_combined_masks.get(int_id)
-        num_tokens = new_stream.shape[0]
-        mask = mask_buf[:num_tokens] if mask_buf is not None else None
-        new_stream = apply_adaptation(adapter, new_stream, mask)
+        new_stream = _blend_one_adaptation(layer_self, int_id, adapter,
+                                           new_stream)
 
     hidden_states = new_stream - h_full
     residual = h_full
@@ -964,6 +986,7 @@ def update_multi_reft_position_masks(
     attn_metadata,
     num_tokens: int,
     decode_token_reft_ids: Optional[torch.Tensor] = None,
+    use_gather: bool = False,
 ) -> None:
     """Pre-compute combined masks for all adapters on all ReFT layers.
 
@@ -976,6 +999,12 @@ def update_multi_reft_position_masks(
     adapter's own position mask then restricts it to its phase, so a
     prefill adapter and a decode adapter paired on the same request
     never overlap.
+
+    With ``use_gather=True`` (eager mode only — member counts are
+    dynamic shapes, incompatible with CUDA graph replay), each active
+    adapter's member-token indices are additionally precomputed so the
+    forward runs the adapter on O(members) tokens instead of the full
+    batch.
 
     Called from the model runner before each forward pass.
     """
@@ -1020,6 +1049,9 @@ def update_multi_reft_position_masks(
     for layer in reft_layers:
         if not hasattr(layer, "reft_adapters"):
             continue
+        # Reset per-step gather state; repopulated below when enabled.
+        layer._reft_member_indices = {}
+        layer._reft_member_mask_values = {}
         # Intersect batch-active IDs with this layer's loaded adapters.
         layer_active_ids = batch_active_ids & {
             int(s) for s in layer.reft_adapters}
@@ -1068,6 +1100,11 @@ def update_multi_reft_position_masks(
                 layer._reft_combined_masks[int_id] = buf
             buf[:num_tokens].copy_(combined[:num_tokens])
             buf[num_tokens:].zero_()
+            if use_gather:
+                member_idx = combined[:num_tokens].nonzero(
+                    as_tuple=True)[0]
+                layer._reft_member_indices[int_id] = member_idx
+                layer._reft_member_mask_values[int_id] = combined[member_idx]
 
 
 # ---------------------------------------------------------------------------

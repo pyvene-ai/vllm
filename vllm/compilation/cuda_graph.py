@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import weakref
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from unittest.mock import patch
@@ -10,7 +11,8 @@ import torch
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
+from vllm.compilation.monitor import (set_cudagraph_capturing_enabled,
+                                      validate_cudagraph_capturing_enabled)
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id)
@@ -20,6 +22,40 @@ from vllm.platforms import current_platform
 from vllm.utils import weak_ref_tensors
 
 logger = init_logger(__name__)
+
+# Weak registry of every live CUDAGraphWrapper (FULL wrapper on the model
+# runner, PIECEWISE wrappers inside the split fx.GraphModule, ubatch
+# wrappers, ...).  Used by invalidate_all_cudagraphs() when the set of
+# modules participating in the forward changes after capture (e.g. a
+# ReFT adapter is loaded or unloaded) — replayed graphs would otherwise
+# silently keep executing the old module set.
+_cudagraph_wrappers: "weakref.WeakSet[CUDAGraphWrapper]" = weakref.WeakSet()
+
+
+def invalidate_all_cudagraphs() -> int:
+    """Drop every captured CUDA graph and re-allow capturing.
+
+    The next dispatch through each wrapper lazily re-captures with the
+    model's current module set (CUDAGraphWrapper captures whenever an
+    entry has no graph yet).  Returns the number of dropped entries.
+
+    Note: lazy re-capture happens outside the warmup ``graph_capture()``
+    coordination context; this is safe for single-GPU serving, which is
+    the supported configuration for dynamically loaded adaptations.
+    """
+    cleared = 0
+    for wrapper in list(_cudagraph_wrappers):
+        entries = wrapper.concrete_cudagraph_entries
+        cleared += len(entries)
+        entries.clear()
+    if cleared:
+        # Capturing is globally frozen after warmup; unfreeze so the
+        # lazy re-capture is legal.
+        set_cudagraph_capturing_enabled(True)
+        logger.info(
+            "Invalidated %d captured CUDA graph(s) after adapter set "
+            "change; they will be re-captured lazily.", cleared)
+    return cleared
 
 
 @dataclasses.dataclass
@@ -93,6 +129,7 @@ class CUDAGraphWrapper:
         # cudagraphs for.
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry]\
                                                                         = {}
+        _cudagraph_wrappers.add(self)
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.

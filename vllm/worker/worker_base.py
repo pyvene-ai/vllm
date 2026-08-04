@@ -250,7 +250,8 @@ class WorkerBase:
             try:
                 dev = next(layer.parameters()).device
             except StopIteration:
-                dev = torch.device("cuda")
+                dev = torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu")
             source = spec.get("adapters", {}).get(layer_idx,
                                                    spec["sample_adapter"])
             model_dtype = torch.bfloat16
@@ -258,6 +259,11 @@ class WorkerBase:
             _add_adapter_to_layer(layer, reft_int_id, adapter_copy,
                                   position, dev, site=site)
             count += 1
+        if count:
+            # Captured CUDA graphs don't include the new adapter; force
+            # lazy re-capture with the updated module set.
+            from vllm.compilation.cuda_graph import invalidate_all_cudagraphs
+            invalidate_all_cudagraphs()
         return count
 
     def unload_reft_adapter(self, reft_int_id: int) -> int:
@@ -282,6 +288,10 @@ class WorkerBase:
         for layer in model.model.layers:
             if _remove_adapter_from_layer(layer, reft_int_id):
                 count += 1
+        if count:
+            # Captured CUDA graphs still reference the removed adapter.
+            from vllm.compilation.cuda_graph import invalidate_all_cudagraphs
+            invalidate_all_cudagraphs()
         return count
 
     def get_reft_debug_stats(self) -> dict:

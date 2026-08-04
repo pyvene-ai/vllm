@@ -162,6 +162,11 @@ class ReFTModelManager:
 
         # Load weights into decoder layers.
         count = self._load_adapter_to_layers(reft_model)
+        if count:
+            # Captured CUDA graphs don't include the new adapter; force
+            # lazy re-capture with the updated module set.
+            from vllm.compilation.cuda_graph import invalidate_all_cudagraphs
+            invalidate_all_cudagraphs()
         logger.debug("Activated ReFT adapter id=%d in slot %d "
                      "(%d layers)", reft_id, slot, count)
 
@@ -178,8 +183,15 @@ class ReFTModelManager:
             pass
 
         # Remove from all layers (also tears down site hooks).
+        removed = 0
         for layer in self.reft_layers:
-            _remove_adapter_from_layer(layer, reft_id)
+            if _remove_adapter_from_layer(layer, reft_id):
+                removed += 1
+
+        if removed:
+            # Captured CUDA graphs baked in the old adapter set.
+            from vllm.compilation.cuda_graph import invalidate_all_cudagraphs
+            invalidate_all_cudagraphs()
 
         logger.debug("Deactivated ReFT adapter id=%d", reft_id)
 
