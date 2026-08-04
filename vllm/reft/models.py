@@ -26,7 +26,9 @@ class ReFTModel:
     id: int
     """Unique integer ID (>= 1).  0 is reserved for base model."""
     position: str
-    """Position mode: ``"first"``, ``"last"``, ``"prefill"``, ``"all"``."""
+    """Position mode: ``"first"``, ``"last"``, ``"prefill"``,
+    ``"decode"``, or ``"all"``.  ``"decode"`` is the exact complement of
+    ``"prefill"``."""
     adapter_config: dict
     """Serializable config dict (from ``spec_to_reft_config``)."""
     layer_indices: frozenset[int] = field(default_factory=frozenset)

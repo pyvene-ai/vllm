@@ -980,16 +980,22 @@ class InputBatch:
 
     def make_reft_inputs(
         self, num_scheduled_tokens: np.ndarray
-    ) -> np.ndarray:
-        """Build per-token reft_int_id mapping from per-request mapping.
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build per-token reft_int_id mappings from per-request mappings.
 
         Returns:
             token_reft_mapping: 1-D int32 numpy array of shape
                 (sum(num_scheduled_tokens),).  Each element is the
-                ``reft_int_id`` for that token (0 = no adapter).
+                primary ``reft_int_id`` for that token (0 = no adapter).
+            token_decode_reft_mapping: same shape; the decode-phase
+                paired adapter's id per token (0 = none).  Phase
+                restriction happens via the adapters' position masks.
         """
-        req_reft_mapping = self.request_reft_mapping[:self.num_reqs]
-        return req_reft_mapping.repeat(num_scheduled_tokens)
+        num_reqs = self.num_reqs
+        req_reft_mapping = self.request_reft_mapping[:num_reqs]
+        req_decode_reft_mapping = self.request_decode_reft_mapping[:num_reqs]
+        return (req_reft_mapping.repeat(num_scheduled_tokens),
+                req_decode_reft_mapping.repeat(num_scheduled_tokens))
 
     @property
     def num_reqs(self) -> int:

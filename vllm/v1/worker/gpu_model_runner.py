@@ -2293,10 +2293,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if self._reft_layers:
             from vllm.reft.layer import update_multi_reft_position_masks
             actual_positions = positions[:num_scheduled_tokens]
-            # Build per-token adapter ID mapping from InputBatch
-            token_reft_ids = torch.from_numpy(
-                self.input_batch.make_reft_inputs(
-                    num_scheduled_tokens_np)).to(self.device)
+            # Build per-token adapter ID mappings from InputBatch
+            # (primary slot + optional decode-phase-paired slot).
+            token_reft_np, decode_token_reft_np = (
+                self.input_batch.make_reft_inputs(num_scheduled_tokens_np))
+            token_reft_ids = torch.from_numpy(token_reft_np).to(self.device)
+            decode_token_reft_ids = torch.from_numpy(
+                decode_token_reft_np).to(self.device)
             # Backward compat: when reft_config= bakes in adapter id=1
             # at construction time, users don't pass ReFTRequest so all
             # token IDs are 0.  Default those to 1 so the adapter fires.
@@ -2304,11 +2307,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 token_reft_ids[token_reft_ids == 0] = 1
             # Ensure all adapters needed for this batch are on GPU.
             if self.reft_manager is not None:
-                batch_ids = set(token_reft_ids.unique().tolist()) - {0}
+                batch_ids = (set(token_reft_ids.unique().tolist())
+                             | set(decode_token_reft_ids.unique().tolist())
+                             ) - {0}
                 self.reft_manager.ensure_active(batch_ids)
             update_multi_reft_position_masks(
                 self._reft_layers, token_reft_ids, actual_positions,
-                attn_metadata, num_scheduled_tokens)
+                attn_metadata, num_scheduled_tokens,
+                decode_token_reft_ids=decode_token_reft_ids)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.

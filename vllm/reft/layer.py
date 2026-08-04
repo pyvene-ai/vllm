@@ -309,6 +309,21 @@ def _compute_position_mask(
             gate = (positions[0:1] == 0).to(dtype)
             return gate.expand(num_tokens)
 
+    if position == "decode":
+        # Exact complement of "prefill": the decode region at the start
+        # of a v1 batch.  A request running its final prompt chunk is
+        # still in the prefill region, so the decode adapter only kicks
+        # in from the step after the prompt completes.
+        if num_prefill_tokens is not None:
+            num_decode_tokens = num_tokens - num_prefill_tokens
+            token_idx = torch.arange(num_tokens, device=positions.device)
+            return (token_idx < num_decode_tokens).to(dtype)
+        else:
+            # Fallback: treat the whole batch as decode iff the first
+            # token is not at position 0 (mirrors the "prefill" gate).
+            gate = (positions[0:1] != 0).to(dtype)
+            return gate.expand(num_tokens)
+
     if position == "first":
         if num_prefill_tokens is not None:
             num_decode_tokens = num_tokens - num_prefill_tokens
@@ -424,14 +439,17 @@ def _reft_apply_adapter_op(
     (num_prefill_tokens, num_decodes, num_prefills,
      query_start_loc, seq_lens) = _get_prefill_info(resolved)
 
-    # Pure decode batch: skip adapter entirely.
-    if (position != "all"
+    # Pure decode batch: skip prefill-flavored adapters entirely
+    # ("all" and "decode" adapters still apply to decode tokens).
+    if (position not in ("all", "decode")
             and num_prefill_tokens is not None
             and num_prefill_tokens == 0):
         return torch.zeros_like(h_full)
 
-    # Mixed batch: only run adapter on prefill tokens (at end of batch).
-    if (position != "all"
+    # Mixed batch: only run prefill-flavored adapters on prefill tokens
+    # (at end of batch).  "decode" falls through to the full-batch path
+    # below, where its position mask restricts it to the decode region.
+    if (position not in ("all", "decode")
             and num_prefill_tokens is not None
             and 0 < num_prefill_tokens < num_tokens):
         num_decode_tokens = num_tokens - num_prefill_tokens
@@ -940,11 +958,19 @@ def update_multi_reft_position_masks(
     positions: torch.Tensor,
     attn_metadata,
     num_tokens: int,
+    decode_token_reft_ids: Optional[torch.Tensor] = None,
 ) -> None:
     """Pre-compute combined masks for all adapters on all ReFT layers.
 
     For each adapter on each layer, the combined mask is:
         (token belongs to this adapter) AND (position satisfies adapter's mode)
+
+    A token belongs to an adapter when the token's request references it
+    through either slot: the primary ``token_reft_ids`` or the optional
+    ``decode_token_reft_ids`` (a decode-phase-paired adapter).  The
+    adapter's own position mask then restricts it to its phase, so a
+    prefill adapter and a decode adapter paired on the same request
+    never overlap.
 
     Called from the model runner before each forward pass.
     """
@@ -952,7 +978,7 @@ def update_multi_reft_position_masks(
         return
 
     # Detect pure-decode batch from metadata (no GPU sync needed).
-    # If no prefill tokens and all adapters use non-"all" positions,
+    # If no prefill tokens and no adapter needs decode-time compute,
     # skip mask computation and adapter forward entirely.
     resolved_meta = _resolve_attn_metadata(attn_metadata)
     (num_prefill_tokens, _, _, _, _) = _get_prefill_info(resolved_meta)
@@ -960,15 +986,15 @@ def update_multi_reft_position_masks(
                       and num_prefill_tokens == 0)
 
     if is_pure_decode:
-        # Check if any adapter uses position="all" (needs decode-time compute)
-        any_all_position = any(
-            pos in ("all", "all_tokens")
+        # "all" and "decode" adapters need compute on decode tokens.
+        any_decode_active = any(
+            pos in ("all", "all_tokens", "decode")
             for layer in reft_layers
             if hasattr(layer, "_reft_adapter_positions")
             for pos in layer._reft_adapter_positions.values()
         )
-        if not any_all_position:
-            # Pure decode + no "all" adapters → skip everything
+        if not any_decode_active:
+            # Pure decode + only prefill-flavored adapters → skip.
             for layer in reft_layers:
                 layer._reft_all_masks_zero = True
             return
@@ -977,8 +1003,9 @@ def update_multi_reft_position_masks(
     # One .unique() call on a small 1-D int tensor — fast, no GPU sync
     # needed since we only use the result as a Python set for membership
     # checks in the forward pass.
-    active_ids_tensor = token_reft_ids.unique()
-    batch_active_ids: set[int] = set(active_ids_tensor.tolist())
+    batch_active_ids: set[int] = set(token_reft_ids.unique().tolist())
+    if decode_token_reft_ids is not None:
+        batch_active_ids |= set(decode_token_reft_ids.unique().tolist())
     batch_active_ids.discard(0)  # 0 = no adapter
 
     # Cache position masks by position string to avoid redundant computation.
@@ -988,8 +1015,16 @@ def update_multi_reft_position_masks(
         if not hasattr(layer, "reft_adapters"):
             continue
         # Intersect batch-active IDs with this layer's loaded adapters.
-        layer._reft_active_ids = batch_active_ids & {
+        layer_active_ids = batch_active_ids & {
             int(s) for s in layer.reft_adapters}
+        if is_pure_decode:
+            # Prefill-flavored adapters can't fire on decode tokens.
+            layer_active_ids = {
+                i for i in layer_active_ids
+                if layer._reft_adapter_positions.get(i, "prefill")
+                in ("all", "all_tokens", "decode")
+            }
+        layer._reft_active_ids = layer_active_ids
         layer._reft_all_masks_zero = len(layer._reft_active_ids) == 0
         if layer._reft_all_masks_zero:
             continue
@@ -997,8 +1032,12 @@ def update_multi_reft_position_masks(
             int_id = int(str_id)
             if int_id not in layer._reft_active_ids:
                 continue
-            # Adapter membership mask
-            adapter_mask = (token_reft_ids == int_id).float()
+            # Adapter membership mask (either slot).
+            adapter_mask = (token_reft_ids == int_id)
+            if decode_token_reft_ids is not None:
+                adapter_mask = adapter_mask | (
+                    decode_token_reft_ids == int_id)
+            adapter_mask = adapter_mask.float()
             # Position mask (cached by position string)
             pos = layer._reft_adapter_positions.get(int_id, "prefill")
             if pos not in pos_mask_cache:
