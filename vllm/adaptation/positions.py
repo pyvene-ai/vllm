@@ -18,6 +18,7 @@ Builtins mirror the historical ReFT position strings: ``all``,
 adaptations register their own with :func:`register_position_mask`.
 """
 
+import re
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -93,15 +94,54 @@ def registered_positions() -> dict[str, _PositionEntry]:
     return _POSITION_REGISTRY
 
 
+# Parameterized position family: "every_<k>" (optionally
+# "every_<k>_offset_<j>") applies on tokens whose position id satisfies
+# ``pos % k == j``.  Resolved on demand — no explicit registration.
+_EVERY_K_RE = re.compile(r"^every_(\d+)(?:_offset_(\d+))?$")
+
+
+def _make_every_k_mask(k: int, offset: int) -> PositionMaskFn:
+
+    def every_k_mask(positions, dtype, num_tokens, phase):
+        # Pure position-id arithmetic: exact under chunked prefill,
+        # batching, and decode; needs no attention metadata.
+        return (positions % k == offset).to(dtype)
+
+    return every_k_mask
+
+
+def _resolve_position(name: str) -> Optional[_PositionEntry]:
+    """Look up *name*, materializing parameterized families on demand."""
+    entry = _POSITION_REGISTRY.get(name)
+    if entry is not None:
+        return entry
+    match = _EVERY_K_RE.match(name)
+    if match is None:
+        return None
+    k = int(match.group(1))
+    offset = int(match.group(2) or 0)
+    if k < 1:
+        raise ValueError(
+            f"Position {name!r}: every_<k> requires k >= 1, got k={k}.")
+    if offset >= k:
+        raise ValueError(
+            f"Position {name!r}: offset must be < k, got offset={offset} "
+            f"with k={k} (the mask would never fire).")
+    register_position_mask(name, _make_every_k_mask(k, offset),
+                           active_in_decode=True)
+    return _POSITION_REGISTRY[name]
+
+
 def get_position_mask(name: str, positions: torch.Tensor,
                       dtype: torch.dtype, num_tokens: int,
                       phase: PhaseInfo) -> Optional[torch.Tensor]:
     """Compute the mask for position *name*, or ``None`` for all-tokens."""
-    entry = _POSITION_REGISTRY.get(name)
+    entry = _resolve_position(name)
     if entry is None:
         raise ValueError(
             f"Unknown position {name!r}. Registered positions: "
-            f"{sorted(_POSITION_REGISTRY)}. Use "
+            f"{sorted(_POSITION_REGISTRY)} (plus the parameterized "
+            "'every_<k>' / 'every_<k>_offset_<j>' family). Use "
             "vllm.adaptation.register_position_mask() to add custom ones.")
     return entry.fn(positions, dtype, num_tokens, phase)
 
@@ -110,7 +150,10 @@ def position_active_in_decode(name: str) -> bool:
     """Whether an adaptation with this position can fire on decode tokens.
 
     Unknown names return True (never skip what we don't understand)."""
-    entry = _POSITION_REGISTRY.get(name)
+    try:
+        entry = _resolve_position(name)
+    except ValueError:
+        return True
     return True if entry is None else entry.active_in_decode
 
 
