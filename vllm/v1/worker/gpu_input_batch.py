@@ -547,9 +547,9 @@ class InputBatch:
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
 
-        # LoRA
-        for lora_id in (self.request_lora_mapping[req_index],
-                        self.request_decode_lora_mapping[req_index]):
+        # LoRA (the set dedupes ids shared by both phase slots)
+        for lora_id in {self.request_lora_mapping[req_index],
+                        self.request_decode_lora_mapping[req_index]}:
             if lora_id != 0:
                 lora_req_ids = self.lora_id_to_request_ids[lora_id]
                 lora_req_ids.discard(req_id)
@@ -560,9 +560,9 @@ class InputBatch:
         self.request_lora_position[req_index] = 0
         self.request_decode_lora_mapping[req_index] = 0
 
-        # ReFT
-        for reft_id in (self.request_reft_mapping[req_index],
-                        self.request_decode_reft_mapping[req_index]):
+        # ReFT (the set dedupes ids shared by both phase slots)
+        for reft_id in {self.request_reft_mapping[req_index],
+                        self.request_decode_reft_mapping[req_index]}:
             if reft_id != 0:
                 reft_req_ids = self.reft_id_to_request_ids[reft_id]
                 reft_req_ids.discard(req_id)

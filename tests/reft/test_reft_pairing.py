@@ -106,6 +106,16 @@ class TestMakeReftInputs:
         assert 1 not in batch.reft_id_to_reft_request
         assert 2 not in batch.reft_id_to_reft_request
 
+    def test_same_id_in_both_slots_removes_cleanly(self):
+        # Odd but legal for ReFT (positions live on the adapter, not the
+        # request): the same id in both slots must not crash removal.
+        batch = _make_batch()
+        req = _req(4, 0, reft_request=_reft(1), decode_reft_request=_reft(1))
+        batch.add_request(req)
+        batch.remove_request(req.req_id)
+        assert 1 not in batch.reft_id_to_reft_request
+        assert 1 not in batch.reft_id_to_request_ids
+
     def test_condense_moves_decode_slot(self):
         batch = _make_batch()
         r1 = _req(4, 4, num_output=1, reft_request=_reft(1))
