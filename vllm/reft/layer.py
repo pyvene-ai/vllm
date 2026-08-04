@@ -987,6 +987,7 @@ def update_multi_reft_position_masks(
     num_tokens: int,
     decode_token_reft_ids: Optional[torch.Tensor] = None,
     use_gather: bool = False,
+    graph_safe: bool = False,
 ) -> None:
     """Pre-compute combined masks for all adapters on all ReFT layers.
 
@@ -1006,8 +1007,19 @@ def update_multi_reft_position_masks(
     forward runs the adapter on O(members) tokens instead of the full
     batch.
 
+    With ``graph_safe=True`` (CUDA graph mode), the Python-state skip
+    optimisations are disabled so the forward's control flow is
+    batch-agnostic — captured graphs bake Python branches, so every
+    loaded adapter must compute unconditionally, with per-batch
+    selection expressed only through the mask buffers.  Buffers of
+    adapters with no tokens this step are zeroed (they'd otherwise be
+    stale from an earlier batch).
+
     Called from the model runner before each forward pass.
     """
+    if graph_safe:
+        # Gather uses dynamic member counts — never in graph mode.
+        use_gather = False
     if not reft_layers:
         return
 
@@ -1019,7 +1031,7 @@ def update_multi_reft_position_masks(
     is_pure_decode = (num_prefill_tokens is not None
                       and num_prefill_tokens == 0)
 
-    if is_pure_decode:
+    if is_pure_decode and not graph_safe:
         # Positions whose masks can be nonzero on decode tokens (e.g.
         # "all", "decode", custom positions) need decode-time compute.
         any_decode_active = any(
@@ -1062,13 +1074,25 @@ def update_multi_reft_position_masks(
                 if position_active_in_decode(
                     layer._reft_adapter_positions.get(i, "prefill"))
             }
-        layer._reft_active_ids = layer_active_ids
-        layer._reft_all_masks_zero = len(layer._reft_active_ids) == 0
-        if layer._reft_all_masks_zero:
-            continue
+        if graph_safe:
+            # Batch-agnostic control flow: the forward iterates every
+            # loaded adapter; selection lives in the mask buffers only.
+            layer._reft_active_ids = None
+            layer._reft_all_masks_zero = False
+            for str_id in layer.reft_adapters:
+                inactive_id = int(str_id)
+                if inactive_id not in layer_active_ids:
+                    buf = layer._reft_combined_masks.get(inactive_id)
+                    if buf is not None:
+                        buf.zero_()
+        else:
+            layer._reft_active_ids = layer_active_ids
+            layer._reft_all_masks_zero = len(layer_active_ids) == 0
+            if layer._reft_all_masks_zero:
+                continue
         for str_id in layer.reft_adapters:
             int_id = int(str_id)
-            if int_id not in layer._reft_active_ids:
+            if int_id not in layer_active_ids:
                 continue
             # Adapter membership mask (either slot).
             adapter_mask = (token_reft_ids == int_id)

@@ -32,16 +32,40 @@ logger = init_logger(__name__)
 _cudagraph_wrappers: "weakref.WeakSet[CUDAGraphWrapper]" = weakref.WeakSet()
 
 
+def _lazy_capture_context():
+    """Coordination context for capturing outside warmup.
+
+    Warmup captures run inside ``vllm.distributed.graph_capture()``,
+    which provides a dedicated side stream and switches the TP/PP
+    custom-allreduce communicators into capture mode.  A lazy
+    (post-invalidation) capture must enter the same context itself —
+    unless one is already open, or distributed state was never
+    initialized (single-process unit tests).
+
+    All ranks reach the same lazy capture at the same step because both
+    the adapter-set change (a collective RPC or deterministic LRU
+    decision) and the batch-descriptor dispatch are SPMD-identical.
+    """
+    from contextlib import nullcontext
+
+    from vllm.distributed import parallel_state
+    if parallel_state.is_graph_capture_context_active():
+        return nullcontext()
+    if not parallel_state.model_parallel_is_initialized():
+        return nullcontext()
+    device = (torch.device("cuda", torch.cuda.current_device())
+              if torch.cuda.is_available() else torch.device("cpu"))
+    return parallel_state.graph_capture(device)
+
+
 def invalidate_all_cudagraphs() -> int:
     """Drop every captured CUDA graph and re-allow capturing.
 
     The next dispatch through each wrapper lazily re-captures with the
     model's current module set (CUDAGraphWrapper captures whenever an
-    entry has no graph yet).  Returns the number of dropped entries.
-
-    Note: lazy re-capture happens outside the warmup ``graph_capture()``
-    coordination context; this is safe for single-GPU serving, which is
-    the supported configuration for dynamically loaded adaptations.
+    entry has no graph yet), entering the distributed graph-capture
+    coordination context as needed (see ``_lazy_capture_context``).
+    Returns the number of dropped entries.
     """
     cleared = 0
     for wrapper in list(_cudagraph_wrappers):
@@ -182,6 +206,10 @@ class CUDAGraphWrapper:
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
+                # Lazy (post-warmup) captures need the distributed
+                # graph-capture coordination context that warmup
+                # provides externally; no-op when already inside one.
+                stack.enter_context(_lazy_capture_context())
                 if self.cudagraph_options.gc_disable:
                     # during every model forward for piecewise cudagraph
                     # mode, we will capture many pieces of cudagraphs

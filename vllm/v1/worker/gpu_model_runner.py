@@ -2311,13 +2311,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                              | set(decode_token_reft_ids.unique().tolist())
                              ) - {0}
                 self.reft_manager.ensure_active(batch_ids)
+            cudagraphs_enabled = (self.compilation_config.cudagraph_mode
+                                  is not None
+                                  and self.compilation_config.cudagraph_mode
+                                  != CUDAGraphMode.NONE)
             update_multi_reft_position_masks(
                 self._reft_layers, token_reft_ids, actual_positions,
                 attn_metadata, num_scheduled_tokens,
                 decode_token_reft_ids=decode_token_reft_ids,
                 # Gather/scatter uses dynamic member counts, which CUDA
                 # graph replay cannot represent — eager mode only.
-                use_gather=self.vllm_config.model_config.enforce_eager)
+                use_gather=self.vllm_config.model_config.enforce_eager,
+                # Captured graphs bake Python control flow: keep the
+                # adapter loop batch-agnostic when cudagraphs are on.
+                graph_safe=cudagraphs_enabled)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
