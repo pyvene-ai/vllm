@@ -243,40 +243,16 @@ def _get_prefill_info(attn_metadata) -> tuple[
     return (None, 0, 0, None, seq_lens)
 
 
-def _prefill_request_indices(
-    num_prefill_tokens: int,
-    num_decodes: int,
-    num_prefills: int,
-    query_start_loc: Optional[torch.Tensor],
-    prefill_positions: torch.Tensor,
-) -> torch.Tensor:
-    """Map each prefill token to its request index (0-based within prefills).
-
-    Prefers ``query_start_loc`` (from attn_metadata) for an exact answer.
-    Falls back to detecting position resets when metadata is unavailable.
-    """
-    if num_prefill_tokens <= 1:
-        return torch.zeros(num_prefill_tokens, device=prefill_positions.device,
-                           dtype=torch.long)
-
-    # --- Preferred path: use query_start_loc from metadata ---
-    if query_start_loc is not None and num_prefills > 0:
-        # query_start_loc covers all requests (decode + prefill), shape (N+1,).
-        # Prefill requests start at index num_decodes.
-        # The prefill-region offsets are relative to the start of prefill tokens.
-        prefill_qsl = query_start_loc[num_decodes:] - query_start_loc[num_decodes]
-        prefill_tok_idx = torch.arange(
-            num_prefill_tokens, device=prefill_positions.device)
-        req_idx = torch.searchsorted(
-            prefill_qsl[1:], prefill_tok_idx, right=True)
-        return req_idx.clamp(max=num_prefills - 1)
-
-    # --- Fallback: detect request boundaries from position resets ---
-    is_boundary = torch.zeros(num_prefill_tokens,
-                              device=prefill_positions.device, dtype=torch.long)
-    is_boundary[1:] = (
-        prefill_positions[1:] <= prefill_positions[:-1]).long()
-    return is_boundary.cumsum(0)
+# _prefill_request_indices moved to vllm.adaptation.positions; re-exported
+# here for backward compatibility.
+from vllm.adaptation.positions import _prefill_request_indices  # noqa: E402,F401
+from vllm.adaptation.positions import (PhaseInfo,  # noqa: E402
+                                       get_position_mask,
+                                       position_active_in_decode)
+from vllm.adaptation.protocol import (apply_adaptation,  # noqa: E402
+                                      check_adaptation_supported,
+                                      resolve_site_submodule_path,
+                                      validate_site)
 
 
 def _compute_position_mask(
@@ -286,107 +262,26 @@ def _compute_position_mask(
     num_tokens: int,
     attn_metadata,
 ) -> Optional[torch.Tensor]:
-    """Return the per-token ReFT mask, or ``None`` for unconditional apply.
+    """Return the per-token mask for *position*, or ``None`` for all-tokens.
 
-    Handles both vLLM V0 (single metadata object) and V1 (dict of per-layer
-    metadata).  Works with any V1 attention backend (FlashInfer, Flash
-    Attention, etc.) by deriving the prefill/decode split from
-    ``query_start_loc`` when explicit fields are absent.
-
-    Uses ``seq_lens`` to correctly identify the true first/last prefill
-    token under chunked prefill.
+    Extracts the batch's prefill/decode split from *attn_metadata*
+    (handles both vLLM V0 single objects and V1 dicts, any attention
+    backend) and dispatches to the named position registry in
+    :mod:`vllm.adaptation.positions`.  Builtins: "all", "all_tokens",
+    "prefill", "decode", "first", "last"; custom positions are added
+    via :func:`vllm.adaptation.register_position_mask`.
     """
     attn_metadata = _resolve_attn_metadata(attn_metadata)
     (num_prefill_tokens, num_decodes, num_prefills,
      query_start_loc, seq_lens) = _get_prefill_info(attn_metadata)
-
-    if position == "prefill":
-        if num_prefill_tokens is not None:
-            num_decode_tokens = num_tokens - num_prefill_tokens
-            token_idx = torch.arange(num_tokens, device=positions.device)
-            return (token_idx >= num_decode_tokens).to(dtype)
-        else:
-            gate = (positions[0:1] == 0).to(dtype)
-            return gate.expand(num_tokens)
-
-    if position == "decode":
-        # Exact complement of "prefill": the decode region at the start
-        # of a v1 batch.  A request running its final prompt chunk is
-        # still in the prefill region, so the decode adapter only kicks
-        # in from the step after the prompt completes.
-        if num_prefill_tokens is not None:
-            num_decode_tokens = num_tokens - num_prefill_tokens
-            token_idx = torch.arange(num_tokens, device=positions.device)
-            return (token_idx < num_decode_tokens).to(dtype)
-        else:
-            # Fallback: treat the whole batch as decode iff the first
-            # token is not at position 0 (mirrors the "prefill" gate).
-            gate = (positions[0:1] != 0).to(dtype)
-            return gate.expand(num_tokens)
-
-    if position == "first":
-        if num_prefill_tokens is not None:
-            num_decode_tokens = num_tokens - num_prefill_tokens
-            # position == 0 only appears in the very first chunk of a
-            # request, so a simple check is sufficient — no seq_lens needed.
-            full_mask = torch.zeros(num_tokens, device=positions.device,
-                                    dtype=dtype)
-            if num_prefill_tokens > 0:
-                prefill_positions = positions[num_decode_tokens:]
-                full_mask[num_decode_tokens:] = (prefill_positions == 0).to(dtype)
-            return full_mask
-        else:
-            in_prefill = (positions[0:1] == 0).to(dtype)
-            return (positions == 0).to(dtype) * in_prefill
-
-    if position == "last":
-        if num_prefill_tokens is not None:
-            num_decode_tokens = num_tokens - num_prefill_tokens
-            full_mask = torch.zeros(num_tokens, device=positions.device,
-                                    dtype=dtype)
-            if num_prefill_tokens == 0:
-                return full_mask
-
-            prefill_positions = positions[num_decode_tokens:]  # (P,)
-
-            # --- Identify the last token of each request's query span ---
-            req_idx = _prefill_request_indices(
-                num_prefill_tokens, num_decodes, num_prefills,
-                query_start_loc, prefill_positions)
-
-            # last-in-query-span: token where req_idx changes or final token
-            is_last_in_span = torch.zeros(num_prefill_tokens,
-                                          device=positions.device, dtype=dtype)
-            if num_prefill_tokens > 1:
-                is_last_in_span[:-1] = (
-                    req_idx[1:] != req_idx[:-1]).to(dtype)
-            is_last_in_span[-1] = 1.0
-
-            # --- Filter to only true last prefill tokens ---
-            if seq_lens is not None:
-                # seq_lens is ordered [decode_reqs..., prefill_reqs...]
-                prefill_seq_lens = seq_lens[num_decodes:]
-                expected_last_pos = prefill_seq_lens[req_idx] - 1
-                is_true_last = (
-                    prefill_positions == expected_last_pos).to(dtype)
-                full_mask[num_decode_tokens:] = (
-                    is_last_in_span * is_true_last)
-            else:
-                # No seq_lens available — fall back to last-in-span only.
-                full_mask[num_decode_tokens:] = is_last_in_span
-
-            return full_mask
-        else:
-            # Fallback tensor-only "last" mask (no prefill/decode split info).
-            is_last = torch.zeros_like(positions, dtype=dtype)
-            is_last[-1] = 1.0
-            next_is_zero = (torch.roll(positions, -1) == 0).to(dtype)
-            is_last = is_last + next_is_zero * (1.0 - is_last)
-            in_prefill = (positions[0:1] == 0).to(dtype)
-            return is_last * in_prefill
-
-    # "all" or unknown position – apply unconditionally (guarded at call-site).
-    return None
+    phase = PhaseInfo(
+        num_prefill_tokens=num_prefill_tokens,
+        num_decodes=num_decodes,
+        num_prefills=num_prefills,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+    )
+    return get_position_mask(position, positions, dtype, num_tokens, phase)
 
 
 def _apply_position_mask(
@@ -861,6 +756,7 @@ def _collect_layer_reft_debug_stats(layer: nn.Module) -> Optional[dict]:
 def _prepare_adapter(source: nn.Module, dev: torch.device,
                      model_dtype: torch.dtype) -> nn.Module:
     """Deep-copy an adapter, cast linears to model dtype, install caches."""
+    check_adaptation_supported(source)
     adapter_copy = copy.deepcopy(source).to(dev)
     for child in adapter_copy.modules():
         if isinstance(child, nn.Linear):
@@ -880,24 +776,103 @@ def _init_multi_reft_state(layer: nn.Module, dev: torch.device,
     """
     layer.reft_adapters = nn.ModuleDict()
     layer._reft_adapter_positions: dict[int, str] = {}
+    layer._reft_adapter_sites: dict[int, str] = {}
     layer._reft_combined_masks: dict[int, torch.Tensor] = {}
+    layer._reft_site_hooks: dict[str, torch.utils.hooks.RemovableHandle] = {}
     _init_reft_debug_buffers(layer, dev)
     _init_reft_capture_buffers(layer, hidden_size, dev)
 
 
+def _apply_site_adaptations(layer: nn.Module, site: str, output):
+    """Blend all active adaptations mounted at *site* into *output*.
+
+    *output* may be a bare tensor or a tuple whose first element is the
+    tensor (vLLM's parallel linear layers return ``(out, bias)``).
+    """
+    if getattr(layer, "_reft_all_masks_zero", False):
+        return output
+    active_ids = getattr(layer, "_reft_active_ids", None)
+    hidden = output[0] if isinstance(output, tuple) else output
+    new_hidden = hidden
+    for str_id, adapter in layer.reft_adapters.items():
+        int_id = int(str_id)
+        if layer._reft_adapter_sites.get(int_id, "block_output") != site:
+            continue
+        if active_ids is not None and int_id not in active_ids:
+            continue
+        mask_buf = layer._reft_combined_masks.get(int_id)
+        num_tokens = new_hidden.shape[0]
+        mask = mask_buf[:num_tokens] if mask_buf is not None else None
+        new_hidden = apply_adaptation(adapter, new_hidden, mask)
+    if new_hidden is hidden:
+        return output
+    if isinstance(output, tuple):
+        return (new_hidden, ) + tuple(output[1:])
+    return new_hidden
+
+
+def _install_site_hook(layer: nn.Module, site: str) -> None:
+    """Install (once) the forward hook a submodule-mounted site needs."""
+    if site in layer._reft_site_hooks:
+        return
+    path = resolve_site_submodule_path(site)
+    assert path is not None, f"site {site!r} does not use a hook"
+    try:
+        submodule = layer.get_submodule(path)
+    except AttributeError as e:
+        raise ValueError(
+            f"Mount site {site!r}: decoder layer has no submodule "
+            f"{path!r}") from e
+
+    def hook(module, args, output, _layer=layer, _site=site):
+        return _apply_site_adaptations(_layer, _site, output)
+
+    layer._reft_site_hooks[site] = submodule.register_forward_hook(hook)
+
+
 def _add_adapter_to_layer(layer: nn.Module, reft_int_id: int,
                           adapter: nn.Module, position: str,
-                          dev: torch.device) -> None:
+                          dev: torch.device,
+                          site: str = "block_output") -> None:
     """Register an adapter on a decoder layer (in-place)."""
+    validate_site(site)
     key = str(reft_int_id)
     layer.reft_adapters[key] = adapter
     layer._reft_adapter_positions[reft_int_id] = position
+    if not hasattr(layer, "_reft_adapter_sites"):
+        layer._reft_adapter_sites = {}
+    if not hasattr(layer, "_reft_site_hooks"):
+        layer._reft_site_hooks = {}
+    layer._reft_adapter_sites[reft_int_id] = site
+    if resolve_site_submodule_path(site) is not None:
+        _install_site_hook(layer, site)
     # Pre-allocate combined mask buffer
     layer._reft_combined_masks[reft_int_id] = torch.zeros(
         _REFT_MASK_FALLBACK_SIZE, dtype=torch.float32, device=dev)
     # Backward compat: keep reft_adapter pointing to first loaded adapter
     if not hasattr(layer, "reft_adapter") or layer.reft_adapter is None:
         layer.reft_adapter = adapter
+
+
+def _remove_adapter_from_layer(layer: nn.Module, reft_int_id: int) -> bool:
+    """Remove an adapter from a decoder layer, tearing down its site
+    hook when it was the site's last user.  Returns True if removed."""
+    key = str(reft_int_id)
+    if not hasattr(layer, "reft_adapters") or key not in layer.reft_adapters:
+        return False
+    del layer.reft_adapters[key]
+    layer._reft_adapter_positions.pop(reft_int_id, None)
+    layer._reft_combined_masks.pop(reft_int_id, None)
+    sites = getattr(layer, "_reft_adapter_sites", {})
+    site = sites.pop(reft_int_id, "block_output")
+    hooks = getattr(layer, "_reft_site_hooks", {})
+    if site in hooks and site not in sites.values():
+        hooks.pop(site).remove()
+    # Update backward compat reft_adapter reference.
+    if getattr(layer, "reft_adapter", None) is not None:
+        remaining = list(layer.reft_adapters.values())
+        layer.reft_adapter = remaining[0] if remaining else None
+    return True
 
 
 def _multi_reft_forward(
@@ -916,38 +891,68 @@ def _multi_reft_forward(
 
     Pure-decode optimisation: if ``_reft_all_masks_zero`` is set (e.g.
     decode-only batch with prefill adapters), skip everything.
+
+    Sites: ``block_input`` adaptations run on the incoming residual
+    stream before ``super_forward``; ``post_attn`` / ``post_mlp`` /
+    ``linear:*`` adaptations run via forward hooks on submodules inside
+    ``super_forward``; ``block_output`` adaptations run on the outgoing
+    stream below.
     """
-    hidden_states, residual = super_forward(positions, hidden_states, residual)
-
-    if not hasattr(layer_self, "reft_adapters") or len(layer_self.reft_adapters) == 0:
-        return hidden_states, residual
-
-    # Skip when all masks are zero (pure decode with non-"all" adapters).
-    if getattr(layer_self, "_reft_all_masks_zero", False):
-        return hidden_states, residual
+    skip = (not hasattr(layer_self, "reft_adapters")
+            or len(layer_self.reft_adapters) == 0
+            or getattr(layer_self, "_reft_all_masks_zero", False))
 
     # Only iterate adapters that have at least one token in this batch.
     # _reft_active_ids is a Python set computed by
     # update_multi_reft_position_masks (outside compilation, no GPU sync).
     active_ids = getattr(layer_self, "_reft_active_ids", None)
 
-    h_full = hidden_states + residual
-    delta = torch.zeros_like(hidden_states)
+    # block_input site: adapt the incoming stream.  The incoming
+    # (hidden_states, residual) pair represents stream = hidden +
+    # residual (residual is None on the first layer); handing the
+    # adapted stream forward with residual=None re-bases the deferred
+    # residual add on the adapted value.
+    if not skip:
+        sites = getattr(layer_self, "_reft_adapter_sites", {})
+        has_active_input_site = any(
+            sites.get(int(str_id), "block_output") == "block_input"
+            and (active_ids is None or int(str_id) in active_ids)
+            for str_id in layer_self.reft_adapters)
+        if has_active_input_site:
+            in_stream = (hidden_states if residual is None else
+                         hidden_states + residual)
+            new_in_stream = _apply_site_adaptations(
+                layer_self, "block_input", in_stream)
+            if new_in_stream is not in_stream:
+                hidden_states, residual = new_in_stream, None
 
+    hidden_states, residual = super_forward(positions, hidden_states, residual)
+
+    if skip:
+        return hidden_states, residual
+
+    h_full = hidden_states + residual
+    new_stream = h_full
+
+    # Sequentially blend each active block_output adaptation into the
+    # stream (insertion order).  For the additive default this matches
+    # the historical sum-of-masked-deltas whenever masks are disjoint
+    # (which membership ∧ phase masks guarantee for paired adapters).
+    adapter_sites = getattr(layer_self, "_reft_adapter_sites", None)
     for str_id, adapter in layer_self.reft_adapters.items():
         int_id = int(str_id)
         if active_ids is not None and int_id not in active_ids:
             continue
-        adapter_delta = adapter._compute_delta(
-            h_full.unsqueeze(0)).squeeze(0)
+        if (adapter_sites is not None
+                and adapter_sites.get(int_id, "block_output")
+                != "block_output"):
+            continue  # mounted elsewhere (hooked submodule / block_input)
         mask_buf = layer_self._reft_combined_masks.get(int_id)
-        if mask_buf is not None:
-            N = adapter_delta.shape[0]
-            adapter_delta = adapter_delta * mask_buf[:N].unsqueeze(-1).to(
-                adapter_delta.dtype)
-        delta = delta + adapter_delta
+        num_tokens = new_stream.shape[0]
+        mask = mask_buf[:num_tokens] if mask_buf is not None else None
+        new_stream = apply_adaptation(adapter, new_stream, mask)
 
-    hidden_states = delta
+    hidden_states = new_stream - h_full
     residual = h_full
     return hidden_states, residual
 
@@ -986,9 +991,10 @@ def update_multi_reft_position_masks(
                       and num_prefill_tokens == 0)
 
     if is_pure_decode:
-        # "all" and "decode" adapters need compute on decode tokens.
+        # Positions whose masks can be nonzero on decode tokens (e.g.
+        # "all", "decode", custom positions) need decode-time compute.
         any_decode_active = any(
-            pos in ("all", "all_tokens", "decode")
+            position_active_in_decode(pos)
             for layer in reft_layers
             if hasattr(layer, "_reft_adapter_positions")
             for pos in layer._reft_adapter_positions.values()
@@ -1021,8 +1027,8 @@ def update_multi_reft_position_masks(
             # Prefill-flavored adapters can't fire on decode tokens.
             layer_active_ids = {
                 i for i in layer_active_ids
-                if layer._reft_adapter_positions.get(i, "prefill")
-                in ("all", "all_tokens", "decode")
+                if position_active_in_decode(
+                    layer._reft_adapter_positions.get(i, "prefill"))
             }
         layer._reft_active_ids = layer_active_ids
         layer._reft_all_masks_zero = len(layer._reft_active_ids) == 0

@@ -187,11 +187,12 @@ class WorkerBase:
         return None
 
     def load_reft_adapter(self, reft_int_id: int, adapter_config: dict,
-                          position: str = "prefill") -> int:
+                          position: str = "prefill",
+                          site: str = "block_output") -> int:
         """Load a new ReFT adapter into all relevant layers.
 
         Called via ``collective_rpc("load_reft_adapter",
-        args=(reft_int_id, adapter_config, position))``.
+        args=(reft_int_id, adapter_config, position, site))``.
 
         If a :class:`~vllm.reft.models.ReFTModelManager` is available (the
         ``enable_reft`` path), the adapter is registered and activated through
@@ -201,11 +202,18 @@ class WorkerBase:
         Args:
             reft_int_id: Unique integer ID for this adapter (>= 1).
             adapter_config: Serializable config dict (from spec_to_reft_config).
-            position: Position mode for this adapter.
+                May carry "site" / "position" keys, overridden by the
+                explicit arguments when those are non-default.
+            position: Position mode for this adapter (any registered
+                position name; builtins: all/prefill/decode/first/last).
+            site: Mount point inside each decoder layer (block_output,
+                block_input, post_attn, post_mlp, linear:<path>).
 
         Returns:
             Number of layers the adapter was loaded into.
         """
+        if site == "block_output":
+            site = adapter_config.get("site", "block_output")
         # Delegate to centralized manager when available.
         manager = self._get_reft_manager()
         if manager is not None:
@@ -219,6 +227,7 @@ class WorkerBase:
                 position=position,
                 adapter_config=adapter_config,
                 layer_indices=frozenset(spec.get("layer_indices", ())),
+                site=site,
             )
             manager.add_adapter(reft_model)
             manager.activate_adapter(reft_int_id)
@@ -247,7 +256,7 @@ class WorkerBase:
             model_dtype = torch.bfloat16
             adapter_copy = _prepare_adapter(source, dev, model_dtype)
             _add_adapter_to_layer(layer, reft_int_id, adapter_copy,
-                                  position, dev)
+                                  position, dev, site=site)
             count += 1
         return count
 
@@ -267,20 +276,11 @@ class WorkerBase:
             return 1 if was_removed else 0
 
         # Fallback: direct per-layer removal (backward compat).
+        from vllm.reft.layer import _remove_adapter_from_layer
         model = self.get_model()
-        key = str(reft_int_id)
         count = 0
         for layer in model.model.layers:
-            if not hasattr(layer, "reft_adapters"):
-                continue
-            if key in layer.reft_adapters:
-                del layer.reft_adapters[key]
-                layer._reft_adapter_positions.pop(reft_int_id, None)
-                layer._reft_combined_masks.pop(reft_int_id, None)
-                # Update backward compat reft_adapter reference
-                if layer.reft_adapter is not None:
-                    remaining = list(layer.reft_adapters.values())
-                    layer.reft_adapter = remaining[0] if remaining else None
+            if _remove_adapter_from_layer(layer, reft_int_id):
                 count += 1
         return count
 

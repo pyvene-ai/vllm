@@ -13,7 +13,8 @@ from typing import Optional
 import torch
 from torch import nn
 
-from vllm.reft.layer import _add_adapter_to_layer, _prepare_adapter
+from vllm.reft.layer import (_add_adapter_to_layer, _prepare_adapter,
+                             _remove_adapter_from_layer)
 from vllm.utils import LRUCache
 
 logger = logging.getLogger("vllm.reft.models")
@@ -33,6 +34,10 @@ class ReFTModel:
     """Serializable config dict (from ``spec_to_reft_config``)."""
     layer_indices: frozenset[int] = field(default_factory=frozenset)
     """Which decoder layers this adapter applies to."""
+    site: str = "block_output"
+    """Mount point inside each decoder layer: ``"block_output"``
+    (default), ``"block_input"``, ``"post_attn"``, ``"post_mlp"``, or
+    ``"linear:<submodule.path>"``."""
 
     def __post_init__(self):
         if self.id < 1:
@@ -172,17 +177,9 @@ class ReFTModelManager:
         except ValueError:
             pass
 
-        # Remove from all layers.
-        key = str(reft_id)
+        # Remove from all layers (also tears down site hooks).
         for layer in self.reft_layers:
-            if key in layer.reft_adapters:
-                del layer.reft_adapters[key]
-                layer._reft_adapter_positions.pop(reft_id, None)
-                layer._reft_combined_masks.pop(reft_id, None)
-                # Update backward compat reft_adapter reference.
-                if getattr(layer, "reft_adapter", None) is not None:
-                    remaining = list(layer.reft_adapters.values())
-                    layer.reft_adapter = remaining[0] if remaining else None
+            _remove_adapter_from_layer(layer, reft_id)
 
         logger.debug("Deactivated ReFT adapter id=%d", reft_id)
 
@@ -255,7 +252,8 @@ class ReFTModelManager:
             dev = self.device
             adapter_copy = _prepare_adapter(source, dev, self.model_dtype)
             _add_adapter_to_layer(layer, reft_model.id, adapter_copy,
-                                  reft_model.position, dev)
+                                  reft_model.position, dev,
+                                  site=reft_model.site)
             count += 1
 
         return count
