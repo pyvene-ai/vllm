@@ -47,6 +47,10 @@ class PhaseInfo:
     num_prefills: int
     query_start_loc: Optional[torch.Tensor]
     seq_lens: Optional[torch.Tensor]
+    prompt_lens: Optional[torch.Tensor] = None
+    """Per-request prompt lengths in batch order (decode requests first,
+    matching ``query_start_loc``).  Needed by generation-anchored
+    positions; supplied by the model runner from the InputBatch."""
 
 
 PositionMaskFn = Callable[
@@ -94,10 +98,66 @@ def registered_positions() -> dict[str, _PositionEntry]:
     return _POSITION_REGISTRY
 
 
-# Parameterized position family: "every_<k>" (optionally
-# "every_<k>_offset_<j>") applies on tokens whose position id satisfies
-# ``pos % k == j``.  Resolved on demand — no explicit registration.
+# Parameterized position families, resolved on demand (no explicit
+# registration):
+#   every_<k>[_offset_<j>]         — prompt-anchored: pos % k == j
+#   every_<k>_decode[_offset_<j>]  — generation-anchored: gen % k == j
+#   first_<k>_decode               — first k generated tokens
+#   decode_range_<a>_<b>           — a <= gen < b
+# where gen = position_id - prompt_len (0 = first sampled token).
 _EVERY_K_RE = re.compile(r"^every_(\d+)(?:_offset_(\d+))?$")
+_EVERY_K_DECODE_RE = re.compile(r"^every_(\d+)_decode(?:_offset_(\d+))?$")
+_FIRST_K_DECODE_RE = re.compile(r"^first_(\d+)_decode$")
+_DECODE_RANGE_RE = re.compile(r"^decode_range_(\d+)_(\d+)$")
+
+
+def _token_generation_index(positions: torch.Tensor, num_tokens: int,
+                            phase: PhaseInfo) -> Optional[torch.Tensor]:
+    """Per-token generation index (position - prompt_len), or ``None``
+    when per-request prompt lengths are unavailable.
+
+    Prompt tokens get negative indices; the first sampled token is 0.
+    """
+    if phase.prompt_lens is None:
+        return None
+    prompt_lens = phase.prompt_lens.to(positions.device)
+
+    if phase.num_prefill_tokens is None:
+        return None
+    num_decode_tokens = num_tokens - phase.num_prefill_tokens
+
+    token_prompt_lens = torch.empty(num_tokens, device=positions.device,
+                                    dtype=positions.dtype)
+    # Decode region: one token per request, in request order.
+    if num_decode_tokens > 0:
+        token_prompt_lens[:num_decode_tokens] = \
+            prompt_lens[:num_decode_tokens].to(positions.dtype)
+    # Prefill region: expand per-request lengths across query spans.
+    if phase.num_prefill_tokens > 0:
+        prefill_positions = positions[num_decode_tokens:]
+        req_idx = _prefill_request_indices(
+            phase.num_prefill_tokens, phase.num_decodes,
+            phase.num_prefills, phase.query_start_loc, prefill_positions)
+        token_prompt_lens[num_decode_tokens:] = \
+            prompt_lens[phase.num_decodes:][req_idx].to(positions.dtype)
+
+    return positions - token_prompt_lens
+
+
+def _make_gen_anchored_mask(predicate) -> PositionMaskFn:
+    """Build a mask fn from a predicate over generation indices.
+
+    Without prompt lengths the mask is all-zeros (inert) rather than
+    misanchored."""
+
+    def gen_mask(positions, dtype, num_tokens, phase):
+        gen_idx = _token_generation_index(positions, num_tokens, phase)
+        if gen_idx is None:
+            return torch.zeros(num_tokens, dtype=dtype,
+                               device=positions.device)
+        return ((gen_idx >= 0) & predicate(gen_idx)).to(dtype)
+
+    return gen_mask
 
 
 def _make_every_k_mask(k: int, offset: int) -> PositionMaskFn:
@@ -110,23 +170,65 @@ def _make_every_k_mask(k: int, offset: int) -> PositionMaskFn:
     return every_k_mask
 
 
+def _validate_every_k(name: str, k: int, offset: int) -> None:
+    if k < 1:
+        raise ValueError(
+            f"Position {name!r}: requires k >= 1, got k={k}.")
+    if offset >= k:
+        raise ValueError(
+            f"Position {name!r}: offset must be < k, got offset={offset} "
+            f"with k={k} (the mask would never fire).")
+
+
 def _resolve_position(name: str) -> Optional[_PositionEntry]:
     """Look up *name*, materializing parameterized families on demand."""
     entry = _POSITION_REGISTRY.get(name)
     if entry is not None:
         return entry
+
+    # Generation-anchored families (checked before the prompt-anchored
+    # every_<k> pattern, which would not match these anyway).
+    match = _EVERY_K_DECODE_RE.match(name)
+    if match is not None:
+        k = int(match.group(1))
+        offset = int(match.group(2) or 0)
+        _validate_every_k(name, k, offset)
+        register_position_mask(
+            name,
+            _make_gen_anchored_mask(lambda g, k=k, o=offset: g % k == o),
+            active_in_decode=True)
+        return _POSITION_REGISTRY[name]
+
+    match = _FIRST_K_DECODE_RE.match(name)
+    if match is not None:
+        k = int(match.group(1))
+        if k < 1:
+            raise ValueError(
+                f"Position {name!r}: requires k >= 1, got k={k}.")
+        register_position_mask(
+            name, _make_gen_anchored_mask(lambda g, k=k: g < k),
+            active_in_decode=True)
+        return _POSITION_REGISTRY[name]
+
+    match = _DECODE_RANGE_RE.match(name)
+    if match is not None:
+        lo, hi = int(match.group(1)), int(match.group(2))
+        if lo >= hi:
+            raise ValueError(
+                f"Position {name!r}: empty range [{lo}, {hi}).")
+        register_position_mask(
+            name,
+            _make_gen_anchored_mask(
+                lambda g, lo=lo, hi=hi: (g >= lo) & (g < hi)),
+            active_in_decode=True)
+        return _POSITION_REGISTRY[name]
+
     match = _EVERY_K_RE.match(name)
     if match is None:
         return None
     k = int(match.group(1))
     offset = int(match.group(2) or 0)
-    if k < 1:
-        raise ValueError(
-            f"Position {name!r}: every_<k> requires k >= 1, got k={k}.")
-    if offset >= k:
-        raise ValueError(
-            f"Position {name!r}: offset must be < k, got offset={offset} "
-            f"with k={k} (the mask would never fire).")
+    _validate_every_k(name, k, offset)
     register_position_mask(name, _make_every_k_mask(k, offset),
                            active_in_decode=True)
     return _POSITION_REGISTRY[name]

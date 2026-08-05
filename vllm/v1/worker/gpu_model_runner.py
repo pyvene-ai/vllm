@@ -2315,6 +2315,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                   is not None
                                   and self.compilation_config.cudagraph_mode
                                   != CUDAGraphMode.NONE)
+            # Per-request prompt lengths (batch order matches the
+            # attention metadata after decode-first reordering) enable
+            # generation-anchored positions like first_<k>_decode.
+            num_reqs = self.input_batch.num_reqs
+            prompt_lens = torch.from_numpy(
+                self.input_batch.num_prompt_tokens[:num_reqs].copy()).to(
+                    self.device)
             update_multi_reft_position_masks(
                 self._reft_layers, token_reft_ids, actual_positions,
                 attn_metadata, num_scheduled_tokens,
@@ -2324,7 +2331,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 use_gather=self.vllm_config.model_config.enforce_eager,
                 # Captured graphs bake Python control flow: keep the
                 # adapter loop batch-agnostic when cudagraphs are on.
-                graph_safe=cudagraphs_enabled)
+                graph_safe=cudagraphs_enabled,
+                prompt_lens=prompt_lens)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.

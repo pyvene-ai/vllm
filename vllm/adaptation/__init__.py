@@ -45,6 +45,7 @@ from vllm.adaptation.positions import (PhaseInfo, get_position_mask,
                                        registered_positions)
 from vllm.adaptation.protocol import (MOUNT_SITES, apply_adaptation,
                                       check_adaptation_supported,
+                                      needs_sequence_segmentation,
                                       resolve_site_submodule_path,
                                       validate_site)
 
@@ -57,6 +58,7 @@ __all__ = [
     "MOUNT_SITES",
     "apply_adaptation",
     "check_adaptation_supported",
+    "needs_sequence_segmentation",
     "resolve_site_submodule_path",
     "validate_site",
 ]

@@ -177,6 +177,15 @@ class WorkerBase:
             count += 1
         if refresh_caches and count:
             self.refresh_reft_caches(reft_int_id)
+        if count:
+            # The layer weights are now the source of truth; pin the
+            # adapter so LRU eviction can't rebuild it from its stale
+            # blueprint and silently revert training.  Adapters not
+            # managed by the LRU (construction-baked) need no pin.
+            get_mgr = getattr(self, "_get_reft_manager", None)
+            manager = get_mgr() if get_mgr is not None else None
+            if manager is not None and reft_int_id in manager.list_adapters():
+                manager.pin_adapter(reft_int_id)
         return count
 
     def _get_reft_manager(self):

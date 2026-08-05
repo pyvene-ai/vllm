@@ -224,6 +224,22 @@ class ReFTModelManager:
     def is_active(self, reft_id: int) -> bool:
         return reft_id in self._active
 
+    def pin_adapter(self, reft_id: int) -> bool:
+        """Pin an adapter against LRU eviction (CPU and GPU caches).
+
+        Used for adapters whose live layer weights are the source of
+        truth (training-time weight sync): eviction would rebuild them
+        from their stale blueprint and silently revert training.
+        """
+        if reft_id not in self._registered:
+            raise ValueError(
+                f"ReFT adapter id={reft_id} is not registered; cannot pin.")
+        self._registered.pin(reft_id)
+        if reft_id not in self._active:
+            self.activate_adapter(reft_id)
+        self._active.pin(reft_id)
+        return True
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

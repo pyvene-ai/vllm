@@ -1,5 +1,7 @@
 """Per-request ReFT adapter identifier for multi-ReFT serving."""
 
+from typing import Optional
+
 import msgspec
 
 
@@ -13,11 +15,18 @@ class ReFTRequest(msgspec.Struct, frozen=True):
         reft_int_id: Unique integer ID. **0 is reserved for "no adapter"
             (base model passthrough).**  Must be >= 1 for real adapters.
         reft_path: Path to the saved adapter checkpoint directory.
+        reft_position: Optional declaration of the adapter's position
+            mode (positions live on the loaded adapter, worker-side).
+            Used by prefix caching: adapters declared ``"decode"`` never
+            touch prefill KV, so their requests share cached prefills
+            with the base model; undeclared positions are conservatively
+            assumed to affect prefill.
     """
 
     reft_name: str
     reft_int_id: int
     reft_path: str
+    reft_position: Optional[str] = None
 
     def __post_init__(self):
         if self.reft_int_id < 1:

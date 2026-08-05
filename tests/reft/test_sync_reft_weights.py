@@ -10,6 +10,7 @@ that adapter's weights/caches may change.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -65,6 +66,85 @@ def _state_dict(fill: float) -> dict[str, torch.Tensor]:
 
 def _adapter(layer, adapter_id: int) -> TrackingAdapter:
     return layer.reft_adapters[str(adapter_id)]
+
+
+class TestSyncPinsAgainstEviction:
+    """A synced (training) adapter's weights live only in the layer
+    modules; LRU eviction would rebuild it from its stale blueprint and
+    silently revert training.  Syncing must pin the adapter."""
+
+    def _manager_setup(self, monkeypatch, max_refts):
+        import vllm.reft as vllm_reft
+        from vllm.reft.models import ReFTModel, ReFTModelManager
+        monkeypatch.setattr(
+            vllm_reft, "reft_config_to_spec", lambda cfg: {
+                "layer_indices": [0],
+                "sample_adapter": TrackingAdapter(),
+                "position": "prefill",
+            })
+        layer = nn.Module()
+        layer._reft_layer_idx = 0
+        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+        manager = ReFTModelManager([layer], max_refts=max_refts,
+                                   max_cpu_refts=8,
+                                   device=torch.device("cpu"),
+                                   model_dtype=torch.float32)
+        model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+        worker = SimpleNamespace(get_model=lambda: model,
+                                 _get_reft_manager=lambda: manager)
+        worker.refresh_reft_caches = (
+            lambda reft_int_id=None: WorkerBase.refresh_reft_caches(
+                worker, reft_int_id))
+
+        def add(rid):
+            manager.add_adapter(
+                ReFTModel(id=rid, position="prefill", adapter_config={},
+                          layer_indices=frozenset([0])))
+            manager.activate_adapter(rid)
+
+        return manager, worker, layer, add
+
+    def test_synced_adapter_survives_lru_eviction(self, monkeypatch):
+        manager, worker, layer, add = self._manager_setup(monkeypatch,
+                                                          max_refts=2)
+        add(1)
+        add(2)
+        WorkerBase.sync_reft_weights(worker, {0: _state_dict(0.5)},
+                                     refresh_caches=False, reft_int_id=1)
+        synced_weight = layer.reft_adapters["1"].proj.weight.clone()
+
+        # Slot pressure: id 3 must evict id 2, never the pinned id 1.
+        add(3)
+        assert manager.is_active(1)
+        assert not manager.is_active(2)
+        assert torch.equal(layer.reft_adapters["1"].proj.weight,
+                           synced_weight)
+
+    def test_eviction_raises_when_only_pinned_left(self, monkeypatch):
+        manager, worker, layer, add = self._manager_setup(monkeypatch,
+                                                          max_refts=1)
+        add(1)
+        WorkerBase.sync_reft_weights(worker, {0: _state_dict(0.5)},
+                                     refresh_caches=False, reft_int_id=1)
+        with pytest.raises(RuntimeError):
+            add(2)
+
+    def test_pin_unregistered_raises(self, monkeypatch):
+        manager, _, _, _ = self._manager_setup(monkeypatch, max_refts=2)
+        with pytest.raises(ValueError, match="not registered"):
+            manager.pin_adapter(99)
+
+    def test_sync_without_manager_registration_is_fine(self, monkeypatch):
+        # Construction-baked adapters (reft_config=) are not in the
+        # manager; syncing them must not fail on the pin step.
+        manager, worker, layer, _ = self._manager_setup(monkeypatch,
+                                                        max_refts=2)
+        _add_adapter_to_layer(layer, 7, TrackingAdapter(), "prefill",
+                              torch.device("cpu"))
+        count = WorkerBase.sync_reft_weights(worker, {0: _state_dict(0.25)},
+                                             refresh_caches=False,
+                                             reft_int_id=7)
+        assert count == 1
 
 
 class TestSyncReftWeights:

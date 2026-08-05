@@ -90,6 +90,23 @@ def apply_adaptation(adaptation: nn.Module, hidden: torch.Tensor,
     return hidden + delta * mask.unsqueeze(-1).to(delta.dtype)
 
 
+def needs_sequence_segmentation(adaptation: nn.Module) -> bool:
+    """Whether this adaptation mixes information along the sequence axis.
+
+    Sequence-mixing computations (cnn/bigram mixers, chunked adapters)
+    must run per request span — vLLM's flattened batch concatenates
+    unrelated requests, and mixing across the boundary leaks one
+    request's hiddens into another's delta.
+
+    An explicit ``sequence_mixing`` attribute wins; otherwise the
+    presence of a ``mixer`` implies sequence mixing.
+    """
+    explicit = getattr(adaptation, "sequence_mixing", None)
+    if explicit is not None:
+        return bool(explicit)
+    return getattr(adaptation, "mixer", None) is not None
+
+
 def check_adaptation_supported(adaptation: nn.Module) -> None:
     """Reject adaptations that cannot run correctly under vLLM serving.
 

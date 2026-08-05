@@ -251,6 +251,7 @@ from vllm.adaptation.positions import (PhaseInfo,  # noqa: E402
                                        position_active_in_decode)
 from vllm.adaptation.protocol import (apply_adaptation,  # noqa: E402
                                       check_adaptation_supported,
+                                      needs_sequence_segmentation,
                                       resolve_site_submodule_path,
                                       validate_site)
 
@@ -261,6 +262,7 @@ def _compute_position_mask(
     dtype: torch.dtype,
     num_tokens: int,
     attn_metadata,
+    prompt_lens: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """Return the per-token mask for *position*, or ``None`` for all-tokens.
 
@@ -268,8 +270,13 @@ def _compute_position_mask(
     (handles both vLLM V0 single objects and V1 dicts, any attention
     backend) and dispatches to the named position registry in
     :mod:`vllm.adaptation.positions`.  Builtins: "all", "all_tokens",
-    "prefill", "decode", "first", "last"; custom positions are added
-    via :func:`vllm.adaptation.register_position_mask`.
+    "prefill", "decode", "first", "last", plus the parameterized
+    families (``every_<k>``, ``every_<k>_decode``, ``first_<k>_decode``,
+    ``decode_range_<a>_<b>``); custom positions are added via
+    :func:`vllm.adaptation.register_position_mask`.
+
+    ``prompt_lens`` (per-request, batch order) enables the
+    generation-anchored families; without it those masks are inert.
     """
     attn_metadata = _resolve_attn_metadata(attn_metadata)
     (num_prefill_tokens, num_decodes, num_prefills,
@@ -280,6 +287,7 @@ def _compute_position_mask(
         num_prefills=num_prefills,
         query_start_loc=query_start_loc,
         seq_lens=seq_lens,
+        prompt_lens=prompt_lens,
     )
     return get_position_mask(position, positions, dtype, num_tokens, phase)
 
@@ -783,6 +791,36 @@ def _init_multi_reft_state(layer: nn.Module, dev: torch.device,
     _init_reft_capture_buffers(layer, hidden_size, dev)
 
 
+def _compute_batch_segments(resolved_meta,
+                            num_tokens: int) -> Optional[list]:
+    """Per-request (start, end) token spans of the flattened batch.
+
+    Used to run sequence-mixing adaptations once per request so they
+    never mix across request boundaries.  Returns ``None`` when the
+    boundaries cannot be determined."""
+    (num_prefill_tokens, num_decodes, num_prefills, query_start_loc,
+     _) = _get_prefill_info(resolved_meta)
+    if num_prefill_tokens is None:
+        return None
+    num_decode_tokens = num_tokens - num_prefill_tokens
+    if query_start_loc is not None:
+        bounds = [int(b) for b in query_start_loc.tolist()]
+        return [(a, min(b, num_tokens))
+                for a, b in zip(bounds[:-1], bounds[1:])
+                if b > a and a < num_tokens]
+    # No query_start_loc: decode tokens are one-per-request; the
+    # prefill region is unambiguous only for a single prefill request.
+    segments = [(i, i + 1) for i in range(num_decode_tokens)]
+    if num_prefill_tokens > 0:
+        if num_prefills > 1:
+            return None
+        segments.append((num_decode_tokens, num_tokens))
+    return segments
+
+
+_seq_mixing_graph_mode_warned = False
+
+
 def _blend_one_adaptation(layer: nn.Module, int_id: int, adapter: nn.Module,
                           hidden: torch.Tensor) -> torch.Tensor:
     """Blend one adaptation into *hidden*, via the gather path when
@@ -793,7 +831,26 @@ def _blend_one_adaptation(layer: nn.Module, int_id: int, adapter: nn.Module,
     its member tokens and scatters results back — O(members) instead of
     O(batch).  Only enabled in eager mode: the member count is dynamic,
     which CUDA graphs cannot capture.
+
+    Sequence-mixing adaptations are applied once per request span (see
+    ``needs_sequence_segmentation``) so they never mix across request
+    boundaries in the flattened batch.
     """
+    if needs_sequence_segmentation(adapter):
+        segments = getattr(layer, "_reft_segments", None)
+        if segments is not None and len(segments) > 1:
+            mask_buf = layer._reft_combined_masks.get(int_id)
+            num_tokens = hidden.shape[0]
+            out = hidden.clone()
+            for start, end in segments:
+                end = min(end, num_tokens)
+                if start >= end:
+                    continue
+                mask = mask_buf[start:end] if mask_buf is not None else None
+                out[start:end] = apply_adaptation(adapter,
+                                                  hidden[start:end], mask)
+            return out
+
     member_idx = getattr(layer, "_reft_member_indices", {}).get(int_id)
     if member_idx is not None:
         if member_idx.numel() == 0:
@@ -988,6 +1045,7 @@ def update_multi_reft_position_masks(
     decode_token_reft_ids: Optional[torch.Tensor] = None,
     use_gather: bool = False,
     graph_safe: bool = False,
+    prompt_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """Pre-compute combined masks for all adapters on all ReFT layers.
 
@@ -1046,6 +1104,28 @@ def update_multi_reft_position_masks(
                 layer._reft_all_masks_zero = True
             return
 
+    # Per-request segments for sequence-mixing adaptations (eager only:
+    # segment counts are dynamic shapes).
+    any_seq_mixing = any(
+        needs_sequence_segmentation(layer.reft_adapters[str_id])
+        for layer in reft_layers if hasattr(layer, "reft_adapters")
+        for str_id in layer.reft_adapters)
+    batch_segments = None
+    if any_seq_mixing:
+        if graph_safe:
+            global _seq_mixing_graph_mode_warned
+            if not _seq_mixing_graph_mode_warned:
+                _seq_mixing_graph_mode_warned = True
+                logger.warning(
+                    "Sequence-mixing adaptations are loaded while CUDA "
+                    "graphs are enabled; per-request segmentation is "
+                    "eager-only, so mixing may leak across request "
+                    "boundaries in the flattened batch. Use "
+                    "enforce_eager=True for sequence-mixing adaptations.")
+        else:
+            batch_segments = _compute_batch_segments(resolved_meta,
+                                                     num_tokens)
+
     # Compute the set of adapter IDs actually referenced in this batch.
     # One .unique() call on a small 1-D int tensor — fast, no GPU sync
     # needed since we only use the result as a Python set for membership
@@ -1064,6 +1144,7 @@ def update_multi_reft_position_masks(
         # Reset per-step gather state; repopulated below when enabled.
         layer._reft_member_indices = {}
         layer._reft_member_mask_values = {}
+        layer._reft_segments = batch_segments
         # Intersect batch-active IDs with this layer's loaded adapters.
         layer_active_ids = batch_active_ids & {
             int(s) for s in layer.reft_adapters}
@@ -1108,7 +1189,7 @@ def update_multi_reft_position_masks(
                 else:
                     pos_mask_cache[pos] = _compute_position_mask(
                         positions, pos, torch.float32, num_tokens,
-                        attn_metadata)
+                        attn_metadata, prompt_lens=prompt_lens)
             pos_mask = pos_mask_cache[pos]
             # Combined mask
             if pos_mask is not None:

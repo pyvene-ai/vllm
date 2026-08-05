@@ -35,6 +35,9 @@ RANK = 8
 
 # collective_rpc needs the in-process engine core.
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+# TP>1 worker processes must spawn: the driver initializes CUDA before
+# the executor creates workers, and CUDA cannot survive a fork.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
 @pytest.fixture
@@ -303,6 +306,76 @@ class TestCudaGraphModeE2E:
                         lora_request=_lora_req(3, "all")) == lora_before
         # ...and the dynamic ReFT adapter is documented-inert here.
         assert _gen_ids(graph_llm, reft_request=_reft_req(21)) == base
+
+
+@pytest.fixture(scope="module")
+def tp2_llm():
+    """Tensor-parallel engine (eager) for multi-GPU adapter validation.
+
+    Workers run as separate processes; the ReFT blueprint class must be
+    importable there (run with PYTHONPATH including the tests root)."""
+    from vllm import LLM
+    llm = LLM(model=MODEL,
+              tensor_parallel_size=2,
+              enforce_eager=True,
+              enable_lora=True,
+              max_loras=4,
+              max_lora_rank=RANK,
+              enable_reft=True,
+              max_refts=8,
+              gpu_memory_utilization=0.3,
+              max_model_len=256)
+    yield llm
+    del llm
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+class TestTensorParallelE2E:
+
+    @pytest.fixture(scope="class", autouse=True)
+    def synced(self, tp2_llm):
+        hidden = _hidden_size()
+        tp2_llm.collective_rpc(
+            "sync_lora_weights",
+            args=(_lora_state_dict(hidden, 0.5), PEFT_CONFIG, 1))
+        tp2_llm.collective_rpc(
+            "sync_lora_weights",
+            args=(_lora_state_dict(hidden, -0.5), PEFT_CONFIG, 2))
+
+    def test_lora_pair_under_tp2(self, tp2_llm):
+        base = _gen_ids(tp2_llm)
+        prefill_only = _gen_ids(tp2_llm,
+                                lora_request=_lora_req(1, "prefill"))
+        paired = _gen_ids(tp2_llm,
+                          lora_request=_lora_req(1, "prefill"),
+                          decode_lora_request=_lora_req(2, "decode"))
+        assert prefill_only != base
+        assert paired[0] == prefill_only[0]
+        assert paired != prefill_only
+
+    def test_decode_boundary_under_tp2(self, tp2_llm):
+        base = _gen_ids(tp2_llm)
+        decode = _gen_ids(tp2_llm, lora_request=_lora_req(2, "decode"))
+        assert decode[0] == base[0]
+        assert decode != base
+
+    def test_reft_decode_adapter_under_tp2(self, tp2_llm):
+        hidden = _hidden_size()
+        base = _gen_ids(tp2_llm)
+        tp2_llm.collective_rpc(
+            "load_reft_adapter",
+            args=(21, _reft_config(hidden, -5.0), "decode"))
+        out = _gen_ids(tp2_llm, reft_request=_reft_req(21))
+        assert out[0] == base[0]
+        assert out != base
+
+    def test_reft_weight_sync_under_tp2(self, tp2_llm):
+        before = _gen_ids(tp2_llm, reft_request=_reft_req(21))
+        new_sd = {"scale": torch.full((_hidden_size(), ), 2.5)}
+        tp2_llm.collective_rpc("sync_reft_weights",
+                               args=({0: new_sd, 1: new_sd}, True, 21))
+        after = _gen_ids(tp2_llm, reft_request=_reft_req(21))
+        assert after != before
 
 
 @pytest.fixture(scope="module")
