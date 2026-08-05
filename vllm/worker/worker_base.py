@@ -260,10 +260,9 @@ class WorkerBase:
                                   position, dev, site=site)
             count += 1
         if count:
-            # Captured CUDA graphs don't include the new adapter; force
-            # lazy re-capture with the updated module set.
-            from vllm.compilation.cuda_graph import invalidate_all_cudagraphs
-            invalidate_all_cudagraphs()
+            from vllm.compilation.cuda_graph import (
+                warn_if_dynamic_adaptation_under_cudagraphs)
+            warn_if_dynamic_adaptation_under_cudagraphs("load")
         return count
 
     def unload_reft_adapter(self, reft_int_id: int) -> int:
@@ -289,9 +288,9 @@ class WorkerBase:
             if _remove_adapter_from_layer(layer, reft_int_id):
                 count += 1
         if count:
-            # Captured CUDA graphs still reference the removed adapter.
-            from vllm.compilation.cuda_graph import invalidate_all_cudagraphs
-            invalidate_all_cudagraphs()
+            from vllm.compilation.cuda_graph import (
+                warn_if_dynamic_adaptation_under_cudagraphs)
+            warn_if_dynamic_adaptation_under_cudagraphs("unload")
         return count
 
     def get_reft_debug_stats(self) -> dict:

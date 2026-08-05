@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CUDA graphs must be re-captured when the ReFT adapter set changes.
+"""CUDA graph handling when the ReFT adapter set changes.
 
-Captured decode graphs bake in the adapter modules that existed at
-capture time; loading or unloading an adapter afterwards would silently
-not take effect inside replayed graphs.  The fix: every CUDAGraphWrapper
-registers itself in a weak registry; changing the adapter set clears all
-captured entries and re-enables capturing, so the next dispatch lazily
-re-captures with the current adapter set.
+Captured graphs replay the compiled forward, which was traced with the
+adapter set that existed at compile time — a ReFT adapter loaded
+post-warmup cannot take effect there (vLLM's compile wrapper bypasses
+Dynamo guards), and re-capturing during real steps bakes per-step
+host-side conditionals (e.g. punica's no-LoRA skip), breaking other
+adapters.  Structural changes therefore must NOT touch captured graphs:
+they emit a loud warning instead
+(warn_if_dynamic_adaptation_under_cudagraphs), and dynamic ReFT serving
+is supported in eager mode.  invalidate_all_cudagraphs() remains as an
+explicitly-invoked mechanism (graphs are retired, never destroyed, to
+protect the shared memory pool).
 """
 
 from types import SimpleNamespace
@@ -17,8 +22,9 @@ import torch
 import torch.nn as nn
 
 from vllm.compilation import monitor
-from vllm.compilation.cuda_graph import (_cudagraph_wrappers,
-                                         invalidate_all_cudagraphs)
+from vllm.compilation.cuda_graph import (
+    _cudagraph_wrappers, invalidate_all_cudagraphs,
+    warn_if_dynamic_adaptation_under_cudagraphs)
 from vllm.reft.layer import _add_adapter_to_layer, _init_multi_reft_state
 from vllm.worker.worker_base import WorkerBase
 
@@ -68,6 +74,30 @@ class TestInvalidateAll:
         finally:
             _cudagraph_wrappers.discard(w)
 
+    def test_invalidated_graphs_are_retired_not_destroyed(
+            self, capture_flag_guard):
+        # Destroying graphs that share a memory pool while later
+        # captures allocate from it trips the CUDA allocator's pool
+        # bookkeeping; invalidation must hold references instead.
+        from vllm.compilation.cuda_graph import _retired_cudagraphs
+        marker = object()
+        w = FakeWrapper(0)
+        w.concrete_cudagraph_entries = {
+            "d": SimpleNamespace(cudagraph=marker),
+            "e": SimpleNamespace(cudagraph=None),  # never captured
+        }
+        _cudagraph_wrappers.add(w)
+        before = len(_retired_cudagraphs)
+        try:
+            assert invalidate_all_cudagraphs() == 2
+            assert not w.concrete_cudagraph_entries
+            assert marker in _retired_cudagraphs
+            assert len(_retired_cudagraphs) == before + 1
+        finally:
+            _cudagraph_wrappers.discard(w)
+            if marker in _retired_cudagraphs:
+                _retired_cudagraphs.remove(marker)
+
     def test_registry_is_weak(self):
         before = len(_cudagraph_wrappers)
         w = FakeWrapper(1)
@@ -102,10 +132,30 @@ def _fake_worker_with_layers(num_layers=2):
     return worker, layers
 
 
-class TestWorkerIntegration:
+class TestWarnHelper:
 
-    def test_load_adapter_invalidates_graphs(self, monkeypatch,
-                                             capture_flag_guard):
+    def test_counts_captured_graphs(self):
+        w = FakeWrapper(3)
+        _cudagraph_wrappers.add(w)
+        try:
+            assert warn_if_dynamic_adaptation_under_cudagraphs("load") == 3
+            # Warning must not disturb the captured graphs.
+            assert len(w.concrete_cudagraph_entries) == 3
+        finally:
+            _cudagraph_wrappers.discard(w)
+
+    def test_silent_when_nothing_captured(self):
+        assert warn_if_dynamic_adaptation_under_cudagraphs("load") == 0
+
+
+class TestWorkerIntegration:
+    """Structural adapter changes must warn but leave captured graphs
+    (and the capture freeze) untouched — re-capture cannot bring a
+    post-compile adapter into the frozen compiled forward, and taking
+    new captures during real steps corrupts other adapters."""
+
+    def test_load_adapter_preserves_graphs(self, monkeypatch,
+                                           capture_flag_guard):
         import vllm.reft as vllm_reft
         monkeypatch.setattr(
             vllm_reft, "reft_config_to_spec", lambda cfg: {
@@ -124,12 +174,12 @@ class TestWorkerIntegration:
             count = WorkerBase.load_reft_adapter(worker, 1, {},
                                                  position="decode")
             assert count == 2
-            assert not w.concrete_cudagraph_entries
-            assert monitor.cudagraph_capturing_enabled
+            assert len(w.concrete_cudagraph_entries) == 2
+            assert monitor.cudagraph_capturing_enabled is False
         finally:
             _cudagraph_wrappers.discard(w)
 
-    def test_unload_adapter_invalidates_graphs(self, capture_flag_guard):
+    def test_unload_adapter_preserves_graphs(self, capture_flag_guard):
         worker, layers = _fake_worker_with_layers()
         for layer in layers:
             _add_adapter_to_layer(layer, 1, _ConstAdapter(), "all",
@@ -140,13 +190,13 @@ class TestWorkerIntegration:
             monitor.cudagraph_capturing_enabled = False
             removed = WorkerBase.unload_reft_adapter(worker, 1)
             assert removed == 2
-            assert not w.concrete_cudagraph_entries
-            assert monitor.cudagraph_capturing_enabled
+            assert len(w.concrete_cudagraph_entries) == 1
+            assert monitor.cudagraph_capturing_enabled is False
         finally:
             _cudagraph_wrappers.discard(w)
 
-    def test_manager_activate_invalidates_graphs(self, monkeypatch,
-                                                 capture_flag_guard):
+    def test_manager_activate_preserves_graphs(self, monkeypatch,
+                                               capture_flag_guard):
         import vllm.reft as vllm_reft
         from vllm.reft.models import ReFTModel, ReFTModelManager
         monkeypatch.setattr(
@@ -170,14 +220,11 @@ class TestWorkerIntegration:
         try:
             monitor.cudagraph_capturing_enabled = False
             manager.activate_adapter(1)
-            assert not w.concrete_cudagraph_entries
-            assert monitor.cudagraph_capturing_enabled
+            assert len(w.concrete_cudagraph_entries) == 1
+            assert monitor.cudagraph_capturing_enabled is False
 
-            # Deactivation (LRU eviction) also changes the captured set.
-            w.concrete_cudagraph_entries = {("desc", 0): object()}
-            monitor.cudagraph_capturing_enabled = False
             manager.remove_adapter(1)
-            assert not w.concrete_cudagraph_entries
-            assert monitor.cudagraph_capturing_enabled
+            assert len(w.concrete_cudagraph_entries) == 1
+            assert monitor.cudagraph_capturing_enabled is False
         finally:
             _cudagraph_wrappers.discard(w)
