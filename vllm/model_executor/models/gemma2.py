@@ -252,9 +252,12 @@ class Gemma2Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
+        from vllm.reft.layer import maybe_reft_layer_type
+        layer_cls = maybe_reft_layer_type(vllm_config, Gemma2DecoderLayer,
+                                          arch="gemma2")
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Gemma2DecoderLayer(
+            lambda prefix: layer_cls(
                 config, cache_config, quant_config, prefix=prefix),
             prefix=f"{prefix}.layers")
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)

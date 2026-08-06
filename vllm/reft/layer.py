@@ -1215,17 +1215,28 @@ def update_multi_reft_position_masks(
 # ---------------------------------------------------------------------------
 # Qwen2 ReFT-aware decoder layer factory
 # ---------------------------------------------------------------------------
+# Architecture-generic ReFT decoder-layer factory
+# ---------------------------------------------------------------------------
 
-def make_reft_qwen2_layer(reft_spec: Optional[dict] = None) -> type:
-    """Return a Qwen2DecoderLayer subclass that supports multi-ReFT adapters.
+def make_reft_decoder_layer(base_layer_cls: type,
+                            reft_spec: Optional[dict] = None,
+                            arch: Optional[str] = None) -> type:
+    """Return a subclass of *base_layer_cls* with multi-adapter support.
 
-    If *reft_spec* is provided (single-adapter backward compat), the initial
-    adapter is loaded at construction time with ``reft_int_id=1``.
-    If *reft_spec* is ``None`` (``enable_reft=True`` mode), layers are created
-    with empty adapter dicts ready for dynamic loading.
+    Works for any decoder layer following vLLM's conventions:
+
+      - constructor arguments are passed through verbatim (both the
+        legacy ``(config, cache_config, quant_config, prefix)`` style
+        and the modern ``(vllm_config, prefix)`` style),
+      - forward contract ``(positions, hidden_states, residual,
+        **kwargs) -> (hidden_states, residual)`` (extra kwargs, e.g.
+        gemma3's, are forwarded).
+
+    If *reft_spec* is provided (single-adapter backward compat), the
+    initial adapter is installed at construction with ``reft_int_id=1``
+    on the spec's ``layer_indices``.  Otherwise layers are created with
+    empty adapter dicts, ready for dynamic loading.
     """
-    from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer
-
     if reft_spec is not None:
         layer_indices_set = frozenset(reft_spec["layer_indices"])
         position = reft_spec["position"]
@@ -1239,29 +1250,67 @@ def make_reft_qwen2_layer(reft_spec: Optional[dict] = None) -> type:
         per_layer_adapters = {}
         debug_mask_enabled = False
 
-    class ReFTQwen2DecoderLayer(Qwen2DecoderLayer):
-        """Qwen2DecoderLayer with multi-ReFT adapter support."""
+    arch_name = arch or base_layer_cls.__name__
 
-        def __init__(self, config, cache_config=None, quant_config=None,
-                     prefix=""):
-            super().__init__(config=config, cache_config=cache_config,
-                             quant_config=quant_config, prefix=prefix)
+    def _find_prefix(args, kwargs) -> str:
+        prefix = kwargs.get("prefix")
+        if isinstance(prefix, str):
+            return prefix
+        for a in args:
+            if isinstance(a, str) and ".layers." in a:
+                return a
+        return ""
 
+    def _find_model_dtype(args, kwargs):
+        for candidate in list(args) + list(kwargs.values()):
+            model_config = getattr(candidate, "model_config", None)
+            if model_config is not None:
+                dtype = getattr(model_config, "dtype", None)
+                if isinstance(dtype, torch.dtype):
+                    return dtype
+                hf_config = getattr(model_config, "hf_config", None)
+                dtype = getattr(hf_config, "torch_dtype", None)
+                if isinstance(dtype, torch.dtype):
+                    return dtype
+            dtype = getattr(candidate, "torch_dtype", None)
+            if isinstance(dtype, torch.dtype):
+                return dtype
+        return torch.bfloat16
+
+    def _find_hidden_size(self, args, kwargs) -> int:
+        hidden = getattr(self, "hidden_size", None)
+        if isinstance(hidden, int):
+            return hidden
+        for candidate in list(args) + list(kwargs.values()):
+            hidden = getattr(candidate, "hidden_size", None)
+            if isinstance(hidden, int):
+                return hidden
+            hf_config = getattr(getattr(candidate, "model_config", None),
+                                "hf_config", None)
+            hidden = getattr(hf_config, "hidden_size", None)
+            if isinstance(hidden, int):
+                return hidden
+        return 4096
+
+    class ReFTDecoderLayer(base_layer_cls):
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+            prefix = _find_prefix(args, kwargs)
             layer_idx = _extract_layer_idx(prefix)
             try:
                 dev = next(self.parameters()).device
             except StopIteration:
                 dev = torch.device("cuda" if torch.cuda.is_available()
                                    else "cpu")
-
-            model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
-            if model_dtype is None:
-                model_dtype = torch.bfloat16
-            hidden_size = getattr(config, "hidden_size", 896)
+            hidden_size = _find_hidden_size(self, args, kwargs)
+            model_dtype = _find_model_dtype(args, kwargs)
 
             object.__setattr__(self, "_reft_layer_idx",
                                layer_idx if layer_idx is not None else -1)
-            object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
+            object.__setattr__(self, "_reft_debug_enabled",
+                               debug_mask_enabled)
             self.reft_adapter = None  # backward compat attribute
 
             _init_multi_reft_state(self, dev, hidden_size)
@@ -1274,196 +1323,81 @@ def make_reft_qwen2_layer(reft_spec: Optional[dict] = None) -> type:
                 _add_adapter_to_layer(self, 1, adapter_copy, position, dev)
                 _REFT_ADAPTER_REGISTRY[layer_idx] = adapter_copy
                 logger.debug(
-                    "[ReFT-vLLM] Attached initial adapter to Qwen2 layer %d "
-                    "(adapter_type=%s)", layer_idx,
-                    type(adapter_copy).__name__)
-
-        def forward(self, positions, hidden_states, residual):
-            return _multi_reft_forward(
-                self, positions, hidden_states, residual,
-                super_forward=super().forward)
-
-        def get_reft_debug_stats(self) -> Optional[dict]:
-            return _collect_layer_reft_debug_stats(self)
-
-    ReFTQwen2DecoderLayer.__name__ = "ReFTQwen2DecoderLayer"
-    ReFTQwen2DecoderLayer.__qualname__ = "ReFTQwen2DecoderLayer"
-    return ReFTQwen2DecoderLayer
-
-
-# ---------------------------------------------------------------------------
-# Llama ReFT-aware decoder layer factory
-# ---------------------------------------------------------------------------
-
-def make_reft_llama_layer(reft_spec: Optional[dict] = None) -> type:
-    """Return a LlamaDecoderLayer subclass that supports multi-ReFT adapters.
-
-    Analogous to ``make_reft_qwen2_layer`` but for the Llama architecture.
-    """
-    from vllm.model_executor.models.llama import LlamaDecoderLayer
-
-    if reft_spec is not None:
-        layer_indices_set = frozenset(reft_spec["layer_indices"])
-        position = reft_spec["position"]
-        sample_adapter: Optional[nn.Module] = reft_spec["sample_adapter"]
-        per_layer_adapters: dict = reft_spec.get("adapters", {})
-        debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
-    else:
-        layer_indices_set = frozenset()
-        position = "prefill"
-        sample_adapter = None
-        per_layer_adapters = {}
-        debug_mask_enabled = False
-
-    class ReFTLlamaDecoderLayer(LlamaDecoderLayer):
-        """LlamaDecoderLayer with multi-ReFT adapter support."""
-
-        def __init__(self, vllm_config, prefix="", config=None):
-            super().__init__(vllm_config=vllm_config, prefix=prefix,
-                             config=config)
-
-            layer_idx = _extract_layer_idx(prefix)
-            try:
-                dev = next(self.parameters()).device
-            except StopIteration:
-                dev = torch.device("cuda" if torch.cuda.is_available()
-                                   else "cpu")
-
-            llama_config = getattr(vllm_config, "model_config", vllm_config)
-            hf_config = getattr(llama_config, "hf_config",
-                                getattr(llama_config, "config", config))
-            model_dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
-            if model_dtype is None:
-                model_dtype = torch.bfloat16
-            hidden_size = getattr(hf_config, "hidden_size", 4096)
-
-            object.__setattr__(self, "_reft_layer_idx",
-                               layer_idx if layer_idx is not None else -1)
-            object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
-            self.reft_adapter = None  # backward compat attribute
-
-            _init_multi_reft_state(self, dev, hidden_size)
-
-            # Load initial adapter from reft_spec (backward compat, id=1)
-            if (layer_idx is not None and layer_idx in layer_indices_set
-                    and sample_adapter is not None):
-                source = per_layer_adapters.get(layer_idx, sample_adapter)
-                adapter_copy = _prepare_adapter(source, dev, model_dtype)
-                _add_adapter_to_layer(self, 1, adapter_copy, position, dev)
-                _REFT_ADAPTER_REGISTRY[layer_idx] = adapter_copy
-                logger.debug(
-                    "[ReFT-vLLM] Attached initial adapter to Llama layer %d "
-                    "(adapter_type=%s)", layer_idx,
-                    type(adapter_copy).__name__)
-
-        def forward(self, positions, hidden_states, residual):
-            return _multi_reft_forward(
-                self, positions, hidden_states, residual,
-                super_forward=super().forward)
-
-        def get_reft_debug_stats(self) -> Optional[dict]:
-            return _collect_layer_reft_debug_stats(self)
-
-    ReFTLlamaDecoderLayer.__name__ = "ReFTLlamaDecoderLayer"
-    ReFTLlamaDecoderLayer.__qualname__ = "ReFTLlamaDecoderLayer"
-    return ReFTLlamaDecoderLayer
-
-
-# ---------------------------------------------------------------------------
-# Qwen3 MoE ReFT-aware decoder layer factory
-# ---------------------------------------------------------------------------
-
-def make_reft_qwen3_moe_layer(reft_spec: Optional[dict] = None) -> type:
-    """Return a Qwen3MoeDecoderLayer subclass that applies ReFT adapters.
-
-    MoE-agnostic: the residual-stream delta is applied AFTER the full layer
-    (attention + sparse MoE block) executes, so the adapter never interacts
-    with expert routing or per-expert state.
-
-    Mirrors ``make_reft_llama_layer``; Qwen3MoeDecoderLayer.__init__ has the
-    same ``(vllm_config, prefix)`` signature and the same
-    ``(positions, hidden_states, residual)`` forward contract. Pass
-    reft_spec=None to get a layer that registers the multi-adapter
-    ModuleDict scaffolding without baking in a default adapter — the
-    bench / serving path then loads adapters dynamically via the
-    `load_reft_adapter` collective_rpc.
-    """
-    from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
-
-    if reft_spec is not None:
-        layer_indices_set = frozenset(reft_spec["layer_indices"])
-        position = reft_spec["position"]
-        sample_adapter: Optional[nn.Module] = reft_spec["sample_adapter"]
-        per_layer_adapters: dict = reft_spec.get("adapters", {})
-        debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
-    else:
-        layer_indices_set = frozenset()
-        position = "prefill"
-        sample_adapter = None
-        per_layer_adapters = {}
-        debug_mask_enabled = False
-
-    class ReFTQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
-        """Qwen3MoeDecoderLayer with optional ReFT adapter delta."""
-
-        def __init__(self, vllm_config, prefix=""):
-            super().__init__(vllm_config=vllm_config, prefix=prefix)
-
-            layer_idx = _extract_layer_idx(prefix)
-            try:
-                dev = next(self.parameters()).device
-            except StopIteration:
-                dev = torch.device("cuda" if torch.cuda.is_available()
-                                   else "cpu")
-
-            hf_config = vllm_config.model_config.hf_text_config
-            model_dtype = getattr(hf_config, "torch_dtype", torch.bfloat16)
-            if model_dtype is None:
-                model_dtype = torch.bfloat16
-            hidden_size = getattr(hf_config, "hidden_size", 4096)
-
-            object.__setattr__(self, "_reft_layer_idx",
-                               layer_idx if layer_idx is not None else -1)
-            object.__setattr__(self, "_reft_debug_enabled", debug_mask_enabled)
-            self.reft_adapter = None  # backward compat attribute
-
-            # Unconditionally install the multi-adapter scaffolding so the
-            # gpu_model_runner's `hasattr(module, "reft_adapters")` discovery
-            # finds every Qwen3MoE decoder layer — without this the bench /
-            # serving path that loads adapters dynamically (enable_reft=True
-            # without a baked-in reft_spec) gets `loaded into 0 layers`.
-            _init_multi_reft_state(self, dev, hidden_size)
-
-            # Load initial adapter from reft_spec (backward compat, id=1)
-            if (layer_idx is not None and layer_idx in layer_indices_set
-                    and sample_adapter is not None):
-                source = per_layer_adapters.get(layer_idx, sample_adapter)
-                adapter_copy = _prepare_adapter(source, dev, model_dtype)
-                _add_adapter_to_layer(self, 1, adapter_copy, position, dev)
-                _REFT_ADAPTER_REGISTRY[layer_idx] = adapter_copy
-                logger.debug(
-                    "[ReFT-vLLM] Attached initial adapter to Qwen3MoE layer "
-                    "%d (adapter_type=%s)", layer_idx,
+                    "[ReFT-vLLM] Attached initial adapter to %s layer %s "
+                    "(adapter_type=%s)", arch_name, layer_idx,
                     type(adapter_copy).__name__)
 
             object.__setattr__(self, "_reft_position", position)
             _maybe_log_reft_layer_init(
-                arch="qwen3_moe",
+                arch=arch_name,
                 layer_idx=getattr(self, "_reft_layer_idx", -1),
                 attached=getattr(self, "reft_adapter", None) is not None,
-                debug_enabled=bool(getattr(self, "_reft_debug_enabled", False)),
+                debug_enabled=bool(getattr(self, "_reft_debug_enabled",
+                                           False)),
                 position=position,
                 adapter=getattr(self, "reft_adapter", None),
             )
 
-        def forward(self, positions, hidden_states, residual):
-            return _multi_reft_forward(
-                self, positions, hidden_states, residual,
-                super_forward=super().forward)
+        def forward(self, positions, hidden_states, residual, **kwargs):
+            if kwargs:
+
+                def super_forward(p, h, r):
+                    return base_layer_cls.forward(self, p, h, r, **kwargs)
+            else:
+
+                def super_forward(p, h, r):
+                    return base_layer_cls.forward(self, p, h, r)
+
+            return _multi_reft_forward(self, positions, hidden_states,
+                                       residual,
+                                       super_forward=super_forward)
 
         def get_reft_debug_stats(self) -> Optional[dict]:
             return _collect_layer_reft_debug_stats(self)
 
-    ReFTQwen3MoeDecoderLayer.__name__ = "ReFTQwen3MoeDecoderLayer"
-    ReFTQwen3MoeDecoderLayer.__qualname__ = "ReFTQwen3MoeDecoderLayer"
-    return ReFTQwen3MoeDecoderLayer
+    ReFTDecoderLayer.__name__ = f"ReFT{base_layer_cls.__name__}"
+    ReFTDecoderLayer.__qualname__ = ReFTDecoderLayer.__name__
+    return ReFTDecoderLayer
+
+
+def maybe_reft_layer_type(vllm_config, default_cls: type,
+                          arch: Optional[str] = None) -> type:
+    """Resolve the decoder-layer class for a model given its ReFT config.
+
+    Returns a ReFT-aware subclass of *default_cls* when ``reft_config``
+    is set (baked adapter) or ``enable_reft`` is on (dynamic loading);
+    otherwise returns *default_cls* unchanged.  This is the one-line
+    hook new architectures use.
+    """
+    from vllm.reft import get_reft_spec, reft_config_to_spec
+    reft_spec = reft_config_to_spec(getattr(vllm_config, "reft_config",
+                                            None))
+    if reft_spec is None:
+        reft_spec = get_reft_spec()
+    if reft_spec is not None:
+        return make_reft_decoder_layer(default_cls, reft_spec, arch=arch)
+    if getattr(vllm_config, "enable_reft", False):
+        return make_reft_decoder_layer(default_cls, None, arch=arch)
+    return default_cls
+
+
+# ---------------------------------------------------------------------------
+# Per-architecture factories (backward-compat wrappers)
+# ---------------------------------------------------------------------------
+
+def make_reft_qwen2_layer(reft_spec: Optional[dict] = None) -> type:
+    from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer
+    return make_reft_decoder_layer(Qwen2DecoderLayer, reft_spec,
+                                   arch="qwen2")
+
+
+def make_reft_llama_layer(reft_spec: Optional[dict] = None) -> type:
+    from vllm.model_executor.models.llama import LlamaDecoderLayer
+    return make_reft_decoder_layer(LlamaDecoderLayer, reft_spec,
+                                   arch="llama")
+
+
+def make_reft_qwen3_moe_layer(reft_spec: Optional[dict] = None) -> type:
+    from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
+    return make_reft_decoder_layer(Qwen3MoeDecoderLayer, reft_spec,
+                                   arch="qwen3_moe")
