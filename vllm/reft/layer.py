@@ -826,16 +826,37 @@ def _blend_one_adaptation(layer: nn.Module, int_id: int, adapter: nn.Module,
     """Blend one adaptation into *hidden*, via the gather path when
     member indices were precomputed for this step.
 
-    The gather path (``use_gather=True`` in
-    ``update_multi_reft_position_masks``) runs the adaptation only on
-    its member tokens and scatters results back — O(members) instead of
-    O(batch).  Only enabled in eager mode: the member count is dynamic,
-    which CUDA graphs cannot capture.
-
-    Sequence-mixing adaptations are applied once per request span (see
-    ``needs_sequence_segmentation``) so they never mix across request
-    boundaries in the flattened batch.
+    Composites (``adapter.members``: phase-gated submodules in one
+    checkpoint, e.g. storage-on-prefill + steering-on-decode) blend each
+    member under its own membership∧phase mask, precomputed by
+    ``update_multi_reft_position_masks`` alongside the regular buffers.
     """
+    members = getattr(adapter, "members", None)
+    if members is not None:
+        comp_masks = getattr(layer, "_reft_composite_masks", {})
+        num_tokens = hidden.shape[0]
+        out = hidden
+        for j, member in enumerate(members):
+            mbuf = comp_masks.get((int_id, j))
+            if mbuf is None:
+                # Never seen a batch (e.g. first graph-mode step for an
+                # inactive adapter): all-zero mask, delta contributes 0.
+                mbuf = torch.zeros(
+                    max(num_tokens, _REFT_MASK_FALLBACK_SIZE),
+                    dtype=torch.float32, device=hidden.device)
+                comp_masks = layer.__dict__.setdefault(
+                    "_reft_composite_masks", comp_masks)
+                comp_masks[(int_id, j)] = mbuf
+            out = apply_adaptation(member, out, mbuf[:num_tokens])
+        return out
+
+    # The gather path (use_gather=True in update_multi_reft_position_
+    # masks) runs the adaptation only on its member tokens and scatters
+    # results back — O(members) instead of O(batch). Eager mode only:
+    # the member count is dynamic, which CUDA graphs cannot capture.
+    # Sequence-mixing adaptations are applied once per request span
+    # (needs_sequence_segmentation) so they never mix across request
+    # boundaries in the flattened batch.
     if needs_sequence_segmentation(adapter):
         segments = getattr(layer, "_reft_segments", None)
         if segments is not None and len(segments) > 1:
@@ -1166,6 +1187,10 @@ def update_multi_reft_position_masks(
                     buf = layer._reft_combined_masks.get(inactive_id)
                     if buf is not None:
                         buf.zero_()
+                    for key, mbuf in getattr(
+                            layer, "_reft_composite_masks", {}).items():
+                        if key[0] == inactive_id:
+                            mbuf.zero_()
         else:
             layer._reft_active_ids = layer_active_ids
             layer._reft_all_masks_zero = len(layer_active_ids) == 0
@@ -1191,6 +1216,35 @@ def update_multi_reft_position_masks(
                         positions, pos, torch.float32, num_tokens,
                         attn_metadata, prompt_lens=prompt_lens)
             pos_mask = pos_mask_cache[pos]
+            # Composite: additionally precompute membership ∧ member-
+            # phase masks, one buffer per (adapter id, member index) —
+            # _blend_one_adaptation applies each member under its own.
+            comp_members = getattr(
+                layer.reft_adapters[str_id], "members", None)
+            if comp_members is not None:
+                comp_masks = layer.__dict__.setdefault(
+                    "_reft_composite_masks", {})
+                for j, member in enumerate(comp_members):
+                    mpos = getattr(member, "position", "all")
+                    if mpos not in pos_mask_cache:
+                        if mpos in ("all", "all_tokens"):
+                            pos_mask_cache[mpos] = None
+                        else:
+                            pos_mask_cache[mpos] = _compute_position_mask(
+                                positions, mpos, torch.float32, num_tokens,
+                                attn_metadata, prompt_lens=prompt_lens)
+                    mpos_mask = pos_mask_cache[mpos]
+                    mcombined = (adapter_mask if mpos_mask is None
+                                 else adapter_mask * mpos_mask)
+                    mbuf = comp_masks.get((int_id, j))
+                    if mbuf is None or mbuf.shape[0] < num_tokens:
+                        mbuf = torch.zeros(
+                            max(num_tokens, _REFT_MASK_FALLBACK_SIZE),
+                            dtype=torch.float32, device=positions.device)
+                        comp_masks[(int_id, j)] = mbuf
+                    mbuf[:num_tokens].copy_(mcombined)
+                    if mbuf.shape[0] > num_tokens:
+                        mbuf[num_tokens:].zero_()
             # Combined mask
             if pos_mask is not None:
                 combined = adapter_mask * pos_mask
