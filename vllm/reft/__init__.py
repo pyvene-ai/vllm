@@ -198,7 +198,7 @@ def reft_config_to_spec(reft_config: Optional[dict[str, Any]],
         adapters: dict[int, Any] = {}
         for idx, sd in adapter_states.items():
             a = copy.deepcopy(sample)
-            a.load_state_dict(_deserialize_state_dict(sd))
+            a.load_state_dict(_deserialize_state_dict(sd), strict=False)
             if hasattr(a, "install_inference_caches"):
                 a.install_inference_caches()
             adapters[int(idx)] = a
@@ -404,7 +404,7 @@ def _blueprint_to_adapter(blueprint: dict):
     # Load trained weights if available in the blueprint.
     saved_state = blueprint.get("state_dict")
     if saved_state:
-        adapter.load_state_dict(_deserialize_state_dict(saved_state))
+        adapter.load_state_dict(_deserialize_state_dict(saved_state), strict=False)
         if hasattr(adapter, "install_inference_caches"):
             adapter.install_inference_caches()
 
@@ -487,7 +487,7 @@ def _read_spec_file() -> Optional[dict]:
         adapters = {}
         for idx, sd in adapter_states.items():
             a = copy.deepcopy(sample)
-            a.load_state_dict(_deserialize_state_dict(sd))
+            a.load_state_dict(_deserialize_state_dict(sd), strict=False)
             if hasattr(a, "install_inference_caches"):
                 a.install_inference_caches()
             adapters[int(idx)] = a
