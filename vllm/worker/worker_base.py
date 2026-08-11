@@ -173,7 +173,7 @@ class WorkerBase:
                 continue
             device = next(adapter.parameters()).device
             sd = {k: v.to(device) for k, v in state_dict.items()}
-            adapter.load_state_dict(sd)
+            adapter.load_state_dict(sd, strict=False)
             count += 1
         if refresh_caches and count:
             self.refresh_reft_caches(reft_int_id)
