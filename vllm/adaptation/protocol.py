@@ -16,54 +16,34 @@ __all__ = [
     "validate_site",
 ]
 
-# Named mount points inside a decoder layer.
-#   block_output — the residual stream after the whole block (default;
-#                  historical ReFT mount).
-#   block_input  — the residual stream before the block runs.
-#   post_attn    — the attention module's output, before the residual
-#                  add (hooked on layer.self_attn).
-#   post_mlp     — the MLP module's output, before the residual add
-#                  (hooked on layer.mlp).
-# Additionally "linear:<submodule.path>" mounts on the output of any
-# named submodule of the layer, e.g. "linear:self_attn.qkv_proj" or
-# "linear:mlp.gate_up_proj" (note vLLM merges q/k/v and gate/up).
-MOUNT_SITES = ("block_output", "block_input", "post_attn", "post_mlp")
-LINEAR_SITE_PREFIX = "linear:"
-
-# Hook targets for the fixed non-block sites.
-_SITE_SUBMODULES = {
-    "post_attn": "self_attn",
-    "post_mlp": "mlp",
-}
-
-
-def validate_site(site: str) -> None:
-    """Raise ValueError if *site* is not a recognized mount point."""
-    if site in MOUNT_SITES:
-        return
-    if site.startswith(LINEAR_SITE_PREFIX):
-        if not site[len(LINEAR_SITE_PREFIX):]:
-            raise ValueError(
-                "linear site must name a submodule, e.g. "
-                "'linear:self_attn.qkv_proj'")
-        return
-    raise ValueError(
-        f"Unknown mount site {site!r}. Expected one of {MOUNT_SITES} or "
-        f"'{LINEAR_SITE_PREFIX}<submodule.path>'.")
+# Mount-site vocabulary: imported from the adapters library — the
+# SINGLE source of truth shared with HF-side training, so a site added
+# there exists on both sides at once and cannot drift
+# (ARCHITECTURE.md "Serving contract" in the adapters repo). The fork
+# deliberately has no fallback copy: serving an adapter without the
+# library that defines its placement vocabulary would reintroduce the
+# silent-drift bug class this import exists to kill.
+try:
+    from adapters.sites import (LINEAR_SITE_PREFIX, MOUNT_SITES,
+                                validate_site)
+    from adapters.sites import \
+        resolve_site_submodule_path as _shared_resolve
+except ImportError as _e:  # pragma: no cover
+    raise ImportError(
+        "vllm.adaptation requires the 'adapters' library (the shared "
+        "mount-site table, adapters.sites). Install it: "
+        "pip install -e /path/to/adapters") from _e
 
 
 def resolve_site_submodule_path(site: str) -> Optional[str]:
     """Submodule path (relative to the decoder layer) a site hooks onto.
 
     Returns ``None`` for the block-level sites, which are applied inside
-    the layer's own forward rather than via a submodule hook.
+    the layer's own forward rather than via a submodule hook. Resolution
+    uses the shared table's "vllm" backend naming (q/k/v and gate/up are
+    fused here, unlike HF).
     """
-    validate_site(site)
-    if site in ("block_output", "block_input"):
-        return None
-    if site.startswith(LINEAR_SITE_PREFIX):
-        return site[len(LINEAR_SITE_PREFIX):]
-    return _SITE_SUBMODULES[site]
+    return _shared_resolve(site, backend="vllm")
 
 
 def apply_adaptation(adaptation: nn.Module, hidden: torch.Tensor,
