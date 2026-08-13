@@ -396,5 +396,14 @@ register_position_mask("all", _all_mask, active_in_decode=True)
 register_position_mask("all_tokens", _all_mask, active_in_decode=True)
 register_position_mask("prefill", _prefill_mask, active_in_decode=False)
 register_position_mask("decode", _decode_mask, active_in_decode=True)
+register_position_mask(
+    "decode_b",
+    # Decode-plus-boundary: the decode region PLUS the final prompt
+    # token of each prefill request (the position that produces the
+    # first sampled token). Union of two existing masks.
+    lambda positions, dtype, num_tokens, phase: (
+        _decode_mask(positions, dtype, num_tokens, phase)
+        + _last_mask(positions, dtype, num_tokens, phase)).clamp(max=1),
+    active_in_decode=True)
 register_position_mask("first", _first_mask, active_in_decode=False)
 register_position_mask("last", _last_mask, active_in_decode=False)
