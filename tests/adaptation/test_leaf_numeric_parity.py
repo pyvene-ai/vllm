@@ -23,7 +23,7 @@ import torch
 adapters_registry = pytest.importorskip(
     "adapters.registry",
     reason="requires the adapters library (shared-contract branch)")
-from adapters.registry import ADAPTER_REGISTRY  # noqa: E402
+from adapters.registry import LEAF_REGISTRY  # noqa: E402
 
 from vllm.reft import (_adapter_to_blueprint,  # noqa: E402
                        _blueprint_to_adapter)
@@ -36,9 +36,8 @@ FAMILIES = ["direft_gelusq", "pkmem_open_k8", "gated_delta_cap",
 
 def _make(name):
     torch.manual_seed(0)
-    a = ADAPTER_REGISTRY[name](hidden_size=HIDDEN, low_rank_dim=8,
-                               layer_idx=0, device="cpu",
-                               dtype=torch.float32)
+    a = LEAF_REGISTRY[name](HIDDEN, low_rank_dim=8, layer_idx=0,
+                            device="cpu", dtype=torch.float32)
     a.eval()
     return a
 
