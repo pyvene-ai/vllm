@@ -350,12 +350,15 @@ class Qwen2MoeModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
+        from vllm.reft.layer import maybe_reft_layer_type
+        _layer_cls = maybe_reft_layer_type(
+            vllm_config, Qwen2MoeDecoderLayer, arch="qwen2_moe")
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Qwen2MoeDecoderLayer(config=config,
-                                                cache_config=cache_config,
-                                                quant_config=quant_config,
-                                                prefix=prefix),
+            lambda prefix: _layer_cls(config=config,
+                                      cache_config=cache_config,
+                                      quant_config=quant_config,
+                                      prefix=prefix),
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

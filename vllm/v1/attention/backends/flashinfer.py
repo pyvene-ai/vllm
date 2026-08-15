@@ -247,6 +247,10 @@ class FlashInferMetadata:
     qo_indptr_gpu: Optional[torch.Tensor] = None
     paged_kv_indptr_gpu: Optional[torch.Tensor] = None
 
+    # Per-request query start locations (all requests, decode + prefill).
+    # Stored for use by ReFT position masking under chunked prefill.
+    query_start_loc: Optional[torch.Tensor] = None
+
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     cudagraph_support: ClassVar[AttentionCGSupport] = \
@@ -544,6 +548,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             use_cascade=use_cascade,
+            query_start_loc=common_attn_metadata.query_start_loc,
         )
 
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu

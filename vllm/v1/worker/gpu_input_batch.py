@@ -11,6 +11,7 @@ from typing_extensions import deprecated
 
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItems
+from vllm.reft.request import ReFTRequest
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import length_from_prompt_token_ids_or_embeds, swap_dict_values
@@ -23,6 +24,10 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.utils import is_spec_decode_unsupported
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
+
+
+# Numeric codes stored in InputBatch.request_lora_position.
+_LORA_POSITION_CODES = {"all": 0, "prefill": 1, "decode": 2}
 
 
 @dataclass
@@ -43,6 +48,9 @@ class CachedRequestState:
     mrope_position_delta: Optional[int] = None
 
     lora_request: Optional[LoRARequest] = None
+    decode_lora_request: Optional[LoRARequest] = None
+    reft_request: Optional[ReFTRequest] = None
+    decode_reft_request: Optional[ReFTRequest] = None
     prompt_embeds: Optional[torch.Tensor] = None
 
     def __post_init__(self):
@@ -230,8 +238,25 @@ class InputBatch:
         # lora related
         self.request_lora_mapping = np.zeros((self.max_num_reqs, ),
                                              dtype=np.int32)
+        # lora_position: 0 = "all" (default), 1 = "prefill", 2 = "decode"
+        self.request_lora_position = np.zeros((self.max_num_reqs, ),
+                                              dtype=np.int8)
+        # Optional second adapter that applies only during the decode
+        # phase (0 = none).  When set, the primary adapter must be
+        # prefill-only, so exactly one adapter is active per phase.
+        self.request_decode_lora_mapping = np.zeros((self.max_num_reqs, ),
+                                                    dtype=np.int32)
         self.lora_id_to_request_ids: dict[int, set[str]] = {}
         self.lora_id_to_lora_request: dict[int, LoRARequest] = {}
+
+        # reft related
+        self.request_reft_mapping = np.zeros((self.max_num_reqs, ),
+                                             dtype=np.int32)
+        # Optional second ReFT adapter for the decode phase (0 = none).
+        self.request_decode_reft_mapping = np.zeros((self.max_num_reqs, ),
+                                                    dtype=np.int32)
+        self.reft_id_to_request_ids: dict[int, set[str]] = {}
+        self.reft_id_to_reft_request: dict[int, ReFTRequest] = {}
 
         # req_index -> generator
         # NOTE(woosuk): The indices of the requests that do not have their own
@@ -430,18 +455,77 @@ class InputBatch:
         # Speculative decoding: by default 1 token is generated.
         self.num_accepted_tokens_cpu[req_index] = 1
 
-        # Add request lora ID
+        # Add request lora ID(s)
+        if request.decode_lora_request is not None:
+            if request.decode_lora_request.lora_position != "decode":
+                raise ValueError(
+                    "decode_lora_request must have lora_position='decode', "
+                    f"got {request.decode_lora_request.lora_position!r}")
+            if (request.lora_request is not None
+                    and request.lora_request.lora_position != "prefill"):
+                raise ValueError(
+                    "When decode_lora_request is set, the primary "
+                    "lora_request must have lora_position='prefill' so that "
+                    "exactly one adapter applies per phase, got "
+                    f"{request.lora_request.lora_position!r}")
+            if (request.lora_request is not None
+                    and request.lora_request.lora_int_id
+                    == request.decode_lora_request.lora_int_id):
+                raise ValueError(
+                    "lora_request and decode_lora_request must use distinct "
+                    "lora_int_ids, both got "
+                    f"{request.lora_request.lora_int_id}")
+
         if request.lora_request:
             lora_id = request.lora_request.lora_int_id
             if lora_id not in self.lora_id_to_request_ids:
                 self.lora_id_to_request_ids[lora_id] = set()
 
             self.request_lora_mapping[req_index] = lora_id
+            self.request_lora_position[req_index] = _LORA_POSITION_CODES[
+                request.lora_request.lora_position]
             self.lora_id_to_request_ids[lora_id].add(request.req_id)
             self.lora_id_to_lora_request[lora_id] = request.lora_request
         else:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
+            self.request_lora_position[req_index] = 0
+
+        if request.decode_lora_request:
+            decode_lora_id = request.decode_lora_request.lora_int_id
+            if decode_lora_id not in self.lora_id_to_request_ids:
+                self.lora_id_to_request_ids[decode_lora_id] = set()
+
+            self.request_decode_lora_mapping[req_index] = decode_lora_id
+            self.lora_id_to_request_ids[decode_lora_id].add(request.req_id)
+            self.lora_id_to_lora_request[decode_lora_id] = (
+                request.decode_lora_request)
+        else:
+            self.request_decode_lora_mapping[req_index] = 0
+
+        # Add request reft ID(s)
+        if request.reft_request:
+            reft_id = request.reft_request.reft_int_id
+            if reft_id not in self.reft_id_to_request_ids:
+                self.reft_id_to_request_ids[reft_id] = set()
+
+            self.request_reft_mapping[req_index] = reft_id
+            self.reft_id_to_request_ids[reft_id].add(request.req_id)
+            self.reft_id_to_reft_request[reft_id] = request.reft_request
+        else:
+            self.request_reft_mapping[req_index] = 0
+
+        if request.decode_reft_request:
+            decode_reft_id = request.decode_reft_request.reft_int_id
+            if decode_reft_id not in self.reft_id_to_request_ids:
+                self.reft_id_to_request_ids[decode_reft_id] = set()
+
+            self.request_decode_reft_mapping[req_index] = decode_reft_id
+            self.reft_id_to_request_ids[decode_reft_id].add(request.req_id)
+            self.reft_id_to_reft_request[decode_reft_id] = (
+                request.decode_reft_request)
+        else:
+            self.request_decode_reft_mapping[req_index] = 0
 
         return req_index
 
@@ -463,15 +547,30 @@ class InputBatch:
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
 
-        # LoRA
-        lora_id = self.request_lora_mapping[req_index]
-        if lora_id != 0:
-            lora_req_ids = self.lora_id_to_request_ids[lora_id]
-            lora_req_ids.discard(req_id)
-            if not lora_req_ids:
-                del self.lora_id_to_request_ids[lora_id]
-                del self.lora_id_to_lora_request[lora_id]
-            self.request_lora_mapping[req_index] = 0
+        # LoRA (the set dedupes ids shared by both phase slots)
+        for lora_id in {self.request_lora_mapping[req_index],
+                        self.request_decode_lora_mapping[req_index]}:
+            if lora_id != 0:
+                lora_req_ids = self.lora_id_to_request_ids[lora_id]
+                lora_req_ids.discard(req_id)
+                if not lora_req_ids:
+                    del self.lora_id_to_request_ids[lora_id]
+                    del self.lora_id_to_lora_request[lora_id]
+        self.request_lora_mapping[req_index] = 0
+        self.request_lora_position[req_index] = 0
+        self.request_decode_lora_mapping[req_index] = 0
+
+        # ReFT (the set dedupes ids shared by both phase slots)
+        for reft_id in {self.request_reft_mapping[req_index],
+                        self.request_decode_reft_mapping[req_index]}:
+            if reft_id != 0:
+                reft_req_ids = self.reft_id_to_request_ids[reft_id]
+                reft_req_ids.discard(req_id)
+                if not reft_req_ids:
+                    del self.reft_id_to_request_ids[reft_id]
+                    del self.reft_id_to_reft_request[reft_id]
+        self.request_reft_mapping[req_index] = 0
+        self.request_decode_reft_mapping[req_index] = 0
 
         if self.is_pooling_model:
             self.pooling_params.pop(req_id, None)
@@ -543,6 +642,19 @@ class InputBatch:
 
         self.request_lora_mapping[i1], self.request_lora_mapping[i2] = \
             self.request_lora_mapping[i2], self.request_lora_mapping[i1]
+        self.request_lora_position[i1], self.request_lora_position[i2] = \
+            self.request_lora_position[i2], self.request_lora_position[i1]
+        self.request_decode_lora_mapping[i1], \
+            self.request_decode_lora_mapping[i2] = \
+            self.request_decode_lora_mapping[i2], \
+            self.request_decode_lora_mapping[i1]
+
+        self.request_reft_mapping[i1], self.request_reft_mapping[i2] = \
+            self.request_reft_mapping[i2], self.request_reft_mapping[i1]
+        self.request_decode_reft_mapping[i1], \
+            self.request_decode_reft_mapping[i2] = \
+            self.request_decode_reft_mapping[i2], \
+            self.request_decode_reft_mapping[i1]
 
         if self.is_pooling_model:
             # Sampling and logits parameters don't apply to pooling models.
@@ -644,6 +756,15 @@ class InputBatch:
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[
                 last_req_index]
+            self.request_lora_position[empty_index] = \
+                self.request_lora_position[last_req_index]
+            self.request_decode_lora_mapping[empty_index] = \
+                self.request_decode_lora_mapping[last_req_index]
+
+            self.request_reft_mapping[empty_index] = self.request_reft_mapping[
+                last_req_index]
+            self.request_decode_reft_mapping[empty_index] = \
+                self.request_decode_reft_mapping[last_req_index]
 
             if self.is_pooling_model:
                 last_req_index -= 1
@@ -815,14 +936,66 @@ class InputBatch:
             3. lora_requests: Set of relevant LoRA requests.
         """
 
-        req_lora_mapping = self.request_lora_mapping[:self.num_reqs]
-        prompt_lora_mapping = tuple(req_lora_mapping)
-        token_lora_mapping = tuple(
-            req_lora_mapping.repeat(num_scheduled_tokens))
+        num_reqs = self.num_reqs
+        req_lora_mapping = self.request_lora_mapping[:num_reqs]
+        req_lora_position = self.request_lora_position[:num_reqs]
+        req_decode_lora = self.request_decode_lora_mapping[:num_reqs]
+
+        needs_phase_split = (np.any(req_lora_position != 0)
+                             or np.any(req_decode_lora != 0))
+
+        if needs_phase_split:
+            # A request is in decode phase when all prompt tokens are
+            # computed; the final prompt chunk (which samples the first
+            # output token) still counts as prefill, so a decode-phase
+            # adapter takes over exactly where a prefill one stops.
+            is_decode = (self.num_computed_tokens_cpu[:num_reqs]
+                         >= self.num_prompt_tokens[:num_reqs])
+
+            # Adapter id each request contributes during the prefill
+            # phase: the primary adapter unless it is decode-only.
+            prefill_ids = np.where(req_lora_position == 2, 0,
+                                   req_lora_mapping)
+            # Adapter id during the decode phase: the dedicated decode
+            # adapter if present, else the primary unless prefill-only.
+            decode_ids = np.where(req_lora_position == 1, 0,
+                                  req_lora_mapping)
+            decode_ids = np.where(req_decode_lora != 0, req_decode_lora,
+                                  decode_ids)
+
+            effective_ids = np.where(is_decode, decode_ids,
+                                     prefill_ids).astype(np.int32)
+            prompt_lora_mapping = tuple(effective_ids)
+            token_lora_mapping = tuple(
+                effective_ids.repeat(num_scheduled_tokens))
+        else:
+            prompt_lora_mapping = tuple(req_lora_mapping)
+            token_lora_mapping = tuple(
+                req_lora_mapping.repeat(num_scheduled_tokens))
+
         active_lora_requests: set[LoRARequest] = set(
             self.lora_id_to_lora_request.values())
 
         return prompt_lora_mapping, token_lora_mapping, active_lora_requests
+
+    def make_reft_inputs(
+        self, num_scheduled_tokens: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build per-token reft_int_id mappings from per-request mappings.
+
+        Returns:
+            token_reft_mapping: 1-D int32 numpy array of shape
+                (sum(num_scheduled_tokens),).  Each element is the
+                primary ``reft_int_id`` for that token (0 = no adapter).
+            token_decode_reft_mapping: same shape; the decode-phase
+                paired adapter's id per token (0 = none).  Phase
+                restriction happens via the adapters' position masks.
+        """
+        num_reqs = self.num_reqs
+        req_reft_mapping = self.request_reft_mapping[:num_reqs]
+        req_decode_reft_mapping = self.request_decode_reft_mapping[:num_reqs]
+        return (req_reft_mapping.repeat(num_scheduled_tokens),
+                req_decode_reft_mapping.repeat(num_scheduled_tokens))
 
     @property
     def num_reqs(self) -> int:

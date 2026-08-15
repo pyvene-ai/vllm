@@ -39,6 +39,7 @@ from vllm.inputs import (DataPrompt, PromptType, SingletonPrompt, TextPrompt,
                          TokensPrompt)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.reft.request import ReFTRequest
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.outputs import (ClassificationRequestOutput, EmbeddingRequestOutput,
                           PoolingRequestOutput, RequestOutput,
@@ -340,6 +341,12 @@ class LLM:
         *,
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
+        reft_request: Optional[Union[list[ReFTRequest],
+                                     ReFTRequest]] = None,
+        decode_lora_request: Optional[Union[list[LoRARequest],
+                                            LoRARequest]] = None,
+        decode_reft_request: Optional[Union[list[ReFTRequest],
+                                            ReFTRequest]] = None,
         priority: Optional[list[int]] = None,
     ) -> list[RequestOutput]:
         """Generates the completions for the input prompts.
@@ -362,6 +369,11 @@ class LLM:
                 it is used to create the progress bar.
                 If `False`, no progress bar is created.
             lora_request: LoRA request to use for generation, if any.
+            decode_lora_request: Optional decode-phase-only LoRA request,
+                paired with a prefill-only `lora_request` on the same
+                prompt.  Must have `lora_position="decode"`.
+            decode_reft_request: Optional decode-phase-only ReFT request,
+                paired with a prefill ReFT adapter on the same prompt.
             priority: The priority of the requests, if any.
                 Only applicable when priority scheduling policy is enabled.
 
@@ -395,6 +407,9 @@ class LLM:
             params=sampling_params,
             use_tqdm=use_tqdm,
             lora_request=lora_request,
+            reft_request=reft_request,
+            decode_lora_request=decode_lora_request,
+            decode_reft_request=decode_reft_request,
             priority=priority,
         )
 
@@ -475,6 +490,15 @@ class LLM:
             modality_lora_id,
             modality_lora_path,
         )
+
+    def get_reft_debug_stats(self) -> dict:
+        """Return per-layer ReFT debug stats via worker RPC."""
+        results = self.collective_rpc("get_reft_debug_stats")
+        # Single-worker: return its stats directly
+        if len(results) == 1:
+            return results[0]
+        # Multi-worker: return {worker_idx: stats}
+        return {i: r for i, r in enumerate(results)}
 
     def collective_rpc(self,
                        method: Union[str, Callable[..., _R]],
@@ -820,6 +844,8 @@ class LLM:
                                         list[SamplingParams]]] = None,
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[LoRARequest] = None,
+        reft_request: Optional[Union[list[ReFTRequest],
+                                     ReFTRequest]] = None,
         chat_template: Optional[str] = None,
         chat_template_content_format: ChatTemplateContentFormatOption = "auto",
         add_generation_prompt: bool = True,
@@ -854,6 +880,7 @@ class LLM:
                 it is used to create the progress bar.
                 If `False`, no progress bar is created.
             lora_request: LoRA request to use for generation, if any.
+            reft_request: ReFT request to use for generation, if any.
             chat_template: The template to use for structuring the chat.
                 If not provided, the model's default chat template will be used.
             chat_template_content_format: The format to render message content.
@@ -895,6 +922,7 @@ class LLM:
             sampling_params=sampling_params,
             use_tqdm=use_tqdm,
             lora_request=lora_request,
+            reft_request=reft_request,
         )
 
     def encode(
@@ -1471,6 +1499,12 @@ class LLM:
         *,
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[Sequence[LoRARequest], LoRARequest]],
+        reft_request: Optional[Union[Sequence[ReFTRequest],
+                                     ReFTRequest]] = None,
+        decode_lora_request: Optional[Union[Sequence[LoRARequest],
+                                            LoRARequest]] = None,
+        decode_reft_request: Optional[Union[Sequence[ReFTRequest],
+                                            ReFTRequest]] = None,
         priority: Optional[list[int]] = None,
     ) -> None:
         if isinstance(prompts, (str, dict)):
@@ -1484,6 +1518,18 @@ class LLM:
         if isinstance(lora_request,
                       Sequence) and len(lora_request) != num_requests:
             raise ValueError("The lengths of prompts and lora_request "
+                             "must be the same.")
+        if isinstance(reft_request,
+                      Sequence) and len(reft_request) != num_requests:
+            raise ValueError("The lengths of prompts and reft_request "
+                             "must be the same.")
+        if isinstance(decode_lora_request,
+                      Sequence) and len(decode_lora_request) != num_requests:
+            raise ValueError("The lengths of prompts and decode_lora_request "
+                             "must be the same.")
+        if isinstance(decode_reft_request,
+                      Sequence) and len(decode_reft_request) != num_requests:
+            raise ValueError("The lengths of prompts and decode_reft_request "
                              "must be the same.")
 
         for sp in params if isinstance(params, Sequence) else (params, ):
@@ -1519,6 +1565,12 @@ class LLM:
                 tokenization_kwargs=tokenization_kwargs,
                 lora_request=lora_request[i] if isinstance(
                     lora_request, Sequence) else lora_request,
+                reft_request=reft_request[i] if isinstance(
+                    reft_request, Sequence) else reft_request,
+                decode_lora_request=decode_lora_request[i] if isinstance(
+                    decode_lora_request, Sequence) else decode_lora_request,
+                decode_reft_request=decode_reft_request[i] if isinstance(
+                    decode_reft_request, Sequence) else decode_reft_request,
                 priority=priority[i] if priority else 0,
             )
 
@@ -1563,6 +1615,9 @@ class LLM:
         params: Union[SamplingParams, PoolingParams],
         tokenization_kwargs: Optional[dict[str, Any]] = None,
         lora_request: Optional[LoRARequest] = None,
+        reft_request: Optional[ReFTRequest] = None,
+        decode_lora_request: Optional[LoRARequest] = None,
+        decode_reft_request: Optional[ReFTRequest] = None,
         priority: int = 0,
     ) -> None:
         request_id = str(next(self.request_counter))
@@ -1573,6 +1628,9 @@ class LLM:
             lora_request=lora_request,
             tokenization_kwargs=tokenization_kwargs,
             priority=priority,
+            reft_request=reft_request,
+            decode_lora_request=decode_lora_request,
+            decode_reft_request=decode_reft_request,
         )
 
     def _run_engine(

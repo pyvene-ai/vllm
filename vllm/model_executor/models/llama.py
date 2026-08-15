@@ -534,6 +534,21 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         self.config = config
         self.lora_config = lora_config
 
+        # If reft_config is set or enable_reft is True, use ReFT-aware decoder
+        # layers.  The caller-supplied layer_type takes precedence (e.g. Eagle3).
+        if layer_type is LlamaDecoderLayer:
+            from vllm.reft import reft_config_to_spec, get_reft_spec
+            from vllm.reft.layer import make_reft_llama_layer
+            enable_reft = getattr(vllm_config, "enable_reft", False)
+            reft_spec = reft_config_to_spec(
+                getattr(vllm_config, "reft_config", None))
+            if reft_spec is None:
+                reft_spec = get_reft_spec()
+            if reft_spec is not None:
+                layer_type = make_reft_llama_layer(reft_spec)
+            elif enable_reft:
+                layer_type = make_reft_llama_layer(None)
+
         self.model = self._init_model(vllm_config=vllm_config,
                                       prefix=maybe_prefix(prefix, "model"),
                                       layer_type=layer_type)
@@ -576,6 +591,27 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         num_layers = len(self.model.layers)
         return (2, num_layers // 2, num_layers - 3)
 
+    def get_reft_debug_stats(self) -> dict:
+        """Return serializable per-layer ReFT debug stats, if enabled."""
+        stats: dict = {}
+        layers = list(self.model.layers)
+        stats["__summary__"] = {
+            "model_type": type(self).__name__,
+            "num_layers": len(layers),
+            "adapter_layers": sum(
+                hasattr(layer, "reft_adapters") and len(layer.reft_adapters) > 0
+                for layer in layers),
+            "debug_enabled_layers": sum(
+                bool(getattr(layer, "_reft_debug_enabled", False))
+                for layer in layers),
+        }
+        for layer_idx, layer in enumerate(layers):
+            if hasattr(layer, "get_reft_debug_stats"):
+                layer_stats = layer.get_reft_debug_stats()
+                if layer_stats is not None:
+                    stats[layer_idx] = layer_stats
+        return stats
+
     def _init_model(self,
                     vllm_config: VllmConfig,
                     prefix: str = "",
@@ -612,9 +648,29 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
             skip_prefixes=(["lm_head."]
                            if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(
+        loaded = loader.load_weights(
             self.maybe_remap_mistral(name, loaded_weight)
             for name, loaded_weight in weights)
+        # ReFT adapter params are initialized from the blueprint spec,
+        # not from the HF checkpoint.  Mark them as loaded so the
+        # checkpoint validator in default_loader.py does not raise.
+        for name, _ in self.named_parameters():
+            if ".reft_adapter." in name or ".reft_adapters." in name:
+                loaded.add(name)
+        return loaded
+
+    def refresh_reft_caches(self) -> None:
+        """Recompute derived ReFT caches after adapter weights are updated.
+
+        Called via ``collective_rpc("refresh_reft_caches")`` after TRL's
+        ``sync_weights()`` pushes new adapter parameters.
+        """
+        for layer in self.model.layers:
+            if not hasattr(layer, "reft_adapters"):
+                continue
+            for adapter in layer.reft_adapters.values():
+                if hasattr(adapter, "refresh_inference_caches"):
+                    adapter.refresh_inference_caches()
 
     # This function is used to remap the mistral format as
     # used by Mistral and Llama <=2

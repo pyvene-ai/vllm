@@ -989,6 +989,17 @@ def get_pipeline_model_parallel_group():
     return get_pp_group()
 
 
+# Tracks nesting of the graph_capture() coordination context so that
+# lazy (post-warmup) CUDA graph captures can tell whether they need to
+# enter it themselves.  See vllm.compilation.cuda_graph.
+_graph_capture_depth: int = 0
+
+
+def is_graph_capture_context_active() -> bool:
+    """Whether a graph_capture() coordination context is currently open."""
+    return _graph_capture_depth > 0
+
+
 @contextmanager
 def graph_capture(device: torch.device):
     """
@@ -1004,10 +1015,15 @@ def graph_capture(device: torch.device):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
+    global _graph_capture_depth
     context = GraphCaptureContext(torch.cuda.Stream(device=device))
     with get_tp_group().graph_capture(context), get_pp_group().graph_capture(
             context):
-        yield context
+        _graph_capture_depth += 1
+        try:
+            yield context
+        finally:
+            _graph_capture_depth -= 1
 
 
 logger = init_logger(__name__)

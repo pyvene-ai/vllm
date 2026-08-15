@@ -24,6 +24,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
+import logging
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any, Optional, Union
@@ -51,6 +52,8 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import is_interleaved
+
+logger = logging.getLogger("vllm.reft")
 
 from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
@@ -465,8 +468,27 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         self.lora_config = lora_config
 
         self.quant_config = quant_config
+
+        # If reft_config is set or enable_reft is True, use ReFT-aware decoder
+        # layers so CUDA graphs capture the adapter path.
+        from vllm.reft import reft_config_to_spec, get_reft_spec
+        from vllm.reft.layer import make_reft_qwen2_layer
+        enable_reft = getattr(vllm_config, "enable_reft", False)
+        reft_spec = reft_config_to_spec(
+            getattr(vllm_config, "reft_config", None))
+        if reft_spec is None:
+            reft_spec = get_reft_spec()
+        if reft_spec is not None:
+            decoder_layer_type = make_reft_qwen2_layer(reft_spec)
+        elif enable_reft:
+            # Multi-ReFT mode: empty adapters, loaded dynamically
+            decoder_layer_type = make_reft_qwen2_layer(None)
+        else:
+            decoder_layer_type = Qwen2DecoderLayer
+
         self.model = Qwen2Model(vllm_config=vllm_config,
-                                prefix=maybe_prefix(prefix, "model"))
+                                prefix=maybe_prefix(prefix, "model"),
+                                decoder_layer_type=decoder_layer_type)
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -495,6 +517,27 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         num_layers = len(self.model.layers)
         return (2, num_layers // 2, num_layers - 3)
 
+    def get_reft_debug_stats(self) -> dict:
+        """Return serializable per-layer ReFT debug stats, if enabled."""
+        stats: dict = {}
+        layers = list(self.model.layers)
+        stats["__summary__"] = {
+            "model_type": type(self).__name__,
+            "num_layers": len(layers),
+            "adapter_layers": sum(
+                hasattr(layer, "reft_adapters") and len(layer.reft_adapters) > 0
+                for layer in layers),
+            "debug_enabled_layers": sum(
+                bool(getattr(layer, "_reft_debug_enabled", False))
+                for layer in layers),
+        }
+        for layer_idx, layer in enumerate(layers):
+            if hasattr(layer, "get_reft_debug_stats"):
+                layer_stats = layer.get_reft_debug_stats()
+                if layer_stats is not None:
+                    stats[layer_idx] = layer_stats
+        return stats
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -520,4 +563,63 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
             skip_prefixes=(["lm_head."]
                            if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        # Mark adapter params as loaded for checkpoint validator
+        for name, _ in self.named_parameters():
+            if ".reft_adapter." in name or ".reft_adapters." in name:
+                loaded.add(name)
+        return loaded
+
+    def get_reft_weight_fingerprints(self, layer_indices=None) -> dict:
+        """Return param/buffer fingerprints for ReFT adapters.
+
+        Used by diagnostic scripts to verify weight sync in server mode.
+        Returns a dict keyed by layer index, each containing per-adapter
+        fingerprints (name, shape, dtype, first 4 flattened values).
+        """
+        result = {}
+        layers = list(self.model.layers)
+        if layer_indices is None:
+            n = len(layers)
+            layer_indices = [0, n // 2, n - 1]
+        for idx in layer_indices:
+            layer = layers[idx]
+            if not hasattr(layer, "reft_adapters"):
+                continue
+            layer_fp = {}
+            for str_id, adapter in layer.reft_adapters.items():
+                adapter_fp = {"params": {}, "buffers": {}}
+                for pname, p in adapter.named_parameters():
+                    adapter_fp["params"][pname] = {
+                        "shape": list(p.shape),
+                        "dtype": str(p.dtype),
+                        "first4": p.data.detach().float().flatten()[:4].tolist(),
+                    }
+                for bname, b in adapter.named_buffers():
+                    adapter_fp["buffers"][bname] = {
+                        "shape": list(b.shape),
+                        "dtype": str(b.dtype),
+                        "first4": b.data.detach().float().flatten()[:4].tolist(),
+                    }
+                layer_fp[str_id] = adapter_fp
+            if layer_fp:
+                result[idx] = layer_fp
+        return result
+
+    def refresh_reft_caches(self) -> None:
+        """Recompute derived ReFT caches after adapter weights are updated.
+
+        Called via ``collective_rpc("refresh_reft_caches")`` after TRL's
+        ``sync_weights()`` pushes new adapter parameters.
+        """
+        refreshed = []
+        for idx, layer in enumerate(self.model.layers):
+            if not hasattr(layer, "reft_adapters"):
+                continue
+            for str_id, adapter in layer.reft_adapters.items():
+                if hasattr(adapter, "refresh_inference_caches"):
+                    adapter.refresh_inference_caches()
+                    refreshed.append((idx, str_id))
+        logger.debug("Refreshed %d ReFT adapter caches: %s",
+                      len(refreshed), refreshed)
+

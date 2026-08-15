@@ -504,9 +504,11 @@ class VllmBackend:
             hash_content = []
             for filepath in forward_code_files:
                 hash_content.append(filepath)
-                if filepath == "<string>":
-                    # This means the function was dynamically generated, with
-                    # e.g. exec(). We can't actually check these.
+                if filepath.startswith("<"):
+                    # Synthetic paths like "<string>" (exec'd code) or
+                    # "<frozen os>" / "<frozen importlib._bootstrap>" (Python
+                    # 3.12+ freezes several stdlib modules into the
+                    # interpreter; they have no on-disk source file).
                     continue
                 with open(filepath) as f:
                     hash_content.append(f.read())
@@ -518,6 +520,24 @@ class VllmBackend:
             # 3. compiler hash
             compiler_hash = self.compiler_manager.compute_hash(vllm_config)
             factors.append(compiler_hash)
+
+            # 4. ReFT adapter spec hash (if present).
+            # The compiled graph captures adapter weight shapes (e.g. _R_cache
+            # shape encodes low_rank_dim).  Different ranks produce different
+            # kernels, so they must not share a cache entry.
+            import os as _os
+            _reft_spec_path = _os.environ.get("_VLLM_REFT_SPEC_FILE", "")
+            if _reft_spec_path and _os.path.exists(_reft_spec_path):
+                import hashlib as _hashlib
+                try:
+                    with open(_reft_spec_path, "rb") as _f:
+                        _spec_bytes = _f.read()
+                    factors.append(
+                        _hashlib.md5(_spec_bytes,
+                                     usedforsecurity=False).hexdigest()
+                    )
+                except OSError:
+                    pass
 
             # combine all factors to generate the cache dir
             hash_key = hashlib.md5(str(factors).encode(),

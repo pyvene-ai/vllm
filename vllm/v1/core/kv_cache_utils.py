@@ -428,11 +428,13 @@ def need_extra_keys(request: Request) -> bool:
     """
 
     # Multimodal requests need to include the MM hash.
-    # LoRA requests need to include the LoRA ID.
+    # LoRA / ReFT requests need to include the adapter ID (unless the
+    # adapter is decode-only and cannot affect prefill KV).
     # Request with provided cache salt need to include the salt.
-    return bool(request.mm_features) or (request.lora_request
-                                         is not None) or (request.cache_salt
-                                                          is not None)
+    return (bool(request.mm_features) or (request.lora_request is not None)
+            or (getattr(request, "reft_request", None) is not None)
+            or (getattr(request, "decode_reft_request", None) is not None)
+            or (request.cache_salt is not None))
 
 
 def _gen_mm_extra_hash_keys(request: Request, start_token_idx: int,
@@ -502,16 +504,46 @@ def _gen_mm_extra_hash_keys(request: Request, start_token_idx: int,
 def _gen_lora_extra_hash_keys(request: Request) -> list[int]:
     """Generate extra keys related to LoRA for block hash computation.
 
+    Only adapters that can affect *prefill* hidden states key the hash:
+    KV written under such an adapter differs from base-model KV, so it
+    must never be shared across adapters.  Decode-only adapters
+    (``lora_position="decode"`` and the ``decode_lora_request`` slot)
+    never touch prefill KV — excluding them lets their requests share
+    cached prefills with the base model.
+
     Args:
         request: The request object.
 
     Returns:
-        Return LoRA id of the request if it is a LoRA request. Return empty
-        list otherwise.
+        The LoRA id if the request's primary adapter affects prefill.
+        Empty list otherwise.
     """
     if not request.lora_request:
         return []
+    if request.lora_request.lora_position == "decode":
+        return []
     return [request.lora_request.lora_int_id]
+
+
+def _gen_reft_extra_hash_keys(request: Request) -> list[str]:
+    """Generate extra keys related to ReFT for block hash computation.
+
+    ReFT positions live on the loaded adapter (worker-side), so the
+    hasher relies on the optional ``reft_position`` declared on the
+    request: adapters declared ``"decode"`` are excluded (prefill KV
+    unaffected); anything else — including undeclared — is
+    conservatively included.  Keys are namespaced ("reft:<id>") so they
+    can never collide with LoRA integer ids.
+    """
+    keys: list[str] = []
+    for reft_req in (getattr(request, "reft_request", None),
+                     getattr(request, "decode_reft_request", None)):
+        if reft_req is None:
+            continue
+        if getattr(reft_req, "reft_position", None) == "decode":
+            continue
+        keys.append(f"reft:{reft_req.reft_int_id}")
+    return keys
 
 
 def generate_block_hash_extra_keys(
@@ -533,10 +565,12 @@ def generate_block_hash_extra_keys(
     mm_extra_keys, new_start_mm_idx = _gen_mm_extra_hash_keys(
         request, start_token_idx, end_token_idx, start_mm_idx)
     lora_extra_keys: list[int] = _gen_lora_extra_hash_keys(request)
+    reft_extra_keys: list[str] = _gen_reft_extra_hash_keys(request)
     cache_salt_keys: list[str] = [request.cache_salt] if (
         start_token_idx == 0 and request.cache_salt) else []
 
-    extra_keys: list[Any] = lora_extra_keys + mm_extra_keys + cache_salt_keys
+    extra_keys: list[Any] = (lora_extra_keys + reft_extra_keys +
+                             mm_extra_keys + cache_salt_keys)
 
     if not extra_keys:
         return None, new_start_mm_idx

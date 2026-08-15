@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
+import os
 import traceback
 from itertools import chain
 from typing import TYPE_CHECKING, Optional
@@ -178,7 +179,28 @@ builtin_platform_plugins = {
 }
 
 
+_FORCED_PLATFORM_QUALNAMES = {
+    'cpu': "vllm.platforms.cpu.CpuPlatform",
+    'cuda': "vllm.platforms.cuda.CudaPlatform",
+    'rocm': "vllm.platforms.rocm.RocmPlatform",
+    'tpu': "vllm.platforms.tpu.TpuPlatform",
+    'xpu': "vllm.platforms.xpu.XPUPlatform",
+}
+
+
 def resolve_current_platform_cls_qualname() -> str:
+    # Explicit override, e.g. VLLM_FORCE_PLATFORM=cpu to run CPU-only
+    # tests on a CUDA build without visible GPUs.
+    forced = os.environ.get("VLLM_FORCE_PLATFORM")
+    if forced:
+        qualname = _FORCED_PLATFORM_QUALNAMES.get(forced.lower())
+        if qualname is None:
+            raise ValueError(
+                f"Unknown VLLM_FORCE_PLATFORM={forced!r}; expected one of "
+                f"{sorted(_FORCED_PLATFORM_QUALNAMES)}")
+        logger.info("Platform forced to %s via VLLM_FORCE_PLATFORM.", forced)
+        return qualname
+
     platform_plugins = load_plugins_by_group('vllm.platform_plugins')
 
     activated_plugins = []

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
         KVConnectorMetadata)
     from vllm.lora.request import LoRARequest
     from vllm.multimodal.inputs import MultiModalFeatureSpec
+    from vllm.reft.request import ReFTRequest
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.request import Request
@@ -34,7 +35,10 @@ class NewRequestData:
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
     lora_request: Optional[LoRARequest]
+    reft_request: Optional[ReFTRequest] = None
     prompt_embeds: Optional[torch.Tensor] = None
+    decode_lora_request: Optional[LoRARequest] = None
+    decode_reft_request: Optional[ReFTRequest] = None
 
     @classmethod
     def from_request(
@@ -51,7 +55,10 @@ class NewRequestData:
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
+            reft_request=request.reft_request,
             prompt_embeds=request.prompt_embeds,
+            decode_lora_request=request.decode_lora_request,
+            decode_reft_request=request.decode_reft_request,
         )
 
     def __repr__(self) -> str:

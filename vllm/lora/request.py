@@ -29,8 +29,13 @@ class LoRARequest(
     long_lora_max_len: Optional[int] = None
     base_model_name: Optional[str] = msgspec.field(default=None)
     tensorizer_config_dict: Optional[dict] = None
+    lora_position: str = "all"  # "all", "prefill" or "decode"
 
     def __post_init__(self):
+        if self.lora_position not in ("all", "prefill", "decode"):
+            raise ValueError(
+                f"lora_position must be 'all', 'prefill' or 'decode', "
+                f"got {self.lora_position!r}")
         if self.lora_int_id < 1:
             raise ValueError(f"id must be > 0, got {self.lora_int_id}")
         if self.lora_local_path:

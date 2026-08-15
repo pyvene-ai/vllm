@@ -365,9 +365,12 @@ class Gemma3Model(nn.Module):
             config.hidden_size,
             prefix=f"{prefix}.embed_tokens",
         )
+        from vllm.reft.layer import maybe_reft_layer_type
+        layer_cls = maybe_reft_layer_type(vllm_config, Gemma3DecoderLayer,
+                                          arch="gemma3")
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Gemma3DecoderLayer(
+            lambda prefix: layer_cls(
                 config, cache_config, quant_config, prefix=prefix),
             prefix=f"{prefix}.layers")
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)

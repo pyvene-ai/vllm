@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import weakref
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from unittest.mock import patch
@@ -10,7 +11,8 @@ import torch
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
+from vllm.compilation.monitor import (set_cudagraph_capturing_enabled,
+                                      validate_cudagraph_capturing_enabled)
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id)
@@ -20,6 +22,121 @@ from vllm.platforms import current_platform
 from vllm.utils import weak_ref_tensors
 
 logger = init_logger(__name__)
+
+# Weak registry of every live CUDAGraphWrapper (FULL wrapper on the model
+# runner, PIECEWISE wrappers inside the split fx.GraphModule, ubatch
+# wrappers, ...).  Used by invalidate_all_cudagraphs() when the set of
+# modules participating in the forward changes after capture (e.g. a
+# ReFT adapter is loaded or unloaded) — replayed graphs would otherwise
+# silently keep executing the old module set.
+_cudagraph_wrappers: "weakref.WeakSet[CUDAGraphWrapper]" = weakref.WeakSet()
+
+
+def _lazy_capture_context():
+    """Coordination context for capturing outside warmup.
+
+    Warmup captures run inside ``vllm.distributed.graph_capture()``,
+    which provides a dedicated side stream and switches the TP/PP
+    custom-allreduce communicators into capture mode.  A lazy
+    (post-invalidation) capture must enter the same context itself —
+    unless one is already open, or distributed state was never
+    initialized (single-process unit tests).
+
+    All ranks reach the same lazy capture at the same step because both
+    the adapter-set change (a collective RPC or deterministic LRU
+    decision) and the batch-descriptor dispatch are SPMD-identical.
+    """
+    from contextlib import nullcontext
+
+    from vllm.distributed import parallel_state
+    if parallel_state.is_graph_capture_context_active():
+        return nullcontext()
+    if not parallel_state.model_parallel_is_initialized():
+        return nullcontext()
+    device = (torch.device("cuda", torch.cuda.current_device())
+              if torch.cuda.is_available() else torch.device("cpu"))
+    return parallel_state.graph_capture(device)
+
+
+def warn_if_dynamic_adaptation_under_cudagraphs(action: str) -> int:
+    """Warn when the adapter *structure* changes after graphs were captured.
+
+    vLLM's torch.compile wrapper bypasses Dynamo guards after the first
+    compilation, so a ReFT adapter loaded post-warmup is absent from the
+    compiled forward regardless of any CUDA-graph re-capture (the
+    re-captured graph replays the same compiled code).  Re-capturing is
+    not only useless here but harmful: a capture taken during a real
+    step bakes that step's host-side conditionals (e.g. punica's
+    no-active-LoRA skip), silently breaking unrelated adapters.
+
+    Supported configurations:
+      - dynamic ReFT adapter loading  -> enforce_eager=True
+      - construction-baked ReFT (reft_config=) + in-place weight sync
+        -> works under compiled/captured execution
+      - LoRA load/sync -> always works (buffer-driven, captured with
+        dummy LoRAs at warmup)
+
+    Returns the number of currently captured graphs (0 = nothing to
+    warn about).
+    """
+    captured = sum(
+        len(w.concrete_cudagraph_entries) for w in _cudagraph_wrappers)
+    if captured:
+        logger.warning(
+            "ReFT adapter %s happened after %d CUDA graph(s) were "
+            "captured. Dynamically loaded ReFT adaptations DO NOT take "
+            "effect in compiled/captured execution — use "
+            "enforce_eager=True for dynamic ReFT serving, or bake "
+            "adapters at engine construction (reft_config=) and update "
+            "them via weight sync.", action, captured)
+    return captured
+
+
+# Invalidated graphs are retired here instead of being destroyed:
+# captured graphs share a memory pool, and destroying some of them
+# while later captures allocate from the same pool trips the CUDA
+# caching allocator's pool bookkeeping ("use_count > 0" internal
+# assert).  Holding references sidesteps the destruction path entirely;
+# the retained memory is bounded by the (rare) number of adapter-set
+# changes.  High-churn adapter workloads should use eager mode.
+_retired_cudagraphs: list = []
+
+
+def invalidate_all_cudagraphs() -> int:
+    """Drop every captured CUDA graph and re-allow capturing.
+
+    The next dispatch through each wrapper lazily re-captures with the
+    model's current module set (CUDAGraphWrapper captures whenever an
+    entry has no graph yet), entering the distributed graph-capture
+    coordination context as needed (see ``_lazy_capture_context``).
+    Old graphs are retired, not destroyed (see ``_retired_cudagraphs``).
+    Returns the number of dropped entries.
+    """
+    cleared = 0
+    for wrapper in list(_cudagraph_wrappers):
+        entries = wrapper.concrete_cudagraph_entries
+        if not entries:
+            continue
+        cleared += len(entries)
+        for entry in entries.values():
+            graph = getattr(entry, "cudagraph", None)
+            if graph is not None:
+                _retired_cudagraphs.append(graph)
+        entries.clear()
+    if cleared:
+        # Make sure no in-flight work still uses the old graphs before
+        # anything else touches the shared pool.
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+        # Capturing is globally frozen after warmup; unfreeze so the
+        # lazy re-capture is legal.
+        set_cudagraph_capturing_enabled(True)
+        logger.info(
+            "Invalidated %d captured CUDA graph(s) after adapter set "
+            "change; they will be re-captured lazily (%d retired graphs "
+            "held to protect the shared memory pool).", cleared,
+            len(_retired_cudagraphs))
+    return cleared
 
 
 @dataclasses.dataclass
@@ -93,6 +210,7 @@ class CUDAGraphWrapper:
         # cudagraphs for.
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry]\
                                                                         = {}
+        _cudagraph_wrappers.add(self)
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
@@ -144,7 +262,21 @@ class CUDAGraphWrapper:
             entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
 
+            # A capture outside warmup's graph_capture() context is a
+            # *lazy* capture happening inside a real request's forward.
+            # Capture records kernels without executing them, so the
+            # step's outputs would be garbage unless we replay the
+            # fresh graph before returning (warmup's dummy runs never
+            # consume outputs, so they skip this).
+            from vllm.distributed import parallel_state
+            is_lazy_capture = (
+                not parallel_state.is_graph_capture_context_active())
+
             with ExitStack() as stack:
+                # Lazy (post-warmup) captures need the distributed
+                # graph-capture coordination context that warmup
+                # provides externally; no-op when already inside one.
+                stack.enter_context(_lazy_capture_context())
                 if self.cudagraph_options.gc_disable:
                     # during every model forward for piecewise cudagraph
                     # mode, we will capture many pieces of cudagraphs
@@ -179,6 +311,12 @@ class CUDAGraphWrapper:
             entry.cudagraph = cudagraph
 
             compilation_counter.num_cudagraph_captured += 1
+
+            if is_lazy_capture:
+                # Execute the just-recorded work so this real step
+                # produces actual results (inputs already sit in the
+                # persistent buffers the graph reads).
+                cudagraph.replay()
 
             # important: we need to return the output, rather than
             # the weak ref of the output, so that pytorch can correctly
