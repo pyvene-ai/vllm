@@ -52,14 +52,13 @@ def _request_lora_ids(request: Request) -> set[int]:
 
 
 def _request_reft_ids(request: Request) -> set[int]:
-    """All ReFT adapter ids a request needs (primary + decode-phase)."""
-    ids: set[int] = set()
-    if request.reft_request and request.reft_request.reft_int_id > 0:
-        ids.add(request.reft_request.reft_int_id)
-    decode_reft = getattr(request, "decode_reft_request", None)
-    if decode_reft and decode_reft.reft_int_id > 0:
-        ids.add(decode_reft.reft_int_id)
-    return ids
+    """All ReFT adapter ids a request needs (every member)."""
+    members = getattr(request, "reft_requests", None)
+    if members is None:
+        members = [r for r in (request.reft_request,
+                               getattr(request, "decode_reft_request",
+                                       None)) if r is not None]
+    return {r.reft_int_id for r in members if r.reft_int_id > 0}
 
 
 class Scheduler(SchedulerInterface):

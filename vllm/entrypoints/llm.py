@@ -347,6 +347,8 @@ class LLM:
                                             LoRARequest]] = None,
         decode_reft_request: Optional[Union[list[ReFTRequest],
                                             ReFTRequest]] = None,
+        reft_requests: Optional[Union[list[ReFTRequest],
+                                      list[list[ReFTRequest]]]] = None,
         priority: Optional[list[int]] = None,
     ) -> list[RequestOutput]:
         """Generates the completions for the input prompts.
@@ -410,6 +412,7 @@ class LLM:
             reft_request=reft_request,
             decode_lora_request=decode_lora_request,
             decode_reft_request=decode_reft_request,
+            reft_requests=reft_requests,
             priority=priority,
         )
 
@@ -1505,6 +1508,8 @@ class LLM:
                                             LoRARequest]] = None,
         decode_reft_request: Optional[Union[Sequence[ReFTRequest],
                                             ReFTRequest]] = None,
+        reft_requests: Optional[Union[list[ReFTRequest],
+                                      list[list[ReFTRequest]]]] = None,
         priority: Optional[list[int]] = None,
     ) -> None:
         if isinstance(prompts, (str, dict)):
@@ -1531,6 +1536,18 @@ class LLM:
                       Sequence) and len(decode_reft_request) != num_requests:
             raise ValueError("The lengths of prompts and decode_reft_request "
                              "must be the same.")
+        # reft_requests: one member list shared by all prompts, or a
+        # per-prompt list of member lists.
+        per_prompt_reft_members = None
+        if reft_requests is not None:
+            if reft_requests and isinstance(reft_requests[0], ReFTRequest):
+                per_prompt_reft_members = [list(reft_requests)] * num_requests
+            else:
+                if len(reft_requests) != num_requests:
+                    raise ValueError(
+                        "The lengths of prompts and reft_requests must be "
+                        "the same (or pass one flat member list).")
+                per_prompt_reft_members = [list(m) for m in reft_requests]
 
         for sp in params if isinstance(params, Sequence) else (params, ):
             if isinstance(sp, SamplingParams):
@@ -1571,6 +1588,8 @@ class LLM:
                     decode_lora_request, Sequence) else decode_lora_request,
                 decode_reft_request=decode_reft_request[i] if isinstance(
                     decode_reft_request, Sequence) else decode_reft_request,
+                reft_requests=(per_prompt_reft_members[i]
+                               if per_prompt_reft_members else None),
                 priority=priority[i] if priority else 0,
             )
 
@@ -1618,6 +1637,7 @@ class LLM:
         reft_request: Optional[ReFTRequest] = None,
         decode_lora_request: Optional[LoRARequest] = None,
         decode_reft_request: Optional[ReFTRequest] = None,
+        reft_requests: Optional[list[ReFTRequest]] = None,
         priority: int = 0,
     ) -> None:
         request_id = str(next(self.request_counter))
@@ -1631,6 +1651,7 @@ class LLM:
             reft_request=reft_request,
             decode_lora_request=decode_lora_request,
             decode_reft_request=decode_reft_request,
+            reft_requests=reft_requests,
         )
 
     def _run_engine(

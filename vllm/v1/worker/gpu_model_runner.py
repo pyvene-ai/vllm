@@ -602,6 +602,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 reft_request=new_req_data.reft_request,
                 decode_lora_request=new_req_data.decode_lora_request,
                 decode_reft_request=new_req_data.decode_reft_request,
+                reft_requests=new_req_data.reft_requests,
             )
             self.requests[req_id] = req_state
 
@@ -2294,12 +2295,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             from vllm.reft.layer import update_multi_reft_position_masks
             actual_positions = positions[:num_scheduled_tokens]
             # Build per-token adapter ID mappings from InputBatch
-            # (primary slot + optional decode-phase-paired slot).
-            token_reft_np, decode_token_reft_np = (
+            # (one array per populated member slot).
+            slot_reft_np = (
                 self.input_batch.make_reft_inputs(num_scheduled_tokens_np))
-            token_reft_ids = torch.from_numpy(token_reft_np).to(self.device)
-            decode_token_reft_ids = torch.from_numpy(
-                decode_token_reft_np).to(self.device)
+            slot_reft_ids = [torch.from_numpy(a).to(self.device)
+                             for a in slot_reft_np]
+            token_reft_ids = slot_reft_ids[0]
+            extra_token_reft_ids = slot_reft_ids[1:]
             # Backward compat: when reft_config= bakes in adapter id=1
             # at construction time, users don't pass ReFTRequest so all
             # token IDs are 0.  Default those to 1 so the adapter fires.
@@ -2307,9 +2309,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 token_reft_ids[token_reft_ids == 0] = 1
             # Ensure all adapters needed for this batch are on GPU.
             if self.reft_manager is not None:
-                batch_ids = (set(token_reft_ids.unique().tolist())
-                             | set(decode_token_reft_ids.unique().tolist())
-                             ) - {0}
+                batch_ids = set()
+                for t in slot_reft_ids:
+                    batch_ids |= set(t.unique().tolist())
+                batch_ids -= {0}
                 self.reft_manager.ensure_active(batch_ids)
             cudagraphs_enabled = (self.compilation_config.cudagraph_mode
                                   is not None
@@ -2325,7 +2328,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             update_multi_reft_position_masks(
                 self._reft_layers, token_reft_ids, actual_positions,
                 attn_metadata, num_scheduled_tokens,
-                decode_token_reft_ids=decode_token_reft_ids,
+                extra_token_reft_ids=extra_token_reft_ids,
                 # Gather/scatter uses dynamic member counts, which CUDA
                 # graph replay cannot represent — eager mode only.
                 use_gather=self.vllm_config.model_config.enforce_eager,

@@ -49,7 +49,11 @@ class ReFTRequest(msgspec.Struct, frozen=True):
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, ReFTRequest):
             return NotImplemented
-        return self.reft_name == other.reft_name
+        # identity includes the int id: N-member requests may carry
+        # members sharing a name, and set-dedup by name alone would
+        # silently drop them
+        return (self.reft_name == other.reft_name
+                and self.reft_int_id == other.reft_int_id)
 
     def __hash__(self) -> int:
-        return hash(self.reft_name)
+        return hash((self.reft_name, self.reft_int_id))

@@ -434,6 +434,7 @@ def need_extra_keys(request: Request) -> bool:
     return (bool(request.mm_features) or (request.lora_request is not None)
             or (getattr(request, "reft_request", None) is not None)
             or (getattr(request, "decode_reft_request", None) is not None)
+            or bool(getattr(request, "reft_requests", None))
             or (request.cache_salt is not None))
 
 
@@ -536,8 +537,11 @@ def _gen_reft_extra_hash_keys(request: Request) -> list[str]:
     can never collide with LoRA integer ids.
     """
     keys: list[str] = []
-    for reft_req in (getattr(request, "reft_request", None),
-                     getattr(request, "decode_reft_request", None)):
+    members = getattr(request, "reft_requests", None)
+    if members is None:
+        members = (getattr(request, "reft_request", None),
+                   getattr(request, "decode_reft_request", None))
+    for reft_req in members:
         if reft_req is None:
             continue
         if getattr(reft_req, "reft_position", None) == "decode":

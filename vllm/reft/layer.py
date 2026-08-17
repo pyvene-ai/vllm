@@ -40,7 +40,7 @@ import math
 import os
 import re
 import types
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -1067,6 +1067,7 @@ def update_multi_reft_position_masks(
     use_gather: bool = False,
     graph_safe: bool = False,
     prompt_lens: Optional[torch.Tensor] = None,
+    extra_token_reft_ids: Sequence[torch.Tensor] = (),
 ) -> None:
     """Pre-compute combined masks for all adapters on all ReFT layers.
 
@@ -1154,6 +1155,8 @@ def update_multi_reft_position_masks(
     batch_active_ids: set[int] = set(token_reft_ids.unique().tolist())
     if decode_token_reft_ids is not None:
         batch_active_ids |= set(decode_token_reft_ids.unique().tolist())
+    for extra in extra_token_reft_ids:
+        batch_active_ids |= set(extra.unique().tolist())
     batch_active_ids.discard(0)  # 0 = no adapter
 
     # Cache position masks by position string to avoid redundant computation.
@@ -1200,11 +1203,13 @@ def update_multi_reft_position_masks(
             int_id = int(str_id)
             if int_id not in layer_active_ids:
                 continue
-            # Adapter membership mask (either slot).
+            # Adapter membership mask (any slot).
             adapter_mask = (token_reft_ids == int_id)
             if decode_token_reft_ids is not None:
                 adapter_mask = adapter_mask | (
                     decode_token_reft_ids == int_id)
+            for extra in extra_token_reft_ids:
+                adapter_mask = adapter_mask | (extra == int_id)
             adapter_mask = adapter_mask.float()
             # Position mask (cached by position string)
             pos = layer._reft_adapter_positions.get(int_id, "prefill")

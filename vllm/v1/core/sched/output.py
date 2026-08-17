@@ -39,6 +39,7 @@ class NewRequestData:
     prompt_embeds: Optional[torch.Tensor] = None
     decode_lora_request: Optional[LoRARequest] = None
     decode_reft_request: Optional[ReFTRequest] = None
+    reft_requests: Optional[list[ReFTRequest]] = None
 
     @classmethod
     def from_request(
@@ -59,6 +60,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             decode_lora_request=request.decode_lora_request,
             decode_reft_request=request.decode_reft_request,
+            reft_requests=request.reft_requests,
         )
 
     def __repr__(self) -> str:

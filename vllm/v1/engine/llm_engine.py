@@ -224,6 +224,7 @@ class LLMEngine:
         reft_request: Optional[ReFTRequest] = None,
         decode_lora_request: Optional[LoRARequest] = None,
         decode_reft_request: Optional[ReFTRequest] = None,
+        reft_requests: Optional[list[ReFTRequest]] = None,
     ) -> None:
         # Validate the request_id type.
         if not isinstance(request_id, str):
@@ -236,7 +237,8 @@ class LLMEngine:
             tokenization_kwargs, trace_headers, priority,
             reft_request=reft_request,
             decode_lora_request=decode_lora_request,
-            decode_reft_request=decode_reft_request)
+            decode_reft_request=decode_reft_request,
+            reft_requests=reft_requests)
 
         n = params.n if isinstance(params, SamplingParams) else 1
 

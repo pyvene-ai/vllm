@@ -226,6 +226,17 @@ class Processor:
         if decode_lora_request is None:
             return
 
+    def _validate_reft_members(
+            self, reft_requests: Optional[list["ReFTRequest"]]) -> None:
+        """N-member adapter lists: ids must be unique — duplicate ids
+        would double-apply one adapter through two slots."""
+        if not reft_requests:
+            return
+        ids = [r.reft_int_id for r in reft_requests]
+        if len(set(ids)) != len(ids):
+            raise ValueError(
+                f"reft_requests carries duplicate reft_int_ids: {ids}")
+
         self._validate_lora(decode_lora_request)
 
         if decode_lora_request.lora_position != "decode":
@@ -361,11 +372,13 @@ class Processor:
         reft_request: Optional[ReFTRequest] = None,
         decode_lora_request: Optional[LoRARequest] = None,
         decode_reft_request: Optional[ReFTRequest] = None,
+        reft_requests: Optional[list[ReFTRequest]] = None,
     ) -> tuple[Optional[str], EngineCoreRequest]:
 
         # TODO(woosuk): Support pooling models.
         self._validate_lora(lora_request)
         self._validate_decode_lora(lora_request, decode_lora_request)
+        self._validate_reft_members(reft_requests)
         self._validate_params(params)
 
         data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
@@ -483,6 +496,7 @@ class Processor:
             reft_request=reft_request,
             decode_lora_request=decode_lora_request,
             decode_reft_request=decode_reft_request,
+            reft_requests=reft_requests,
             cache_salt=decoder_inputs.get("cache_salt"),
             priority=priority,
             data_parallel_rank=data_parallel_rank,

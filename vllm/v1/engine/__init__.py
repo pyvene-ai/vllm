@@ -64,6 +64,12 @@ class EngineCoreRequest(
     decode_lora_request: Optional[LoRARequest] = None
     decode_reft_request: Optional[ReFTRequest] = None
 
+    # N-member adapter list (v3): supersedes the two slots above. When
+    # set, it is the COMPLETE member list for the request; the legacy
+    # two fields are ignored. Appended last to preserve msgspec
+    # array_like wire order.
+    reft_requests: Optional[list[ReFTRequest]] = None
+
     # Index of the client, used to ensure outputs are sent back to the same
     # client for this request when scaling out the front-end.
     client_index: int = 0

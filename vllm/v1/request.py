@@ -41,6 +41,7 @@ class Request:
         reft_request: Optional["ReFTRequest"] = None,
         decode_lora_request: Optional["LoRARequest"] = None,
         decode_reft_request: Optional["ReFTRequest"] = None,
+        reft_requests: Optional[list["ReFTRequest"]] = None,
         structured_output_request: Optional["StructuredOutputRequest"] = None,
         cache_salt: Optional[str] = None,
         priority: int = 0,
@@ -59,6 +60,11 @@ class Request:
         self.reft_request = reft_request
         self.decode_lora_request = decode_lora_request
         self.decode_reft_request = decode_reft_request
+        # canonical N-member list; falls back to the legacy slot pair
+        self.reft_requests: list["ReFTRequest"] = (
+            list(reft_requests) if reft_requests
+            else [r for r in (reft_request, decode_reft_request)
+                  if r is not None])
         self.structured_output_request = structured_output_request
         self.arrival_time = arrival_time if arrival_time is not None else \
             time.time()
@@ -148,6 +154,7 @@ class Request:
             reft_request=request.reft_request,
             decode_lora_request=request.decode_lora_request,
             decode_reft_request=request.decode_reft_request,
+            reft_requests=request.reft_requests,
             structured_output_request=StructuredOutputRequest(
                 sampling_params=request.sampling_params) \
                     if request.sampling_params else None,
