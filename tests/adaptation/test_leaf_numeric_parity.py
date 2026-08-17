@@ -25,7 +25,7 @@ adapters_registry = pytest.importorskip(
     reason="requires the adapters library (shared-contract branch)")
 from adapters.registry import LEAF_REGISTRY  # noqa: E402
 
-from vllm.adapter import (_adapter_to_blueprint,  # noqa: E402
+from vllm.adaptation.specs import (_adapter_to_blueprint,  # noqa: E402
                        _blueprint_to_adapter)
 
 HIDDEN = 64

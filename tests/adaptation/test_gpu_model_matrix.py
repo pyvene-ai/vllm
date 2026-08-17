@@ -53,7 +53,7 @@ class TestModelMatrixE2E:
                 pytest.skip(f"{model_id} unavailable: {msg[:120]}")
             raise
         try:
-            from vllm.adapter import spec_to_adapter_config
+            from vllm.adaptation.specs import spec_to_adapter_config
             base = _gen_ids(llm)
 
             llm.collective_rpc(
