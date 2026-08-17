@@ -11,7 +11,7 @@ from typing_extensions import deprecated
 
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItems
-from vllm.adapter.request import AdapterRequest
+from vllm.adaptation.request import AdapterRequest
 
 MAX_ADAPTER_SLOTS = 8
 from vllm.pooling_params import PoolingParams

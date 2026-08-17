@@ -18,7 +18,7 @@ import torch.nn as nn
 
 from vllm.adaptation import (PhaseInfo, get_position_mask,
                              position_active_in_decode)
-from vllm.adapter.layer import (_add_adapter_to_layer, _init_multi_adapter_state,
+from vllm.adaptation.layer import (_add_adapter_to_layer, _init_multi_adapter_state,
                              _multi_adapter_forward,
                              update_adapter_position_masks)
 

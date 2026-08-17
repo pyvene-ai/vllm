@@ -1,4 +1,4 @@
-"""vllm.adapter – first-class adapter (Representation Fine-Tuning) support in vLLM.
+"""vllm.adaptation.specs – first-class adapter (Representation Fine-Tuning) support in vLLM.
 
 This package owns everything required to run adapter-adapted models in vLLM:
 
@@ -11,7 +11,7 @@ This package owns everything required to run adapter-adapted models in vLLM:
 
 Usage (preferred — via VllmConfig)::
 
-    from vllm.adapter import spec_to_adapter_config
+    from vllm.adaptation.specs import spec_to_adapter_config
 
     adapter_spec = adapter_model.export_vllm_adapter_spec()
     llm = LLM(model=model_name, adapter_config=spec_to_adapter_config(adapter_spec))
@@ -31,10 +31,10 @@ import tempfile
 import threading
 from typing import Any, Optional
 
-logger = logging.getLogger("vllm.adapter")
+logger = logging.getLogger("vllm.adaptation")
 
-from vllm.adapter.models import ServedAdapter, AdapterManager
-from vllm.adapter.request import AdapterRequest
+from vllm.adaptation.manager import ServedAdapter, AdapterManager
+from vllm.adaptation.request import AdapterRequest
 
 __all__ = [
     "ServedAdapter",

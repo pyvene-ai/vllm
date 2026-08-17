@@ -600,8 +600,8 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
         # adapter-aware decoder layers so CUDA graphs capture the adapter
         # path. Falls back to the deprecated get_adapter_spec() global state
         # used by TRL hooks.
-        from vllm.adapter import adapter_config_to_spec, get_adapter_spec
-        from vllm.adapter.layer import make_adapter_qwen3_moe_layer
+        from vllm.adaptation.specs import adapter_config_to_spec, get_adapter_spec
+        from vllm.adaptation.layer import make_adapter_qwen3_moe_layer
         enable_adapters = getattr(vllm_config, "enable_adapters", False)
         adapter_spec = adapter_config_to_spec(
             getattr(vllm_config, "adapter_config", None))

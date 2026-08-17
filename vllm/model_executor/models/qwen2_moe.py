@@ -350,7 +350,7 @@ class Qwen2MoeModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        from vllm.adapter.layer import maybe_adapter_layer_type
+        from vllm.adaptation.layer import maybe_adapter_layer_type
         _layer_cls = maybe_adapter_layer_type(
             vllm_config, Qwen2MoeDecoderLayer, arch="qwen2_moe")
         self.start_layer, self.end_layer, self.layers = make_layers(

@@ -20,7 +20,7 @@ from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
-    from vllm.adapter.request import AdapterRequest
+    from vllm.adaptation.request import AdapterRequest
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 

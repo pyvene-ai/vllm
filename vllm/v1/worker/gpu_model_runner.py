@@ -2292,7 +2292,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # address buffers that the compiled forward reads.
         # Use num_scheduled_tokens (actual, not padded) for the mask.
         if self._adapter_layers:
-            from vllm.adapter.layer import update_adapter_position_masks
+            from vllm.adaptation.layer import update_adapter_position_masks
             actual_positions = positions[:num_scheduled_tokens]
             # Build per-token adapter ID mappings from InputBatch
             # (one array per populated member slot).
@@ -2727,7 +2727,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Instantiate centralized adapter manager with LRU eviction.
         self.adapter_manager: Optional["AdapterManager"] = None
         if self.vllm_config.enable_adapters and self._adapter_layers:
-            from vllm.adapter.models import AdapterManager
+            from vllm.adaptation.manager import AdapterManager
             self.adapter_manager = AdapterManager(
                 adapter_layers=self._adapter_layers,
                 max_adapters=self.vllm_config.max_adapters,

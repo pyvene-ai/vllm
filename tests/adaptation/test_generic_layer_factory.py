@@ -18,7 +18,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm.adapter.layer import (_add_adapter_to_layer, make_adapter_decoder_layer,
+from vllm.adaptation.layer import (_add_adapter_to_layer, make_adapter_decoder_layer,
                              maybe_adapter_layer_type,
                              update_adapter_position_masks)
 
@@ -200,7 +200,7 @@ class TestBackwardCompatFactories:
     def test_wrappers_subclass_their_base(self, factory_name, base_path):
         import importlib
 
-        import vllm.adapter.layer as adapter_layer
+        import vllm.adaptation.layer as adapter_layer
         module_path, cls_name = base_path.rsplit(".", 1)
         base = getattr(importlib.import_module(module_path), cls_name)
         cls = getattr(adapter_layer, factory_name)(None)

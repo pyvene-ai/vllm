@@ -5,7 +5,7 @@
 This package is the extension surface for custom "adaptations":
 arbitrary per-token computations mounted at named points of the model
 and restricted to named token positions (phases).  The adapter serving
-machinery in :mod:`vllm.adapter` is one consumer; anything satisfying the
+machinery in :mod:`vllm.adaptation` is one consumer; anything satisfying the
 protocol below can be served through the same request plumbing
 (``adapter_request`` / ``decode_adapter_request``), LRU manager, and
 training-time weight sync.

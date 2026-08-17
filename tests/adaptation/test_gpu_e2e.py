@@ -102,7 +102,7 @@ class BigDeltaAdapter(nn.Module):
 
 
 def _adapter_config(hidden: int, value: float):
-    from vllm.adapter import spec_to_adapter_config
+    from vllm.adaptation.specs import spec_to_adapter_config
     return spec_to_adapter_config({
         "layer_indices": [0, 1],
         "position": "prefill",  # per-adapter position given at load
@@ -111,7 +111,7 @@ def _adapter_config(hidden: int, value: float):
 
 
 def _adapter_req(idx: int):
-    from vllm.adapter.request import AdapterRequest
+    from vllm.adaptation.request import AdapterRequest
     return AdapterRequest(adapter_name=f"r{idx}", adapter_int_id=idx,
                        adapter_path=f"/synced/{idx}")
 

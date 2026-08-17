@@ -17,7 +17,7 @@ if TYPE_CHECKING:
         KVConnectorMetadata)
     from vllm.lora.request import LoRARequest
     from vllm.multimodal.inputs import MultiModalFeatureSpec
-    from vllm.adapter.request import AdapterRequest
+    from vllm.adaptation.request import AdapterRequest
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.request import Request

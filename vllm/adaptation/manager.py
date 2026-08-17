@@ -13,11 +13,11 @@ from typing import Optional
 import torch
 from torch import nn
 
-from vllm.adapter.layer import (_add_adapter_to_layer, _prepare_adapter,
+from vllm.adaptation.layer import (_add_adapter_to_layer, _prepare_adapter,
                              _remove_adapter_from_layer)
 from vllm.utils import LRUCache
 
-logger = logging.getLogger("vllm.adapter.models")
+logger = logging.getLogger("vllm.adaptation.manager")
 
 
 @dataclass
@@ -69,7 +69,7 @@ class AdapterManager:
         the least-recently-used adapter is evicted from GPU.
 
     The manager reuses the existing per-layer functions from
-    ``vllm.adapter.layer``: ``_prepare_adapter`` and ``_add_adapter_to_layer``
+    ``vllm.adaptation.layer``: ``_prepare_adapter`` and ``_add_adapter_to_layer``
     for loading, and the deletion logic from ``worker_base.py`` for
     unloading.
     """
@@ -256,7 +256,7 @@ class AdapterManager:
 
         Returns the number of layers loaded.
         """
-        from vllm.adapter import adapter_config_to_spec
+        from vllm.adaptation.specs import adapter_config_to_spec
 
         spec = adapter_config_to_spec(adapter_model.adapter_config)
         if spec is None:

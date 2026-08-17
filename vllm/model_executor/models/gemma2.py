@@ -252,7 +252,7 @@ class Gemma2Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        from vllm.adapter.layer import maybe_adapter_layer_type
+        from vllm.adaptation.layer import maybe_adapter_layer_type
         layer_cls = maybe_adapter_layer_type(vllm_config, Gemma2DecoderLayer,
                                           arch="gemma2")
         self.start_layer, self.end_layer, self.layers = make_layers(

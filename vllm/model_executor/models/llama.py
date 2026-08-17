@@ -537,8 +537,8 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         # If adapter_config is set or enable_adapters is True, use adapter-aware decoder
         # layers.  The caller-supplied layer_type takes precedence (e.g. Eagle3).
         if layer_type is LlamaDecoderLayer:
-            from vllm.adapter import adapter_config_to_spec, get_adapter_spec
-            from vllm.adapter.layer import make_adapter_llama_layer
+            from vllm.adaptation.specs import adapter_config_to_spec, get_adapter_spec
+            from vllm.adaptation.layer import make_adapter_llama_layer
             enable_adapters = getattr(vllm_config, "enable_adapters", False)
             adapter_spec = adapter_config_to_spec(
                 getattr(vllm_config, "adapter_config", None))

@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from vllm.adaptation import check_adaptation_supported
-from vllm.adapter.layer import _prepare_adapter
+from vllm.adaptation.layer import _prepare_adapter
 
 
 class _StatefulMixer(nn.Module):

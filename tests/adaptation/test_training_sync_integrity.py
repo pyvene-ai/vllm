@@ -23,7 +23,7 @@ import torch.nn as nn
 
 from vllm.compilation import monitor
 from vllm.compilation.cuda_graph import _cudagraph_wrappers
-from vllm.adapter.layer import _add_adapter_to_layer, _init_multi_adapter_state
+from vllm.adaptation.layer import _add_adapter_to_layer, _init_multi_adapter_state
 from vllm.worker.worker_base import WorkerBase
 
 from .test_cudagraph_invalidation import FakeWrapper

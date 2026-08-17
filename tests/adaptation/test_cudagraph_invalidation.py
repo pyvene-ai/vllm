@@ -25,7 +25,7 @@ from vllm.compilation import monitor
 from vllm.compilation.cuda_graph import (
     _cudagraph_wrappers, invalidate_all_cudagraphs,
     warn_if_dynamic_adaptation_under_cudagraphs)
-from vllm.adapter.layer import _add_adapter_to_layer, _init_multi_adapter_state
+from vllm.adaptation.layer import _add_adapter_to_layer, _init_multi_adapter_state
 from vllm.worker.worker_base import WorkerBase
 
 
@@ -156,7 +156,7 @@ class TestWorkerIntegration:
 
     def test_load_adapter_preserves_graphs(self, monkeypatch,
                                            capture_flag_guard):
-        import vllm.adapter as vllm_adapter
+        import vllm.adaptation.specs as vllm_adapter
         monkeypatch.setattr(
             vllm_adapter, "adapter_config_to_spec", lambda cfg: {
                 "layer_indices": [0, 1],
@@ -197,8 +197,8 @@ class TestWorkerIntegration:
 
     def test_manager_activate_preserves_graphs(self, monkeypatch,
                                                capture_flag_guard):
-        import vllm.adapter as vllm_adapter
-        from vllm.adapter.models import ServedAdapter, AdapterManager
+        import vllm.adaptation.specs as vllm_adapter
+        from vllm.adaptation.manager import ServedAdapter, AdapterManager
         monkeypatch.setattr(
             vllm_adapter, "adapter_config_to_spec", lambda cfg: {
                 "layer_indices": [0],

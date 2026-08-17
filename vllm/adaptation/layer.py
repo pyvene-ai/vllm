@@ -1,4 +1,4 @@
-"""vllm.adapter.layer – CUDA-graph-compatible adapter decoder layer factories.
+"""vllm.adaptation.layer – CUDA-graph-compatible adapter decoder layer factories.
 
 Overview
 --------
@@ -16,7 +16,7 @@ This module provides two things:
      vLLM decoder layer and run the adapter delta in their forward pass.
 
 The factories are called by Qwen2ForCausalLM / LlamaForCausalLM when a
-``_adapter_spec`` is present (see vllm.adapter.__init__ for the thread-local API).
+``_adapter_spec`` is present (see vllm.adaptation.specs for the thread-local API).
 
 CUDA-graph safety
 -----------------
@@ -1428,7 +1428,7 @@ def maybe_adapter_layer_type(vllm_config, default_cls: type,
     otherwise returns *default_cls* unchanged.  This is the one-line
     hook new architectures use.
     """
-    from vllm.adapter import get_adapter_spec, adapter_config_to_spec
+    from vllm.adaptation.specs import get_adapter_spec, adapter_config_to_spec
     adapter_spec = adapter_config_to_spec(getattr(vllm_config, "adapter_config",
                                             None))
     if adapter_spec is None:

@@ -39,7 +39,7 @@ from vllm.inputs import (DataPrompt, PromptType, SingletonPrompt, TextPrompt,
                          TokensPrompt)
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.adapter.request import AdapterRequest
+from vllm.adaptation.request import AdapterRequest
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.outputs import (ClassificationRequestOutput, EmbeddingRequestOutput,
                           PoolingRequestOutput, RequestOutput,

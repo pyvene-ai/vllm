@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 
 from vllm.adaptation import (resolve_site_submodule_path, validate_site)
-from vllm.adapter.layer import (_add_adapter_to_layer, _init_multi_adapter_state,
+from vllm.adaptation.layer import (_add_adapter_to_layer, _init_multi_adapter_state,
                              _multi_adapter_forward, _remove_adapter_from_layer,
                              update_adapter_position_masks)
 
@@ -240,8 +240,8 @@ class TestPhaseGatingAtSites:
 class TestManagerSiteFlow:
 
     def test_site_flows_through_manager(self, monkeypatch):
-        import vllm.adapter as vllm_adapter
-        from vllm.adapter.models import ServedAdapter, AdapterManager
+        import vllm.adaptation.specs as vllm_adapter
+        from vllm.adaptation.manager import ServedAdapter, AdapterManager
 
         layer = TinyDecoderLayer()
         layer._adapter_layer_idx = 0

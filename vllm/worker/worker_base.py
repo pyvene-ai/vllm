@@ -203,7 +203,7 @@ class WorkerBase:
         Called via ``collective_rpc("load_adapter",
         args=(adapter_int_id, adapter_config, position, site))``.
 
-        If a :class:`~vllm.adapter.models.AdapterManager` is available (the
+        If a :class:`~vllm.adaptation.manager.AdapterManager` is available (the
         ``enable_adapters`` path), the adapter is registered and activated through
         the manager's LRU cache.  Otherwise falls back to direct per-layer
         loading.
@@ -226,8 +226,8 @@ class WorkerBase:
         # Delegate to centralized manager when available.
         manager = self._get_adapter_manager()
         if manager is not None:
-            from vllm.adapter import adapter_config_to_spec
-            from vllm.adapter.models import ServedAdapter
+            from vllm.adaptation.specs import adapter_config_to_spec
+            from vllm.adaptation.manager import ServedAdapter
             spec = adapter_config_to_spec(adapter_config)
             if spec is None:
                 return 0
@@ -243,8 +243,8 @@ class WorkerBase:
             return len(adapter_model.layer_indices)
 
         # Fallback: direct per-layer loading (backward compat).
-        from vllm.adapter import adapter_config_to_spec
-        from vllm.adapter.layer import _prepare_adapter, _add_adapter_to_layer
+        from vllm.adaptation.specs import adapter_config_to_spec
+        from vllm.adaptation.layer import _prepare_adapter, _add_adapter_to_layer
 
         spec = adapter_config_to_spec(adapter_config)
         if spec is None:
@@ -277,7 +277,7 @@ class WorkerBase:
     def unload_adapter(self, adapter_int_id: int) -> int:
         """Remove a adapter from all layers.
 
-        Delegates to the :class:`~vllm.adapter.models.AdapterManager` when
+        Delegates to the :class:`~vllm.adaptation.manager.AdapterManager` when
         available, otherwise falls back to direct per-layer removal.
 
         Returns:
@@ -290,7 +290,7 @@ class WorkerBase:
             return 1 if was_removed else 0
 
         # Fallback: direct per-layer removal (backward compat).
-        from vllm.adapter.layer import _remove_adapter_from_layer
+        from vllm.adaptation.layer import _remove_adapter_from_layer
         model = self.get_model()
         count = 0
         for layer in model.model.layers:

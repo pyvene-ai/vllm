@@ -53,7 +53,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import is_interleaved
 
-logger = logging.getLogger("vllm.adapter")
+logger = logging.getLogger("vllm.adaptation")
 
 from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
@@ -471,8 +471,8 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
 
         # If adapter_config is set or enable_adapters is True, use adapter-aware decoder
         # layers so CUDA graphs capture the adapter path.
-        from vllm.adapter import adapter_config_to_spec, get_adapter_spec
-        from vllm.adapter.layer import make_adapter_qwen2_layer
+        from vllm.adaptation.specs import adapter_config_to_spec, get_adapter_spec
+        from vllm.adaptation.layer import make_adapter_qwen2_layer
         enable_adapters = getattr(vllm_config, "enable_adapters", False)
         adapter_spec = adapter_config_to_spec(
             getattr(vllm_config, "adapter_config", None))
