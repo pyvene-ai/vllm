@@ -147,7 +147,7 @@ class WorkerBase:
         """Load adapter weights for a specific adapter ID.
 
         Called via ``collective_rpc("sync_adapter_weights",
-        args=(weight_dict,), kwargs=...)`` from pyadapter's ``sync_to_vllm`` and
+        args=(weight_dict,), kwargs=...)`` from pyreft's ``sync_to_vllm`` and
         from trl's vllm_generation. The 2nd positional arg is
         ``refresh_caches`` (so trl's ``args=(weight_dict, False)`` correctly
         disables cache refresh during step-time sync).

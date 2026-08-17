@@ -15,7 +15,7 @@ The adaptation contract (duck-typed; no base class required)
 An adaptation is an ``nn.Module`` that provides ONE of:
 
   - ``_compute_delta(h) -> delta`` — additive blend (default):
-    ``h' = h + mask * delta``.  All existing pyadapter adapters use this.
+    ``h' = h + mask * delta``.  All existing pyreft adapters use this.
   - ``apply_masked(h, mask) -> h'`` — full control of how the masked
     computation combines with the stream (replacement, gating, ...).
     ``mask`` is a per-token float tensor of shape ``(num_tokens,)``.

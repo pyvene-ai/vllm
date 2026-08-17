@@ -359,7 +359,7 @@ def _mixer_instance_to_name(mixer_instance) -> Optional[str]:
     if mixer_instance is None:
         return None
     try:
-        from pyadapter.adapters._mixer import MIXER_REGISTRY
+        from pyreft.adapters._mixer import MIXER_REGISTRY
         for name, mixer_cls in MIXER_REGISTRY.items():
             if isinstance(mixer_instance, mixer_cls):
                 return name
@@ -382,7 +382,7 @@ def _blueprint_to_adapter(blueprint: dict):
     mod_name = blueprint["__module__"]
     # Backward compat: old blueprints stored "adaptors.*" module paths
     if mod_name.startswith("adaptors."):
-        mod_name = mod_name.replace("adaptors.", "pyadapter.adapters.", 1)
+        mod_name = mod_name.replace("adaptors.", "pyreft.adapters.", 1)
     qual_name = blueprint["__qualname__"]
     has_state = "state_dict" in blueprint and blueprint["state_dict"]
     logger.debug(

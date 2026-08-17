@@ -30,7 +30,7 @@ from vllm.adaptation.specs import (_adapter_to_blueprint,  # noqa: E402
 
 HIDDEN = 64
 # one leaf per mechanism family (steering / storage / recurrent)
-FAMILIES = ["diadapter_gelusq", "pkmem_open_k8", "gated_delta_cap",
+FAMILIES = ["direft_gelusq", "pkmem_open_k8", "gated_delta_cap",
             "gated_delta_fast", "gated_delta_wmfast"]
 
 
