@@ -220,12 +220,6 @@ class Processor:
                 "with its own tokenizer, consider specifying `--tokenizer "
                 "[lora_path]` to use the LoRA tokenizer.")
 
-    def _validate_decode_lora(
-            self, lora_request: Optional[LoRARequest],
-            decode_lora_request: Optional[LoRARequest]) -> None:
-        if decode_lora_request is None:
-            return
-
     def _validate_reft_members(
             self, reft_requests: Optional[list["ReFTRequest"]]) -> None:
         """N-member adapter lists: ids must be unique — duplicate ids
@@ -236,6 +230,12 @@ class Processor:
         if len(set(ids)) != len(ids):
             raise ValueError(
                 f"reft_requests carries duplicate reft_int_ids: {ids}")
+
+    def _validate_decode_lora(
+            self, lora_request: Optional[LoRARequest],
+            decode_lora_request: Optional[LoRARequest]) -> None:
+        if decode_lora_request is None:
+            return
 
         self._validate_lora(decode_lora_request)
 
