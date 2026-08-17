@@ -18,9 +18,9 @@ import torch.nn as nn
 
 from vllm.adaptation import (PhaseInfo, get_position_mask,
                              position_active_in_decode)
-from vllm.reft.layer import (_add_adapter_to_layer, _init_multi_reft_state,
-                             _multi_reft_forward,
-                             update_multi_reft_position_masks)
+from vllm.adapter.layer import (_add_adapter_to_layer, _init_multi_adapter_state,
+                             _multi_adapter_forward,
+                             update_adapter_position_masks)
 
 HIDDEN = 8
 
@@ -121,12 +121,12 @@ class TestEveryKServing:
 
     def test_every_k_adapter_in_forward(self):
         layer = nn.Module()
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
         _add_adapter_to_layer(layer, 1, ConstAdapter(0.5), "every_2",
                               torch.device("cpu"))
         token_ids = torch.ones(6, dtype=torch.int32)
         positions = torch.arange(6)
-        update_multi_reft_position_masks([layer], token_ids, positions,
+        update_adapter_position_masks([layer], token_ids, positions,
                                          _meta(6, 0, 1), 6)
         hidden = torch.ones(6, HIDDEN)
         residual = torch.ones(6, HIDDEN)
@@ -134,7 +134,7 @@ class TestEveryKServing:
         def super_forward(positions, hidden_states, residual):
             return hidden_states, residual
 
-        h, r = _multi_reft_forward(layer, positions, hidden, residual,
+        h, r = _multi_adapter_forward(layer, positions, hidden, residual,
                                    super_forward=super_forward)
         stream = h + r
         expected = torch.tensor([2.5, 2.0, 2.5, 2.0, 2.5, 2.0])
@@ -143,22 +143,22 @@ class TestEveryKServing:
 
     def test_every_k_not_skipped_on_pure_decode(self):
         layer = nn.Module()
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
         _add_adapter_to_layer(layer, 1, ConstAdapter(0.5), "every_4",
                               torch.device("cpu"))
         token_ids = torch.ones(2, dtype=torch.int32)
         positions = torch.tensor([8, 13])
-        update_multi_reft_position_masks([layer], token_ids, positions,
+        update_adapter_position_masks([layer], token_ids, positions,
                                          _meta(0, 2, 0), 2)
-        assert not layer._reft_all_masks_zero
-        assert layer._reft_combined_masks[1][:2].tolist() == [1, 0]
+        assert not layer._adapter_all_masks_zero
+        assert layer._adapter_combined_masks[1][:2].tolist() == [1, 0]
 
     def test_every_k_paired_with_prefill_adapter(self):
         # Prefill adapter on slot 0, every_3 adapter on the decode slot:
         # during decode, the every_3 adapter fires only on matching
         # positions.
         layer = nn.Module()
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
         _add_adapter_to_layer(layer, 1, ConstAdapter(0.5), "prefill",
                               torch.device("cpu"))
         _add_adapter_to_layer(layer, 2, ConstAdapter(0.25), "every_3",
@@ -166,8 +166,8 @@ class TestEveryKServing:
         primary = torch.tensor([1, 1], dtype=torch.int32)
         decode_slot = torch.tensor([2, 2], dtype=torch.int32)
         positions = torch.tensor([6, 7])  # decode steps; 6 % 3 == 0
-        update_multi_reft_position_masks([layer], primary, positions,
+        update_adapter_position_masks([layer], primary, positions,
                                          _meta(0, 2, 0), 2,
-                                         decode_token_reft_ids=decode_slot)
-        assert layer._reft_combined_masks[2][:2].tolist() == [1, 0]
-        assert 1 not in layer._reft_active_ids
+                                         decode_token_adapter_ids=decode_slot)
+        assert layer._adapter_combined_masks[2][:2].tolist() == [1, 0]
+        assert 1 not in layer._adapter_active_ids

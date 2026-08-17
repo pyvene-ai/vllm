@@ -599,10 +599,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
-                reft_request=new_req_data.reft_request,
+                adapter_request=new_req_data.adapter_request,
                 decode_lora_request=new_req_data.decode_lora_request,
-                decode_reft_request=new_req_data.decode_reft_request,
-                reft_requests=new_req_data.reft_requests,
+                decode_adapter_request=new_req_data.decode_adapter_request,
+                adapter_requests=new_req_data.adapter_requests,
             )
             self.requests[req_id] = req_state
 
@@ -2286,34 +2286,34 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if ubatch_slices is not None:
             num_input_tokens = ubatch_slices[0].num_tokens
 
-        # Update ReFT position masks before the forward pass.
+        # Update adapter position masks before the forward pass.
         # This runs outside compilation / CUDA graphs so Python
         # control flow is fine.  The masks are written into fixed-
         # address buffers that the compiled forward reads.
         # Use num_scheduled_tokens (actual, not padded) for the mask.
-        if self._reft_layers:
-            from vllm.reft.layer import update_multi_reft_position_masks
+        if self._adapter_layers:
+            from vllm.adapter.layer import update_adapter_position_masks
             actual_positions = positions[:num_scheduled_tokens]
             # Build per-token adapter ID mappings from InputBatch
             # (one array per populated member slot).
-            slot_reft_np = (
-                self.input_batch.make_reft_inputs(num_scheduled_tokens_np))
-            slot_reft_ids = [torch.from_numpy(a).to(self.device)
-                             for a in slot_reft_np]
-            token_reft_ids = slot_reft_ids[0]
-            extra_token_reft_ids = slot_reft_ids[1:]
-            # Backward compat: when reft_config= bakes in adapter id=1
-            # at construction time, users don't pass ReFTRequest so all
+            slot_adapter_np = (
+                self.input_batch.make_adapter_inputs(num_scheduled_tokens_np))
+            slot_adapter_ids = [torch.from_numpy(a).to(self.device)
+                             for a in slot_adapter_np]
+            token_adapter_ids = slot_adapter_ids[0]
+            extra_token_adapter_ids = slot_adapter_ids[1:]
+            # Backward compat: when adapter_config= bakes in adapter id=1
+            # at construction time, users don't pass AdapterRequest so all
             # token IDs are 0.  Default those to 1 so the adapter fires.
-            if self._reft_builtin_adapter:
-                token_reft_ids[token_reft_ids == 0] = 1
+            if self._adapter_builtin_adapter:
+                token_adapter_ids[token_adapter_ids == 0] = 1
             # Ensure all adapters needed for this batch are on GPU.
-            if self.reft_manager is not None:
+            if self.adapter_manager is not None:
                 batch_ids = set()
-                for t in slot_reft_ids:
+                for t in slot_adapter_ids:
                     batch_ids |= set(t.unique().tolist())
                 batch_ids -= {0}
-                self.reft_manager.ensure_active(batch_ids)
+                self.adapter_manager.ensure_active(batch_ids)
             cudagraphs_enabled = (self.compilation_config.cudagraph_mode
                                   is not None
                                   and self.compilation_config.cudagraph_mode
@@ -2325,10 +2325,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             prompt_lens = torch.from_numpy(
                 self.input_batch.num_prompt_tokens[:num_reqs].copy()).to(
                     self.device)
-            update_multi_reft_position_masks(
-                self._reft_layers, token_reft_ids, actual_positions,
+            update_adapter_position_masks(
+                self._adapter_layers, token_adapter_ids, actual_positions,
                 attn_metadata, num_scheduled_tokens,
-                extra_token_reft_ids=extra_token_reft_ids,
+                extra_token_adapter_ids=extra_token_adapter_ids,
                 # Gather/scatter uses dynamic member counts, which CUDA
                 # graph replay cannot represent — eager mode only.
                 use_gather=self.vllm_config.model_config.enforce_eager,
@@ -2710,35 +2710,35 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     time_after_load - time_before_load)
         prepare_communication_buffer_for_model(self.model)
 
-        # Discover ReFT layers for position mask updates.
-        self._reft_layers: list[nn.Module] = []
+        # Discover adapter layers for position mask updates.
+        self._adapter_layers: list[nn.Module] = []
         for module in self.model.modules():
-            if hasattr(module, "reft_adapters"):
-                self._reft_layers.append(module)
+            if hasattr(module, "served_adapters"):
+                self._adapter_layers.append(module)
         # If a single adapter (id=1) was baked in at construction time
-        # (via reft_config= or set_reft_spec()), users won't pass
-        # ReFTRequest per request.  Default untagged tokens to id=1 so
+        # (via adapter_config= or set_adapter_spec()), users won't pass
+        # AdapterRequest per request.  Default untagged tokens to id=1 so
         # the adapter fires.  Detect by checking if adapter "1" exists
         # on any layer — works for both the VllmConfig path and the
         # deprecated global-state path used by TRL training hooks.
-        self._reft_builtin_adapter = any(
-            "1" in layer.reft_adapters for layer in self._reft_layers
+        self._adapter_builtin_adapter = any(
+            "1" in layer.served_adapters for layer in self._adapter_layers
         )
-        # Instantiate centralized ReFT adapter manager with LRU eviction.
-        self.reft_manager: Optional["ReFTModelManager"] = None
-        if self.vllm_config.enable_reft and self._reft_layers:
-            from vllm.reft.models import ReFTModelManager
-            self.reft_manager = ReFTModelManager(
-                reft_layers=self._reft_layers,
-                max_refts=self.vllm_config.max_refts,
-                max_cpu_refts=self.vllm_config.max_cpu_refts,
+        # Instantiate centralized adapter manager with LRU eviction.
+        self.adapter_manager: Optional["AdapterManager"] = None
+        if self.vllm_config.enable_adapters and self._adapter_layers:
+            from vllm.adapter.models import AdapterManager
+            self.adapter_manager = AdapterManager(
+                adapter_layers=self._adapter_layers,
+                max_adapters=self.vllm_config.max_adapters,
+                max_cpu_adapters=self.vllm_config.max_cpu_adapters,
                 device=self.device,
             )
-        if self._reft_layers:
-            logger.info("[ReFT] Found %d ReFT layers for multi-adapter "
+        if self._adapter_layers:
+            logger.info("[adapter] Found %d adapter layers for multi-adapter "
                         "position masking (builtin_adapter=%s, manager=%s)",
-                        len(self._reft_layers), self._reft_builtin_adapter,
-                        self.reft_manager is not None)
+                        len(self._adapter_layers), self._adapter_builtin_adapter,
+                        self.adapter_manager is not None)
 
         self.is_multimodal_pruning_enabled = (supports_multimodal_pruning(
             self.model) and self.model_config.multimodal_config.

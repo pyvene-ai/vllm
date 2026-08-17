@@ -13,7 +13,7 @@ where ``positions`` is the per-token position-id tensor for the batch,
 split, and the return value is a per-token float mask of shape
 ``(num_tokens,)`` — or ``None`` for "apply unconditionally".
 
-Builtins mirror the historical ReFT position strings: ``all``,
+Builtins mirror the historical adapter position strings: ``all``,
 ``all_tokens``, ``prefill``, ``decode``, ``first``, ``last``.  Custom
 adaptations register their own with :func:`register_position_mask`.
 """

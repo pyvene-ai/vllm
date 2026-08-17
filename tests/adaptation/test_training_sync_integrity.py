@@ -23,7 +23,7 @@ import torch.nn as nn
 
 from vllm.compilation import monitor
 from vllm.compilation.cuda_graph import _cudagraph_wrappers
-from vllm.reft.layer import _add_adapter_to_layer, _init_multi_reft_state
+from vllm.adapter.layer import _add_adapter_to_layer, _init_multi_adapter_state
 from vllm.worker.worker_base import WorkerBase
 
 from .test_cudagraph_invalidation import FakeWrapper
@@ -32,7 +32,7 @@ HIDDEN = 8
 RANK = 4
 
 
-class RealisticReftAdapter(nn.Module):
+class RealisticStreamAdapter(nn.Module):
     """Mimics the adapters library RotateAdapter cache protocol:
 
     - trainable params (rotate_layer.weight, learned_source),
@@ -62,17 +62,17 @@ def _make_model(num_layers=2):
     layers = []
     for i in range(num_layers):
         layer = nn.Module()
-        layer._reft_layer_idx = i
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
-        _add_adapter_to_layer(layer, 1, RealisticReftAdapter(), "prefill",
+        layer._adapter_layer_idx = i
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
+        _add_adapter_to_layer(layer, 1, RealisticStreamAdapter(), "prefill",
                               torch.device("cpu"))
-        layer.reft_adapters["1"].install_inference_caches()
+        layer.served_adapters["1"].install_inference_caches()
         layers.append(layer)
     model = SimpleNamespace(model=SimpleNamespace(layers=layers))
     worker = SimpleNamespace(get_model=lambda: model)
-    worker.refresh_reft_caches = (
-        lambda reft_int_id=None: WorkerBase.refresh_reft_caches(
-            worker, reft_int_id))
+    worker.refresh_adapter_caches = (
+        lambda adapter_int_id=None: WorkerBase.refresh_adapter_caches(
+            worker, adapter_int_id))
     return worker, layers
 
 
@@ -90,18 +90,18 @@ class TestInPlaceness:
 
     def test_param_and_cache_addresses_stable_across_sync(self):
         worker, layers = _make_model()
-        adapter = layers[0].reft_adapters["1"]
+        adapter = layers[0].served_adapters["1"]
         ptrs_before = {
             name: p.data_ptr()
             for name, p in adapter.named_parameters()
         }
         cache_ptr_before = adapter._R_cache.data_ptr()
 
-        WorkerBase.sync_reft_weights(worker,
+        WorkerBase.sync_adapter_weights(worker,
                                      {0: _training_state_dict(0.25),
                                       1: _training_state_dict(0.25)},
                                      refresh_caches=True,
-                                     reft_int_id=1)
+                                     adapter_int_id=1)
 
         for name, p in adapter.named_parameters():
             assert p.data_ptr() == ptrs_before[name], \
@@ -111,48 +111,48 @@ class TestInPlaceness:
 
     def test_caches_hold_new_weights_after_sync(self):
         worker, layers = _make_model()
-        WorkerBase.sync_reft_weights(worker,
+        WorkerBase.sync_adapter_weights(worker,
                                      {0: _training_state_dict(0.5),
                                       1: _training_state_dict(0.5)},
                                      refresh_caches=True,
-                                     reft_int_id=1)
+                                     adapter_int_id=1)
         for layer in layers:
-            adapter = layer.reft_adapters["1"]
+            adapter = layer.served_adapters["1"]
             assert torch.all(adapter._R_cache == 0.5), \
                 "inference cache is stale after weight sync"
 
     def test_stale_cache_without_refresh(self):
         # refresh_caches=False (TRL's step-time call) intentionally
-        # leaves caches stale; the follow-up refresh_reft_caches RPC
+        # leaves caches stale; the follow-up refresh_adapter_caches RPC
         # must fix them.
         worker, layers = _make_model()
-        WorkerBase.sync_reft_weights(worker,
+        WorkerBase.sync_adapter_weights(worker,
                                      {0: _training_state_dict(0.5),
                                       1: _training_state_dict(0.5)},
                                      refresh_caches=False,
-                                     reft_int_id=1)
-        adapter = layers[0].reft_adapters["1"]
+                                     adapter_int_id=1)
+        adapter = layers[0].served_adapters["1"]
         assert not torch.all(adapter._R_cache == 0.5)
-        WorkerBase.refresh_reft_caches(worker)
+        WorkerBase.refresh_adapter_caches(worker)
         assert torch.all(adapter._R_cache == 0.5)
 
     def test_training_state_dict_without_cache_keys_loads(self):
         # Non-persistent caches must not make strict load fail.
         worker, layers = _make_model()
-        count = WorkerBase.sync_reft_weights(worker,
+        count = WorkerBase.sync_adapter_weights(worker,
                                             {0: _training_state_dict(0.1)},
                                             refresh_caches=True,
-                                            reft_int_id=1)
+                                            adapter_int_id=1)
         assert count == 1
 
     def test_delta_uses_new_weights(self):
         worker, layers = _make_model()
-        WorkerBase.sync_reft_weights(worker,
+        WorkerBase.sync_adapter_weights(worker,
                                      {0: _training_state_dict(0.5),
                                       1: _training_state_dict(0.5)},
                                      refresh_caches=True,
-                                     reft_int_id=1)
-        adapter = layers[0].reft_adapters["1"]
+                                     adapter_int_id=1)
+        adapter = layers[0].served_adapters["1"]
         h = torch.ones(1, 3, HIDDEN)
         delta = adapter._compute_delta(h)
         # source = 0.5*8 + 0.5 = 4.5 per rank dim; delta = source @ R
@@ -162,17 +162,17 @@ class TestInPlaceness:
 
 class TestSyncDoesNotInvalidateGraphs:
 
-    def test_reft_sync_leaves_graphs_captured(self):
+    def test_adapter_sync_leaves_graphs_captured(self):
         worker, _ = _make_model()
         w = FakeWrapper(2)
         _cudagraph_wrappers.add(w)
         saved_flag = monitor.cudagraph_capturing_enabled
         try:
             monitor.cudagraph_capturing_enabled = False
-            WorkerBase.sync_reft_weights(worker,
+            WorkerBase.sync_adapter_weights(worker,
                                          {0: _training_state_dict(0.5)},
                                          refresh_caches=True,
-                                         reft_int_id=1)
+                                         adapter_int_id=1)
             # In-place update: graphs stay valid, no re-capture allowed.
             assert len(w.concrete_cudagraph_entries) == 2
             assert monitor.cudagraph_capturing_enabled is False

@@ -248,7 +248,7 @@ class FlashInferMetadata:
     paged_kv_indptr_gpu: Optional[torch.Tensor] = None
 
     # Per-request query start locations (all requests, decode + prefill).
-    # Stored for use by ReFT position masking under chunked prefill.
+    # Stored for use by adapter position masking under chunked prefill.
     query_start_loc: Optional[torch.Tensor] = None
 
 

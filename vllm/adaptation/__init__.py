@@ -4,10 +4,10 @@
 
 This package is the extension surface for custom "adaptations":
 arbitrary per-token computations mounted at named points of the model
-and restricted to named token positions (phases).  The ReFT serving
-machinery in :mod:`vllm.reft` is one consumer; anything satisfying the
+and restricted to named token positions (phases).  The adapter serving
+machinery in :mod:`vllm.adapter` is one consumer; anything satisfying the
 protocol below can be served through the same request plumbing
-(``reft_request`` / ``decode_reft_request``), LRU manager, and
+(``adapter_request`` / ``decode_adapter_request``), LRU manager, and
 training-time weight sync.
 
 The adaptation contract (duck-typed; no base class required)
@@ -15,7 +15,7 @@ The adaptation contract (duck-typed; no base class required)
 An adaptation is an ``nn.Module`` that provides ONE of:
 
   - ``_compute_delta(h) -> delta`` — additive blend (default):
-    ``h' = h + mask * delta``.  All existing pyreft adapters use this.
+    ``h' = h + mask * delta``.  All existing pyadapter adapters use this.
   - ``apply_masked(h, mask) -> h'`` — full control of how the masked
     computation combines with the stream (replacement, gating, ...).
     ``mask`` is a per-token float tensor of shape ``(num_tokens,)``.

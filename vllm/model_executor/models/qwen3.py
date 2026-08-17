@@ -255,10 +255,10 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen3Model(Qwen2Model):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        from vllm.reft.layer import maybe_reft_layer_type
+        from vllm.adapter.layer import maybe_adapter_layer_type
         super().__init__(vllm_config=vllm_config,
                          prefix=prefix,
-                         decoder_layer_type=maybe_reft_layer_type(
+                         decoder_layer_type=maybe_adapter_layer_type(
                              vllm_config, Qwen3DecoderLayer, arch="qwen3"))
 
 

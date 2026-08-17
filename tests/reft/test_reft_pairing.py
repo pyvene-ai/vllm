@@ -12,9 +12,9 @@ masks inside the layers then restrict each adapter to its own phase.
 import numpy as np
 import torch
 
-from vllm.reft.layer import (_add_adapter_to_layer, _init_multi_reft_state,
+from vllm.adaptation.layer import (_add_adapter_to_layer, _init_multi_reft_state,
                              update_multi_reft_position_masks)
-from vllm.reft.request import ReFTRequest
+from vllm.adaptation.request import ReFTRequest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 

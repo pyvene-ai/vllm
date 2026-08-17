@@ -271,14 +271,14 @@ class DefaultModelLoader(BaseModelLoader):
         # We only enable strict check for non-quantized models
         # that have loaded weights tracking currently.
         if model_config.quantization is None and loaded_weights is not None:
-            # Construction-baked ReFT adapter params carry their weights
-            # from the blueprint (and are refreshed via sync_reft_weights)
+            # Construction-baked adapter params carry their weights
+            # from the blueprint (and are refreshed via sync_adapter_weights)
             # — they are never in the HF checkpoint. Exempt them here,
             # generically, so every hooked architecture passes the audit
             # (per-model load_weights marks exist only in llama/qwen2).
             loaded_weights = loaded_weights | {
                 name for name in weights_to_load
-                if ".reft_adapter." in name or ".reft_adapters." in name
+                if ".adapter_adapter." in name or ".served_adapters." in name
             }
             weights_not_loaded = weights_to_load - loaded_weights
             if weights_not_loaded:

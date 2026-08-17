@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.lora.request import LoRARequest
-from vllm.reft.request import ReFTRequest
+from vllm.adaptation.request import ReFTRequest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.core.sched.scheduler import (_request_lora_ids,

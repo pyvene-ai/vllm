@@ -11,7 +11,7 @@ import torch
 
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
-from vllm.reft.request import ReFTRequest
+from vllm.adapter.request import AdapterRequest
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import SchedulerStats
@@ -55,20 +55,20 @@ class EngineCoreRequest(
     eos_token_id: Optional[int]
     arrival_time: float
     lora_request: Optional[LoRARequest]
-    reft_request: Optional[ReFTRequest]
+    adapter_request: Optional[AdapterRequest]
     cache_salt: Optional[str]
     data_parallel_rank: Optional[int]
     prompt_embeds: Optional[torch.Tensor] = None
     # Optional decode-phase-only adapters, paired with a prefill-only
-    # lora_request/reft_request on the same prompt.
+    # lora_request/adapter_request on the same prompt.
     decode_lora_request: Optional[LoRARequest] = None
-    decode_reft_request: Optional[ReFTRequest] = None
+    decode_adapter_request: Optional[AdapterRequest] = None
 
     # N-member adapter list (v3): supersedes the two slots above. When
     # set, it is the COMPLETE member list for the request; the legacy
     # two fields are ignored. Appended last to preserve msgspec
     # array_like wire order.
-    reft_requests: Optional[list[ReFTRequest]] = None
+    adapter_requests: Optional[list[AdapterRequest]] = None
 
     # Index of the client, used to ensure outputs are sent back to the same
     # client for this request when scaling out the front-end.

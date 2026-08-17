@@ -1,8 +1,8 @@
-"""vllm.reft.layer – CUDA-graph-compatible ReFT decoder layer factories.
+"""vllm.adapter.layer – CUDA-graph-compatible adapter decoder layer factories.
 
 Overview
 --------
-For GRPO training we need vLLM to apply the ReFT adapter delta during
+For GRPO training we need vLLM to apply the adapter delta during
 inference (prefill) while staying on-policy with the HF training model.
 
 This module provides two things:
@@ -11,12 +11,12 @@ This module provides two things:
      identical logic to the ones in the repo's local vllm_config/, but now
      living inside the fork so callers don't need to import project internals.
 
-  2. Layer factory functions (make_reft_qwen2_layer, make_reft_llama_layer) –
+  2. Layer factory functions (make_adapter_qwen2_layer, make_adapter_llama_layer) –
      return nn.Module *classes* (not instances) that subclass the standard
      vLLM decoder layer and run the adapter delta in their forward pass.
 
 The factories are called by Qwen2ForCausalLM / LlamaForCausalLM when a
-``_reft_spec`` is present (see vllm.reft.__init__ for the thread-local API).
+``_adapter_spec`` is present (see vllm.adapter.__init__ for the thread-local API).
 
 CUDA-graph safety
 -----------------
@@ -46,18 +46,18 @@ import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
-_reft_mask_debug_counts: dict[tuple[str, int, str, str], int] = {}
-_reft_init_debug_count = 0
-_reft_nan_check: Optional[bool] = None
+_adapter_mask_debug_counts: dict[tuple[str, int, str, str], int] = {}
+_adapter_init_debug_count = 0
+_adapter_nan_check: Optional[bool] = None
 
 
 def _nan_check_enabled() -> bool:
-    """Return True if VLLM_REFT_NAN_CHECK=1 is set (cached after first call)."""
-    global _reft_nan_check
-    if _reft_nan_check is None:
-        _reft_nan_check = os.environ.get(
-            "VLLM_REFT_NAN_CHECK", "").lower() in {"1", "true", "yes"}
-    return _reft_nan_check
+    """Return True if VLLM_ADAPTER_NAN_CHECK=1 is set (cached after first call)."""
+    global _adapter_nan_check
+    if _adapter_nan_check is None:
+        _adapter_nan_check = os.environ.get(
+            "VLLM_ADAPTER_NAN_CHECK", "").lower() in {"1", "true", "yes"}
+    return _adapter_nan_check
 
 
 def _check_nan(tensor: torch.Tensor, label: str, layer_idx: int) -> bool:
@@ -75,7 +75,7 @@ def _check_nan(tensor: torch.Tensor, label: str, layer_idx: int) -> bool:
         num_inf = torch.isinf(tensor).sum().item()
         total = tensor.numel()
         logger.error(
-            "[ReFT NaN check] layer=%d label=%s has_nan=%s has_inf=%s "
+            "[adapter NaN check] layer=%d label=%s has_nan=%s has_inf=%s "
             "num_nan=%d num_inf=%d total=%d shape=%s dtype=%s "
             "abs_max=%.6g abs_mean=%.6g",
             layer_idx, label, has_nan, has_inf,
@@ -89,8 +89,8 @@ def _check_nan(tensor: torch.Tensor, label: str, layer_idx: int) -> bool:
     return False
 
 
-def _reft_mask_debug_enabled() -> bool:
-    return os.environ.get("VLLM_REFT_DEBUG_MASK", "").lower() in {
+def _adapter_mask_debug_enabled() -> bool:
+    return os.environ.get("VLLM_ADAPTER_DEBUG_MASK", "").lower() in {
         "1",
         "true",
         "yes",
@@ -98,11 +98,11 @@ def _reft_mask_debug_enabled() -> bool:
     }
 
 
-def _reft_mask_debug_limit() -> int:
-    return int(os.environ.get("VLLM_REFT_DEBUG_LIMIT", "12"))
+def _adapter_mask_debug_limit() -> int:
+    return int(os.environ.get("VLLM_ADAPTER_DEBUG_LIMIT", "12"))
 
 
-def _maybe_log_reft_layer_init(
+def _maybe_log_adapter_layer_init(
     *,
     arch: str,
     layer_idx: int,
@@ -111,20 +111,20 @@ def _maybe_log_reft_layer_init(
     position: str,
     adapter: Optional[nn.Module],
 ) -> None:
-    """Emit a small construction-time log for ReFT-aware decoder layers."""
-    global _reft_init_debug_count
+    """Emit a small construction-time log for adapter-aware decoder layers."""
+    global _adapter_init_debug_count
 
-    if not (debug_enabled or _reft_mask_debug_enabled()):
+    if not (debug_enabled or _adapter_mask_debug_enabled()):
         return
 
-    limit = int(os.environ.get("VLLM_REFT_DEBUG_INIT_LIMIT", "64"))
-    if _reft_init_debug_count >= limit:
+    limit = int(os.environ.get("VLLM_ADAPTER_DEBUG_INIT_LIMIT", "64"))
+    if _adapter_init_debug_count >= limit:
         return
-    _reft_init_debug_count += 1
+    _adapter_init_debug_count += 1
 
     adapter_type = type(adapter).__name__ if adapter is not None else None
     logger.info(
-        "[ReFT-vLLM init debug] arch=%s layer=%d attached=%s debug_enabled=%s "
+        "[adapter-vLLM init debug] arch=%s layer=%d attached=%s debug_enabled=%s "
         "position=%s adapter_type=%s",
         arch,
         layer_idx,
@@ -139,7 +139,7 @@ def _maybe_log_reft_layer_init(
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Graph-safe cache helpers (mirrors vllm_config/vllm_reft_layer.py)
+# Graph-safe cache helpers (mirrors vllm_config/vllm_adapter_layer.py)
 # ---------------------------------------------------------------------------
 
 def _install_adapter_caches(adapter: nn.Module,
@@ -300,7 +300,7 @@ def _apply_position_mask(
     num_tokens: int,
     attn_metadata,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Apply the ReFT position mask to *delta* and return ``(delta, mask)``."""
+    """Apply the adapter position mask to *delta* and return ``(delta, mask)``."""
     mask = _compute_position_mask(positions, position, dtype, num_tokens, attn_metadata)
     if mask is None:
         return delta, None
@@ -315,10 +315,10 @@ def _apply_position_mask(
 # from baking in stale adapter weights — after sync_weights() updates the
 # adapter parameters, the custom op always uses the current weights.
 
-_REFT_ADAPTER_REGISTRY: dict[int, nn.Module] = {}
+_LEGACY_ADAPTER_REGISTRY: dict[int, nn.Module] = {}
 
 
-def _reft_apply_adapter_op(
+def _adapter_apply_adapter_op(
     h_full: torch.Tensor,
     positions: torch.Tensor,
     position: str,
@@ -326,11 +326,11 @@ def _reft_apply_adapter_op(
     layer_idx: int,
 ) -> torch.Tensor:
     """Compute adapter delta and apply position mask (runs eagerly)."""
-    # CUDA graph capture is decode-only; ReFT is a no-op for decode tokens.
+    # CUDA graph capture is decode-only; adapter is a no-op for decode tokens.
     if torch.cuda.is_current_stream_capturing():
         return torch.zeros_like(h_full)
 
-    adapter = _REFT_ADAPTER_REGISTRY.get(layer_idx)
+    adapter = _LEGACY_ADAPTER_REGISTRY.get(layer_idx)
     if adapter is None:
         return torch.zeros_like(h_full)
 
@@ -390,7 +390,7 @@ def _reft_apply_adapter_op(
     return delta
 
 
-def _reft_apply_adapter_fake(
+def _adapter_apply_adapter_fake(
     h_full: torch.Tensor,
     positions: torch.Tensor,
     position: str,
@@ -400,11 +400,11 @@ def _reft_apply_adapter_fake(
     return torch.empty_like(h_full).contiguous()
 
 
-# NOTE: The reft_apply_adapter custom op was removed.  Position masking
+# NOTE: The adapter_apply_adapter custom op was removed.  Position masking
 # now uses a pre-computed buffer updated by the model runner before each
 # forward pass.  The adapter's _compute_delta runs inline in the compiled
 # forward — no splitting ops, no graph breaks.
-_REFT_CUSTOM_OP_AVAILABLE = False
+_LEGACY_CUSTOM_OP_AVAILABLE = False
 
 
 def _maybe_log_mask_debug(
@@ -416,8 +416,8 @@ def _maybe_log_mask_debug(
     mask: Optional[torch.Tensor],
     attn_metadata,
 ) -> None:
-    """Log how many tokens receive a nonzero ReFT mask in eager mode."""
-    if not _reft_mask_debug_enabled():
+    """Log how many tokens receive a nonzero adapter mask in eager mode."""
+    if not _adapter_mask_debug_enabled():
         return
     if hasattr(torch, "compiler") and torch.compiler.is_compiling():
         return
@@ -448,14 +448,14 @@ def _maybe_log_mask_debug(
         phase = "decode"
 
     key = (arch, layer_idx, position, phase)
-    count = _reft_mask_debug_counts.get(key, 0)
-    if count >= _reft_mask_debug_limit():
+    count = _adapter_mask_debug_counts.get(key, 0)
+    if count >= _adapter_mask_debug_limit():
         return
-    _reft_mask_debug_counts[key] = count + 1
+    _adapter_mask_debug_counts[key] = count + 1
 
     positions_head = positions[: min(8, num_tokens)].detach().cpu().tolist()
     logger.info(
-        "[ReFT-vLLM mask debug] arch=%s layer=%d position=%s phase=%s "
+        "[adapter-vLLM mask debug] arch=%s layer=%d position=%s phase=%s "
         "masked_tokens=%d total_tokens=%d prefill_tokens=%d decode_tokens=%d "
         "positions_head=%s",
         arch,
@@ -471,10 +471,10 @@ def _maybe_log_mask_debug(
 
 
 _CAPTURE_MAX_TOKENS = 2048  # pre-allocated buffer size
-_REFT_MASK_FALLBACK_SIZE = 131072  # fallback if model runner doesn't init
+_MASK_FALLBACK_SIZE = 131072  # fallback if model runner doesn't init
 
 
-def _init_reft_position_mask_buffer(module: nn.Module,
+def _init_adapter_position_mask_buffer(module: nn.Module,
                                     max_tokens: int,
                                     device: torch.device) -> None:
     """Pre-allocate the position mask buffer used by the compiled forward.
@@ -483,22 +483,22 @@ def _init_reft_position_mask_buffer(module: nn.Module,
     values after .copy_() / .fill_() calls.  The model runner updates it
     before each forward pass.
     """
-    if hasattr(module, "_reft_position_mask"):
+    if hasattr(module, "_adapter_position_mask"):
         return
     module.register_buffer(
-        "_reft_position_mask",
+        "_adapter_position_mask",
         torch.zeros(max_tokens, dtype=torch.float32, device=device),
         persistent=False,
     )
 
 
-def update_reft_position_masks(
-    reft_layers: list[nn.Module],
+def update_single_adapter_position_masks(
+    adapter_layers: list[nn.Module],
     positions: torch.Tensor,
     attn_metadata,
     num_tokens: int,
 ) -> None:
-    """Compute and store ReFT position masks on each layer's buffer.
+    """Compute and store adapter position masks on each layer's buffer.
 
     Called from the model runner (not compiled) before each model forward.
     Uses the existing ``_compute_position_mask`` logic which handles all
@@ -507,13 +507,13 @@ def update_reft_position_masks(
     Groups layers by position so each unique mask is computed only once
     (avoids 23 redundant GPU→CPU syncs for a 24-layer model).
     """
-    if not reft_layers:
+    if not adapter_layers:
         return
 
     # Group layers by position string.
     by_position: dict[str, list[nn.Module]] = {}
-    for layer in reft_layers:
-        pos = getattr(layer, "_reft_position", "prefill")
+    for layer in adapter_layers:
+        pos = getattr(layer, "_adapter_position", "prefill")
         by_position.setdefault(pos, []).append(layer)
 
     for pos, layers in by_position.items():
@@ -524,7 +524,7 @@ def update_reft_position_masks(
                 positions, pos, torch.float32, num_tokens, attn_metadata)
 
         for layer in layers:
-            buf = getattr(layer, "_reft_position_mask", None)
+            buf = getattr(layer, "_adapter_position_mask", None)
             if buf is None:
                 continue
             if mask is None:
@@ -536,7 +536,7 @@ def update_reft_position_masks(
             buf[num_tokens:].zero_()
 
 
-def _init_reft_capture_buffers(module: nn.Module, hidden_size: int,
+def _init_adapter_capture_buffers(module: nn.Module, hidden_size: int,
                                device: torch.device) -> None:
     """Pre-allocate buffers for per-token h_full/delta capture.
 
@@ -544,36 +544,36 @@ def _init_reft_capture_buffers(module: nn.Module, hidden_size: int,
     buffer and track the actual token count separately.  All operations
     are pure tensor ops, fully compatible with TorchDynamo/CUDA graphs.
     """
-    if hasattr(module, "_reft_cap_h"):
+    if hasattr(module, "_adapter_cap_h"):
         return
     M = _CAPTURE_MAX_TOKENS
     H = hidden_size
     # Full per-token captures
     module.register_buffer(
-        "_reft_cap_h", torch.zeros(M, H, dtype=torch.float32,
+        "_adapter_cap_h", torch.zeros(M, H, dtype=torch.float32,
                                    device=device), persistent=False)
     module.register_buffer(
-        "_reft_cap_delta", torch.zeros(M, H, dtype=torch.float32,
+        "_adapter_cap_delta", torch.zeros(M, H, dtype=torch.float32,
                                        device=device), persistent=False)
     # Per-token norms (1-D, one per token position)
     module.register_buffer(
-        "_reft_cap_h_norms", torch.zeros(M, dtype=torch.float32,
+        "_adapter_cap_h_norms", torch.zeros(M, dtype=torch.float32,
                                          device=device), persistent=False)
     module.register_buffer(
-        "_reft_cap_delta_norms", torch.zeros(M, dtype=torch.float32,
+        "_adapter_cap_delta_norms", torch.zeros(M, dtype=torch.float32,
                                              device=device), persistent=False)
     # Scalar aggregates
     module.register_buffer(
-        "_reft_cap_num_tokens", torch.zeros((), dtype=torch.int64,
+        "_adapter_cap_num_tokens", torch.zeros((), dtype=torch.int64,
                                             device=device), persistent=False)
     module.register_buffer(
-        "_reft_cap_delta_abs_max", torch.zeros((), dtype=torch.float32,
+        "_adapter_cap_delta_abs_max", torch.zeros((), dtype=torch.float32,
                                                device=device), persistent=False)
     module.register_buffer(
-        "_reft_cap_h_mean_norm", torch.zeros((), dtype=torch.float32,
+        "_adapter_cap_h_mean_norm", torch.zeros((), dtype=torch.float32,
                                              device=device), persistent=False)
     module.register_buffer(
-        "_reft_cap_delta_mean_norm", torch.zeros((), dtype=torch.float32,
+        "_adapter_cap_delta_mean_norm", torch.zeros((), dtype=torch.float32,
                                                  device=device), persistent=False)
 
 
@@ -592,7 +592,7 @@ def _capture_last_token(
     The buffers are fixed-size (CAPTURE_MAX_TOKENS x hidden_size).
     We write min(num_tokens, max) into the buffer and zero the rest.
     """
-    if not hasattr(module, "_reft_cap_h"):
+    if not hasattr(module, "_adapter_cap_h"):
         return
 
     M = _CAPTURE_MAX_TOKENS
@@ -601,32 +601,32 @@ def _capture_last_token(
 
     # Zero out then copy with implicit dtype cast — avoids allocating
     # temporary float32 tensors which break CUDA graph capture.
-    module._reft_cap_h.zero_()
-    module._reft_cap_delta.zero_()
-    module._reft_cap_h_norms.zero_()
-    module._reft_cap_delta_norms.zero_()
+    module._adapter_cap_h.zero_()
+    module._adapter_cap_delta.zero_()
+    module._adapter_cap_h_norms.zero_()
+    module._adapter_cap_delta_norms.zero_()
 
-    module._reft_cap_h[:write_n].copy_(h_full[:write_n].detach())
-    module._reft_cap_delta[:write_n].copy_(delta[:write_n].detach())
-    module._reft_cap_h_norms[:write_n].copy_(
-        module._reft_cap_h[:write_n].norm(dim=-1))
-    module._reft_cap_delta_norms[:write_n].copy_(
-        module._reft_cap_delta[:write_n].norm(dim=-1))
+    module._adapter_cap_h[:write_n].copy_(h_full[:write_n].detach())
+    module._adapter_cap_delta[:write_n].copy_(delta[:write_n].detach())
+    module._adapter_cap_h_norms[:write_n].copy_(
+        module._adapter_cap_h[:write_n].norm(dim=-1))
+    module._adapter_cap_delta_norms[:write_n].copy_(
+        module._adapter_cap_delta[:write_n].norm(dim=-1))
 
     # Store token count: zero then add n as a tensor to avoid SymInt in .fill_()
-    module._reft_cap_num_tokens.zero_()
-    module._reft_cap_num_tokens.add_(write_n)
-    module._reft_cap_delta_abs_max.copy_(
-        module._reft_cap_delta[:write_n].abs().amax())
-    module._reft_cap_h_mean_norm.copy_(
-        module._reft_cap_h[:write_n].norm(dim=-1).mean())
-    module._reft_cap_delta_mean_norm.copy_(
-        module._reft_cap_delta[:write_n].norm(dim=-1).mean())
+    module._adapter_cap_num_tokens.zero_()
+    module._adapter_cap_num_tokens.add_(write_n)
+    module._adapter_cap_delta_abs_max.copy_(
+        module._adapter_cap_delta[:write_n].abs().amax())
+    module._adapter_cap_h_mean_norm.copy_(
+        module._adapter_cap_h[:write_n].norm(dim=-1).mean())
+    module._adapter_cap_delta_mean_norm.copy_(
+        module._adapter_cap_delta[:write_n].norm(dim=-1).mean())
 
 
-def _init_reft_debug_buffers(module: nn.Module, device: torch.device) -> None:
+def _init_adapter_debug_buffers(module: nn.Module, device: torch.device) -> None:
     """Initialize non-persistent buffers used for compiled-path mask stats."""
-    if hasattr(module, "_reft_debug_total_tokens"):
+    if hasattr(module, "_adapter_debug_total_tokens"):
         return
 
     def _zero() -> torch.Tensor:
@@ -635,17 +635,17 @@ def _init_reft_debug_buffers(module: nn.Module, device: torch.device) -> None:
     def _zero_f() -> torch.Tensor:
         return torch.zeros((), dtype=torch.float32, device=device)
 
-    module.register_buffer("_reft_debug_total_tokens", _zero(), persistent=False)
-    module.register_buffer("_reft_debug_masked_tokens", _zero(), persistent=False)
-    module.register_buffer("_reft_debug_prefill_tokens", _zero(), persistent=False)
-    module.register_buffer("_reft_debug_decode_tokens", _zero(), persistent=False)
-    module.register_buffer("_reft_debug_prefill_calls", _zero(), persistent=False)
-    module.register_buffer("_reft_debug_decode_calls", _zero(), persistent=False)
-    module.register_buffer("_reft_debug_mixed_calls", _zero(), persistent=False)
-    module.register_buffer("_reft_debug_delta_l2_sum", _zero_f(), persistent=False)
-    module.register_buffer("_reft_debug_delta_abs_sum", _zero_f(), persistent=False)
-    module.register_buffer("_reft_debug_delta_abs_max", _zero_f(), persistent=False)
-    module.register_buffer("_reft_debug_hidden_l2_sum", _zero_f(), persistent=False)
+    module.register_buffer("_adapter_debug_total_tokens", _zero(), persistent=False)
+    module.register_buffer("_adapter_debug_masked_tokens", _zero(), persistent=False)
+    module.register_buffer("_adapter_debug_prefill_tokens", _zero(), persistent=False)
+    module.register_buffer("_adapter_debug_decode_tokens", _zero(), persistent=False)
+    module.register_buffer("_adapter_debug_prefill_calls", _zero(), persistent=False)
+    module.register_buffer("_adapter_debug_decode_calls", _zero(), persistent=False)
+    module.register_buffer("_adapter_debug_mixed_calls", _zero(), persistent=False)
+    module.register_buffer("_adapter_debug_delta_l2_sum", _zero_f(), persistent=False)
+    module.register_buffer("_adapter_debug_delta_abs_sum", _zero_f(), persistent=False)
+    module.register_buffer("_adapter_debug_delta_abs_max", _zero_f(), persistent=False)
+    module.register_buffer("_adapter_debug_hidden_l2_sum", _zero_f(), persistent=False)
 
 
 def _record_mask_debug_stats(
@@ -657,15 +657,15 @@ def _record_mask_debug_stats(
     positions: torch.Tensor,
     attn_metadata,
 ) -> None:
-    """Accumulate compiled-path-safe ReFT mask stats into layer buffers."""
-    debug_enabled = getattr(module, "_reft_debug_enabled", False) or _reft_mask_debug_enabled()
-    if not debug_enabled or not hasattr(module, "_reft_debug_total_tokens"):
+    """Accumulate compiled-path-safe adapter mask stats into layer buffers."""
+    debug_enabled = getattr(module, "_adapter_debug_enabled", False) or _adapter_mask_debug_enabled()
+    if not debug_enabled or not hasattr(module, "_adapter_debug_total_tokens"):
         return
 
     num_tokens_int = positions.shape[0]
     if num_tokens_int == 0:
         return
-    stats_device = module._reft_debug_total_tokens.device
+    stats_device = module._adapter_debug_total_tokens.device
     num_tokens = torch.tensor(num_tokens_int, dtype=torch.int64, device=stats_device)
 
     if mask is None:
@@ -686,75 +686,75 @@ def _record_mask_debug_stats(
     one = torch.ones((), dtype=torch.int64, device=stats_device)
     zero = torch.zeros((), dtype=torch.int64, device=stats_device)
 
-    module._reft_debug_total_tokens.add_(num_tokens)
-    module._reft_debug_masked_tokens.add_(masked_tokens)
-    module._reft_debug_prefill_tokens.add_(prefill_tokens)
-    module._reft_debug_decode_tokens.add_(decode_tokens)
-    module._reft_debug_prefill_calls.add_(
+    module._adapter_debug_total_tokens.add_(num_tokens)
+    module._adapter_debug_masked_tokens.add_(masked_tokens)
+    module._adapter_debug_prefill_tokens.add_(prefill_tokens)
+    module._adapter_debug_decode_tokens.add_(decode_tokens)
+    module._adapter_debug_prefill_calls.add_(
         torch.where((prefill_tokens > 0) & (decode_tokens == 0), one, zero)
     )
-    module._reft_debug_decode_calls.add_(
+    module._adapter_debug_decode_calls.add_(
         torch.where((prefill_tokens == 0) & (decode_tokens > 0), one, zero)
     )
-    module._reft_debug_mixed_calls.add_(
+    module._adapter_debug_mixed_calls.add_(
         torch.where((prefill_tokens > 0) & (decode_tokens > 0), one, zero)
     )
 
     delta_f = delta.detach().to(device=stats_device, dtype=torch.float32)
     hidden_f = hidden_states.detach().to(device=stats_device, dtype=torch.float32)
-    module._reft_debug_delta_l2_sum.add_(delta_f.norm(dim=-1).sum())
-    module._reft_debug_delta_abs_sum.add_(delta_f.abs().sum())
-    module._reft_debug_delta_abs_max.copy_(
-        torch.maximum(module._reft_debug_delta_abs_max, delta_f.abs().amax())
+    module._adapter_debug_delta_l2_sum.add_(delta_f.norm(dim=-1).sum())
+    module._adapter_debug_delta_abs_sum.add_(delta_f.abs().sum())
+    module._adapter_debug_delta_abs_max.copy_(
+        torch.maximum(module._adapter_debug_delta_abs_max, delta_f.abs().amax())
     )
-    module._reft_debug_hidden_l2_sum.add_(hidden_f.norm(dim=-1).sum())
+    module._adapter_debug_hidden_l2_sum.add_(hidden_f.norm(dim=-1).sum())
 
 
-def _collect_layer_reft_debug_stats(layer: nn.Module) -> Optional[dict]:
-    """Return serializable ReFT debug stats for one layer."""
-    total_tokens = getattr(layer, "_reft_debug_total_tokens", None)
+def _collect_layer_adapter_debug_stats(layer: nn.Module) -> Optional[dict]:
+    """Return serializable adapter debug stats for one layer."""
+    total_tokens = getattr(layer, "_adapter_debug_total_tokens", None)
     if total_tokens is None:
         return None
     total = int(total_tokens.detach().cpu().item())
 
     stats = {
-        "layer_idx": int(getattr(layer, "_reft_layer_idx", -1)),
-        "has_adapter": getattr(layer, "reft_adapter", None) is not None,
-        "debug_enabled": bool(getattr(layer, "_reft_debug_enabled", False)),
+        "layer_idx": int(getattr(layer, "_adapter_layer_idx", -1)),
+        "has_adapter": getattr(layer, "adapter_adapter", None) is not None,
+        "debug_enabled": bool(getattr(layer, "_adapter_debug_enabled", False)),
         "has_debug_buffers": True,
-        "position": getattr(layer, "_reft_position", None),
-        "masked_tokens": int(layer._reft_debug_masked_tokens.detach().cpu().item()),
+        "position": getattr(layer, "_adapter_position", None),
+        "masked_tokens": int(layer._adapter_debug_masked_tokens.detach().cpu().item()),
         "total_tokens": total,
-        "prefill_tokens": int(layer._reft_debug_prefill_tokens.detach().cpu().item()),
-        "decode_tokens": int(layer._reft_debug_decode_tokens.detach().cpu().item()),
-        "prefill_calls": int(layer._reft_debug_prefill_calls.detach().cpu().item()),
-        "decode_calls": int(layer._reft_debug_decode_calls.detach().cpu().item()),
-        "mixed_calls": int(layer._reft_debug_mixed_calls.detach().cpu().item()),
-        "delta_l2_sum": float(layer._reft_debug_delta_l2_sum.detach().cpu().item()),
-        "delta_abs_sum": float(layer._reft_debug_delta_abs_sum.detach().cpu().item()),
-        "delta_abs_max": float(layer._reft_debug_delta_abs_max.detach().cpu().item()),
-        "hidden_l2_sum": float(layer._reft_debug_hidden_l2_sum.detach().cpu().item()),
+        "prefill_tokens": int(layer._adapter_debug_prefill_tokens.detach().cpu().item()),
+        "decode_tokens": int(layer._adapter_debug_decode_tokens.detach().cpu().item()),
+        "prefill_calls": int(layer._adapter_debug_prefill_calls.detach().cpu().item()),
+        "decode_calls": int(layer._adapter_debug_decode_calls.detach().cpu().item()),
+        "mixed_calls": int(layer._adapter_debug_mixed_calls.detach().cpu().item()),
+        "delta_l2_sum": float(layer._adapter_debug_delta_l2_sum.detach().cpu().item()),
+        "delta_abs_sum": float(layer._adapter_debug_delta_abs_sum.detach().cpu().item()),
+        "delta_abs_max": float(layer._adapter_debug_delta_abs_max.detach().cpu().item()),
+        "hidden_l2_sum": float(layer._adapter_debug_hidden_l2_sum.detach().cpu().item()),
     }
 
     # Include per-token capture data if available
-    cap_n = getattr(layer, "_reft_cap_num_tokens", None)
+    cap_n = getattr(layer, "_adapter_cap_num_tokens", None)
     if cap_n is not None:
         n = int(cap_n.item())
         if n > 0:
             stats["cap_num_tokens"] = n
-            stats["cap_h"] = layer._reft_cap_h[:n].detach().cpu().tolist()
-            stats["cap_delta"] = layer._reft_cap_delta[:n].detach().cpu().tolist()
-            stats["cap_h_norms"] = layer._reft_cap_h_norms[:n].detach().cpu().tolist()
-            stats["cap_delta_norms"] = layer._reft_cap_delta_norms[:n].detach().cpu().tolist()
-            stats["cap_delta_abs_max"] = float(layer._reft_cap_delta_abs_max.item())
-            stats["cap_h_mean_norm"] = float(layer._reft_cap_h_mean_norm.item())
-            stats["cap_delta_mean_norm"] = float(layer._reft_cap_delta_mean_norm.item())
+            stats["cap_h"] = layer._adapter_cap_h[:n].detach().cpu().tolist()
+            stats["cap_delta"] = layer._adapter_cap_delta[:n].detach().cpu().tolist()
+            stats["cap_h_norms"] = layer._adapter_cap_h_norms[:n].detach().cpu().tolist()
+            stats["cap_delta_norms"] = layer._adapter_cap_delta_norms[:n].detach().cpu().tolist()
+            stats["cap_delta_abs_max"] = float(layer._adapter_cap_delta_abs_max.item())
+            stats["cap_h_mean_norm"] = float(layer._adapter_cap_h_mean_norm.item())
+            stats["cap_delta_mean_norm"] = float(layer._adapter_cap_delta_mean_norm.item())
 
     return stats
 
 
 # ---------------------------------------------------------------------------
-# Qwen2 ReFT-aware decoder layer factory
+# Qwen2 adapter-aware decoder layer factory
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -773,22 +773,22 @@ def _prepare_adapter(source: nn.Module, dev: torch.device,
     return adapter_copy
 
 
-def _init_multi_reft_state(layer: nn.Module, dev: torch.device,
+def _init_multi_adapter_state(layer: nn.Module, dev: torch.device,
                            hidden_size: int) -> None:
     """Initialise the multi-adapter bookkeeping on a decoder layer.
 
     Sets up:
-      - ``reft_adapters``  (nn.ModuleDict) keyed by ``str(reft_int_id)``
-      - ``_reft_adapter_positions`` (dict) adapter_id -> position string
-      - ``_reft_combined_masks`` (dict) adapter_id -> pre-allocated mask buffer
+      - ``served_adapters``  (nn.ModuleDict) keyed by ``str(adapter_int_id)``
+      - ``_adapter_adapter_positions`` (dict) adapter_id -> position string
+      - ``_adapter_combined_masks`` (dict) adapter_id -> pre-allocated mask buffer
     """
-    layer.reft_adapters = nn.ModuleDict()
-    layer._reft_adapter_positions: dict[int, str] = {}
-    layer._reft_adapter_sites: dict[int, str] = {}
-    layer._reft_combined_masks: dict[int, torch.Tensor] = {}
-    layer._reft_site_hooks: dict[str, torch.utils.hooks.RemovableHandle] = {}
-    _init_reft_debug_buffers(layer, dev)
-    _init_reft_capture_buffers(layer, hidden_size, dev)
+    layer.served_adapters = nn.ModuleDict()
+    layer._adapter_adapter_positions: dict[int, str] = {}
+    layer._adapter_adapter_sites: dict[int, str] = {}
+    layer._adapter_combined_masks: dict[int, torch.Tensor] = {}
+    layer._adapter_site_hooks: dict[str, torch.utils.hooks.RemovableHandle] = {}
+    _init_adapter_debug_buffers(layer, dev)
+    _init_adapter_capture_buffers(layer, hidden_size, dev)
 
 
 def _compute_batch_segments(resolved_meta,
@@ -829,11 +829,11 @@ def _blend_one_adaptation(layer: nn.Module, int_id: int, adapter: nn.Module,
     Composites (``adapter.members``: phase-gated submodules in one
     checkpoint, e.g. storage-on-prefill + steering-on-decode) blend each
     member under its own membership∧phase mask, precomputed by
-    ``update_multi_reft_position_masks`` alongside the regular buffers.
+    ``update_adapter_position_masks`` alongside the regular buffers.
     """
     members = getattr(adapter, "members", None)
     if members is not None:
-        comp_masks = getattr(layer, "_reft_composite_masks", {})
+        comp_masks = getattr(layer, "_adapter_composite_masks", {})
         num_tokens = hidden.shape[0]
         out = hidden
         for j, member in enumerate(members):
@@ -842,15 +842,15 @@ def _blend_one_adaptation(layer: nn.Module, int_id: int, adapter: nn.Module,
                 # Never seen a batch (e.g. first graph-mode step for an
                 # inactive adapter): all-zero mask, delta contributes 0.
                 mbuf = torch.zeros(
-                    max(num_tokens, _REFT_MASK_FALLBACK_SIZE),
+                    max(num_tokens, _MASK_FALLBACK_SIZE),
                     dtype=torch.float32, device=hidden.device)
                 comp_masks = layer.__dict__.setdefault(
-                    "_reft_composite_masks", comp_masks)
+                    "_adapter_composite_masks", comp_masks)
                 comp_masks[(int_id, j)] = mbuf
             out = apply_adaptation(member, out, mbuf[:num_tokens])
         return out
 
-    # The gather path (use_gather=True in update_multi_reft_position_
+    # The gather path (use_gather=True in update_multi_adapter_position_
     # masks) runs the adaptation only on its member tokens and scatters
     # results back — O(members) instead of O(batch). Eager mode only:
     # the member count is dynamic, which CUDA graphs cannot capture.
@@ -858,9 +858,9 @@ def _blend_one_adaptation(layer: nn.Module, int_id: int, adapter: nn.Module,
     # (needs_sequence_segmentation) so they never mix across request
     # boundaries in the flattened batch.
     if needs_sequence_segmentation(adapter):
-        segments = getattr(layer, "_reft_segments", None)
+        segments = getattr(layer, "_adapter_segments", None)
         if segments is not None and len(segments) > 1:
-            mask_buf = layer._reft_combined_masks.get(int_id)
+            mask_buf = layer._adapter_combined_masks.get(int_id)
             num_tokens = hidden.shape[0]
             out = hidden.clone()
             for start, end in segments:
@@ -872,16 +872,16 @@ def _blend_one_adaptation(layer: nn.Module, int_id: int, adapter: nn.Module,
                                                   hidden[start:end], mask)
             return out
 
-    member_idx = getattr(layer, "_reft_member_indices", {}).get(int_id)
+    member_idx = getattr(layer, "_adapter_member_indices", {}).get(int_id)
     if member_idx is not None:
         if member_idx.numel() == 0:
             return hidden
-        member_mask = layer._reft_member_mask_values[int_id]
+        member_mask = layer._adapter_member_mask_values[int_id]
         sub = hidden.index_select(0, member_idx)
         sub_new = apply_adaptation(adapter, sub, member_mask)
         return hidden.index_copy(0, member_idx, sub_new.to(hidden.dtype))
 
-    mask_buf = layer._reft_combined_masks.get(int_id)
+    mask_buf = layer._adapter_combined_masks.get(int_id)
     num_tokens = hidden.shape[0]
     mask = mask_buf[:num_tokens] if mask_buf is not None else None
     return apply_adaptation(adapter, hidden, mask)
@@ -893,14 +893,14 @@ def _apply_site_adaptations(layer: nn.Module, site: str, output):
     *output* may be a bare tensor or a tuple whose first element is the
     tensor (vLLM's parallel linear layers return ``(out, bias)``).
     """
-    if getattr(layer, "_reft_all_masks_zero", False):
+    if getattr(layer, "_adapter_all_masks_zero", False):
         return output
-    active_ids = getattr(layer, "_reft_active_ids", None)
+    active_ids = getattr(layer, "_adapter_active_ids", None)
     hidden = output[0] if isinstance(output, tuple) else output
     new_hidden = hidden
-    for str_id, adapter in layer.reft_adapters.items():
+    for str_id, adapter in layer.served_adapters.items():
         int_id = int(str_id)
-        if layer._reft_adapter_sites.get(int_id, "block_output") != site:
+        if layer._adapter_adapter_sites.get(int_id, "block_output") != site:
             continue
         if active_ids is not None and int_id not in active_ids:
             continue
@@ -915,7 +915,7 @@ def _apply_site_adaptations(layer: nn.Module, site: str, output):
 
 def _install_site_hook(layer: nn.Module, site: str) -> None:
     """Install (once) the forward hook a submodule-mounted site needs."""
-    if site in layer._reft_site_hooks:
+    if site in layer._adapter_site_hooks:
         return
     path = resolve_site_submodule_path(site)
     assert path is not None, f"site {site!r} does not use a hook"
@@ -929,55 +929,55 @@ def _install_site_hook(layer: nn.Module, site: str) -> None:
     def hook(module, args, output, _layer=layer, _site=site):
         return _apply_site_adaptations(_layer, _site, output)
 
-    layer._reft_site_hooks[site] = submodule.register_forward_hook(hook)
+    layer._adapter_site_hooks[site] = submodule.register_forward_hook(hook)
 
 
-def _add_adapter_to_layer(layer: nn.Module, reft_int_id: int,
+def _add_adapter_to_layer(layer: nn.Module, adapter_int_id: int,
                           adapter: nn.Module, position: str,
                           dev: torch.device,
                           site: str = "block_output") -> None:
     """Register an adapter on a decoder layer (in-place)."""
     validate_site(site)
-    key = str(reft_int_id)
-    layer.reft_adapters[key] = adapter
-    layer._reft_adapter_positions[reft_int_id] = position
-    if not hasattr(layer, "_reft_adapter_sites"):
-        layer._reft_adapter_sites = {}
-    if not hasattr(layer, "_reft_site_hooks"):
-        layer._reft_site_hooks = {}
-    layer._reft_adapter_sites[reft_int_id] = site
+    key = str(adapter_int_id)
+    layer.served_adapters[key] = adapter
+    layer._adapter_adapter_positions[adapter_int_id] = position
+    if not hasattr(layer, "_adapter_adapter_sites"):
+        layer._adapter_adapter_sites = {}
+    if not hasattr(layer, "_adapter_site_hooks"):
+        layer._adapter_site_hooks = {}
+    layer._adapter_adapter_sites[adapter_int_id] = site
     if resolve_site_submodule_path(site) is not None:
         _install_site_hook(layer, site)
     # Pre-allocate combined mask buffer
-    layer._reft_combined_masks[reft_int_id] = torch.zeros(
-        _REFT_MASK_FALLBACK_SIZE, dtype=torch.float32, device=dev)
-    # Backward compat: keep reft_adapter pointing to first loaded adapter
-    if not hasattr(layer, "reft_adapter") or layer.reft_adapter is None:
-        layer.reft_adapter = adapter
+    layer._adapter_combined_masks[adapter_int_id] = torch.zeros(
+        _MASK_FALLBACK_SIZE, dtype=torch.float32, device=dev)
+    # Backward compat: keep adapter_adapter pointing to first loaded adapter
+    if not hasattr(layer, "adapter_adapter") or layer.adapter_adapter is None:
+        layer.adapter_adapter = adapter
 
 
-def _remove_adapter_from_layer(layer: nn.Module, reft_int_id: int) -> bool:
+def _remove_adapter_from_layer(layer: nn.Module, adapter_int_id: int) -> bool:
     """Remove an adapter from a decoder layer, tearing down its site
     hook when it was the site's last user.  Returns True if removed."""
-    key = str(reft_int_id)
-    if not hasattr(layer, "reft_adapters") or key not in layer.reft_adapters:
+    key = str(adapter_int_id)
+    if not hasattr(layer, "served_adapters") or key not in layer.served_adapters:
         return False
-    del layer.reft_adapters[key]
-    layer._reft_adapter_positions.pop(reft_int_id, None)
-    layer._reft_combined_masks.pop(reft_int_id, None)
-    sites = getattr(layer, "_reft_adapter_sites", {})
-    site = sites.pop(reft_int_id, "block_output")
-    hooks = getattr(layer, "_reft_site_hooks", {})
+    del layer.served_adapters[key]
+    layer._adapter_adapter_positions.pop(adapter_int_id, None)
+    layer._adapter_combined_masks.pop(adapter_int_id, None)
+    sites = getattr(layer, "_adapter_adapter_sites", {})
+    site = sites.pop(adapter_int_id, "block_output")
+    hooks = getattr(layer, "_adapter_site_hooks", {})
     if site in hooks and site not in sites.values():
         hooks.pop(site).remove()
-    # Update backward compat reft_adapter reference.
-    if getattr(layer, "reft_adapter", None) is not None:
-        remaining = list(layer.reft_adapters.values())
-        layer.reft_adapter = remaining[0] if remaining else None
+    # Update backward compat adapter_adapter reference.
+    if getattr(layer, "adapter_adapter", None) is not None:
+        remaining = list(layer.served_adapters.values())
+        layer.adapter_adapter = remaining[0] if remaining else None
     return True
 
 
-def _multi_reft_forward(
+def _multi_adapter_forward(
     layer_self,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -988,10 +988,10 @@ def _multi_reft_forward(
     """Shared multi-adapter forward pass for Qwen2 and Llama layers.
 
     Only iterates adapters that are active in the current batch (set by
-    ``update_multi_reft_position_masks`` before each forward).  Inactive
+    ``update_adapter_position_masks`` before each forward).  Inactive
     adapters are skipped entirely — no ``_compute_delta``, no masking.
 
-    Pure-decode optimisation: if ``_reft_all_masks_zero`` is set (e.g.
+    Pure-decode optimisation: if ``_adapter_all_masks_zero`` is set (e.g.
     decode-only batch with prefill adapters), skip everything.
 
     Sites: ``block_input`` adaptations run on the incoming residual
@@ -1000,14 +1000,14 @@ def _multi_reft_forward(
     ``super_forward``; ``block_output`` adaptations run on the outgoing
     stream below.
     """
-    skip = (not hasattr(layer_self, "reft_adapters")
-            or len(layer_self.reft_adapters) == 0
-            or getattr(layer_self, "_reft_all_masks_zero", False))
+    skip = (not hasattr(layer_self, "served_adapters")
+            or len(layer_self.served_adapters) == 0
+            or getattr(layer_self, "_adapter_all_masks_zero", False))
 
     # Only iterate adapters that have at least one token in this batch.
-    # _reft_active_ids is a Python set computed by
-    # update_multi_reft_position_masks (outside compilation, no GPU sync).
-    active_ids = getattr(layer_self, "_reft_active_ids", None)
+    # _adapter_active_ids is a Python set computed by
+    # update_adapter_position_masks (outside compilation, no GPU sync).
+    active_ids = getattr(layer_self, "_adapter_active_ids", None)
 
     # block_input site: adapt the incoming stream.  The incoming
     # (hidden_states, residual) pair represents stream = hidden +
@@ -1015,11 +1015,11 @@ def _multi_reft_forward(
     # adapted stream forward with residual=None re-bases the deferred
     # residual add on the adapted value.
     if not skip:
-        sites = getattr(layer_self, "_reft_adapter_sites", {})
+        sites = getattr(layer_self, "_adapter_adapter_sites", {})
         has_active_input_site = any(
             sites.get(int(str_id), "block_output") == "block_input"
             and (active_ids is None or int(str_id) in active_ids)
-            for str_id in layer_self.reft_adapters)
+            for str_id in layer_self.served_adapters)
         if has_active_input_site:
             in_stream = (hidden_states if residual is None else
                          hidden_states + residual)
@@ -1040,8 +1040,8 @@ def _multi_reft_forward(
     # stream (insertion order).  For the additive default this matches
     # the historical sum-of-masked-deltas whenever masks are disjoint
     # (which membership ∧ phase masks guarantee for paired adapters).
-    adapter_sites = getattr(layer_self, "_reft_adapter_sites", None)
-    for str_id, adapter in layer_self.reft_adapters.items():
+    adapter_sites = getattr(layer_self, "_adapter_adapter_sites", None)
+    for str_id, adapter in layer_self.served_adapters.items():
         int_id = int(str_id)
         if active_ids is not None and int_id not in active_ids:
             continue
@@ -1057,26 +1057,26 @@ def _multi_reft_forward(
     return hidden_states, residual
 
 
-def update_multi_reft_position_masks(
-    reft_layers: list[nn.Module],
-    token_reft_ids: torch.Tensor,
+def update_adapter_position_masks(
+    adapter_layers: list[nn.Module],
+    token_adapter_ids: torch.Tensor,
     positions: torch.Tensor,
     attn_metadata,
     num_tokens: int,
-    decode_token_reft_ids: Optional[torch.Tensor] = None,
+    decode_token_adapter_ids: Optional[torch.Tensor] = None,
     use_gather: bool = False,
     graph_safe: bool = False,
     prompt_lens: Optional[torch.Tensor] = None,
-    extra_token_reft_ids: Sequence[torch.Tensor] = (),
+    extra_token_adapter_ids: Sequence[torch.Tensor] = (),
 ) -> None:
-    """Pre-compute combined masks for all adapters on all ReFT layers.
+    """Pre-compute combined masks for all adapters on all adapter layers.
 
     For each adapter on each layer, the combined mask is:
         (token belongs to this adapter) AND (position satisfies adapter's mode)
 
     A token belongs to an adapter when the token's request references it
-    through either slot: the primary ``token_reft_ids`` or the optional
-    ``decode_token_reft_ids`` (a decode-phase-paired adapter).  The
+    through either slot: the primary ``token_adapter_ids`` or the optional
+    ``decode_token_adapter_ids`` (a decode-phase-paired adapter).  The
     adapter's own position mask then restricts it to its phase, so a
     prefill adapter and a decode adapter paired on the same request
     never overlap.
@@ -1100,7 +1100,7 @@ def update_multi_reft_position_masks(
     if graph_safe:
         # Gather uses dynamic member counts — never in graph mode.
         use_gather = False
-    if not reft_layers:
+    if not adapter_layers:
         return
 
     # Detect pure-decode batch from metadata (no GPU sync needed).
@@ -1116,22 +1116,22 @@ def update_multi_reft_position_masks(
         # "all", "decode", custom positions) need decode-time compute.
         any_decode_active = any(
             position_active_in_decode(pos)
-            for layer in reft_layers
-            if hasattr(layer, "_reft_adapter_positions")
-            for pos in layer._reft_adapter_positions.values()
+            for layer in adapter_layers
+            if hasattr(layer, "_adapter_adapter_positions")
+            for pos in layer._adapter_adapter_positions.values()
         )
         if not any_decode_active:
             # Pure decode + only prefill-flavored adapters → skip.
-            for layer in reft_layers:
-                layer._reft_all_masks_zero = True
+            for layer in adapter_layers:
+                layer._adapter_all_masks_zero = True
             return
 
     # Per-request segments for sequence-mixing adaptations (eager only:
     # segment counts are dynamic shapes).
     any_seq_mixing = any(
-        needs_sequence_segmentation(layer.reft_adapters[str_id])
-        for layer in reft_layers if hasattr(layer, "reft_adapters")
-        for str_id in layer.reft_adapters)
+        needs_sequence_segmentation(layer.served_adapters[str_id])
+        for layer in adapter_layers if hasattr(layer, "served_adapters")
+        for str_id in layer.served_adapters)
     batch_segments = None
     if any_seq_mixing:
         if graph_safe:
@@ -1152,67 +1152,67 @@ def update_multi_reft_position_masks(
     # One .unique() call on a small 1-D int tensor — fast, no GPU sync
     # needed since we only use the result as a Python set for membership
     # checks in the forward pass.
-    batch_active_ids: set[int] = set(token_reft_ids.unique().tolist())
-    if decode_token_reft_ids is not None:
-        batch_active_ids |= set(decode_token_reft_ids.unique().tolist())
-    for extra in extra_token_reft_ids:
+    batch_active_ids: set[int] = set(token_adapter_ids.unique().tolist())
+    if decode_token_adapter_ids is not None:
+        batch_active_ids |= set(decode_token_adapter_ids.unique().tolist())
+    for extra in extra_token_adapter_ids:
         batch_active_ids |= set(extra.unique().tolist())
     batch_active_ids.discard(0)  # 0 = no adapter
 
     # Cache position masks by position string to avoid redundant computation.
     pos_mask_cache: dict[str, Optional[torch.Tensor]] = {}
 
-    for layer in reft_layers:
-        if not hasattr(layer, "reft_adapters"):
+    for layer in adapter_layers:
+        if not hasattr(layer, "served_adapters"):
             continue
         # Reset per-step gather state; repopulated below when enabled.
-        layer._reft_member_indices = {}
-        layer._reft_member_mask_values = {}
-        layer._reft_segments = batch_segments
+        layer._adapter_member_indices = {}
+        layer._adapter_member_mask_values = {}
+        layer._adapter_segments = batch_segments
         # Intersect batch-active IDs with this layer's loaded adapters.
         layer_active_ids = batch_active_ids & {
-            int(s) for s in layer.reft_adapters}
+            int(s) for s in layer.served_adapters}
         if is_pure_decode:
             # Prefill-flavored adapters can't fire on decode tokens.
             layer_active_ids = {
                 i for i in layer_active_ids
                 if position_active_in_decode(
-                    layer._reft_adapter_positions.get(i, "prefill"))
+                    layer._adapter_adapter_positions.get(i, "prefill"))
             }
         if graph_safe:
             # Batch-agnostic control flow: the forward iterates every
             # loaded adapter; selection lives in the mask buffers only.
-            layer._reft_active_ids = None
-            layer._reft_all_masks_zero = False
-            for str_id in layer.reft_adapters:
+            layer._adapter_active_ids = None
+            layer._adapter_all_masks_zero = False
+            for str_id in layer.served_adapters:
                 inactive_id = int(str_id)
                 if inactive_id not in layer_active_ids:
-                    buf = layer._reft_combined_masks.get(inactive_id)
+                    buf = layer._adapter_combined_masks.get(inactive_id)
                     if buf is not None:
                         buf.zero_()
                     for key, mbuf in getattr(
-                            layer, "_reft_composite_masks", {}).items():
+                            layer, "_adapter_composite_masks", {}).items():
                         if key[0] == inactive_id:
                             mbuf.zero_()
         else:
-            layer._reft_active_ids = layer_active_ids
-            layer._reft_all_masks_zero = len(layer_active_ids) == 0
-            if layer._reft_all_masks_zero:
+            layer._adapter_active_ids = layer_active_ids
+            layer._adapter_all_masks_zero = len(layer_active_ids) == 0
+            if layer._adapter_all_masks_zero:
                 continue
-        for str_id in layer.reft_adapters:
+        for str_id in layer.served_adapters:
             int_id = int(str_id)
             if int_id not in layer_active_ids:
                 continue
             # Adapter membership mask (any slot).
-            adapter_mask = (token_reft_ids == int_id)
-            if decode_token_reft_ids is not None:
+            adapter_mask = (token_adapter_ids == int_id)
+            if decode_token_adapter_ids is not None:
                 adapter_mask = adapter_mask | (
-                    decode_token_reft_ids == int_id)
-            for extra in extra_token_reft_ids:
+                    decode_token_adapter_ids == int_id)
+            for extra in extra_token_adapter_ids:
                 adapter_mask = adapter_mask | (extra == int_id)
             adapter_mask = adapter_mask.float()
             # Position mask (cached by position string)
-            pos = layer._reft_adapter_positions.get(int_id, "prefill")
+            pos = layer._adapter_adapter_positions.get(int_id, "prefill")
             if pos not in pos_mask_cache:
                 if pos in ("all", "all_tokens"):
                     pos_mask_cache[pos] = None
@@ -1225,10 +1225,10 @@ def update_multi_reft_position_masks(
             # phase masks, one buffer per (adapter id, member index) —
             # _blend_one_adaptation applies each member under its own.
             comp_members = getattr(
-                layer.reft_adapters[str_id], "members", None)
+                layer.served_adapters[str_id], "members", None)
             if comp_members is not None:
                 comp_masks = layer.__dict__.setdefault(
-                    "_reft_composite_masks", {})
+                    "_adapter_composite_masks", {})
                 for j, member in enumerate(comp_members):
                     mpos = getattr(member, "position", "all")
                     if mpos not in pos_mask_cache:
@@ -1244,7 +1244,7 @@ def update_multi_reft_position_masks(
                     mbuf = comp_masks.get((int_id, j))
                     if mbuf is None or mbuf.shape[0] < num_tokens:
                         mbuf = torch.zeros(
-                            max(num_tokens, _REFT_MASK_FALLBACK_SIZE),
+                            max(num_tokens, _MASK_FALLBACK_SIZE),
                             dtype=torch.float32, device=positions.device)
                         comp_masks[(int_id, j)] = mbuf
                     mbuf[:num_tokens].copy_(mcombined)
@@ -1256,29 +1256,29 @@ def update_multi_reft_position_masks(
             else:
                 combined = adapter_mask
             # Write into pre-allocated buffer
-            buf = layer._reft_combined_masks.get(int_id)
+            buf = layer._adapter_combined_masks.get(int_id)
             if buf is None or buf.shape[0] < num_tokens:
-                buf = torch.zeros(max(num_tokens, _REFT_MASK_FALLBACK_SIZE),
+                buf = torch.zeros(max(num_tokens, _MASK_FALLBACK_SIZE),
                                   dtype=torch.float32,
                                   device=positions.device)
-                layer._reft_combined_masks[int_id] = buf
+                layer._adapter_combined_masks[int_id] = buf
             buf[:num_tokens].copy_(combined[:num_tokens])
             buf[num_tokens:].zero_()
             if use_gather:
                 member_idx = combined[:num_tokens].nonzero(
                     as_tuple=True)[0]
-                layer._reft_member_indices[int_id] = member_idx
-                layer._reft_member_mask_values[int_id] = combined[member_idx]
+                layer._adapter_member_indices[int_id] = member_idx
+                layer._adapter_member_mask_values[int_id] = combined[member_idx]
 
 
 # ---------------------------------------------------------------------------
-# Qwen2 ReFT-aware decoder layer factory
+# Qwen2 adapter-aware decoder layer factory
 # ---------------------------------------------------------------------------
-# Architecture-generic ReFT decoder-layer factory
+# Architecture-generic adapter decoder-layer factory
 # ---------------------------------------------------------------------------
 
-def make_reft_decoder_layer(base_layer_cls: type,
-                            reft_spec: Optional[dict] = None,
+def make_adapter_decoder_layer(base_layer_cls: type,
+                            adapter_spec: Optional[dict] = None,
                             arch: Optional[str] = None) -> type:
     """Return a subclass of *base_layer_cls* with multi-adapter support.
 
@@ -1291,17 +1291,17 @@ def make_reft_decoder_layer(base_layer_cls: type,
         **kwargs) -> (hidden_states, residual)`` (extra kwargs, e.g.
         gemma3's, are forwarded).
 
-    If *reft_spec* is provided (single-adapter backward compat), the
-    initial adapter is installed at construction with ``reft_int_id=1``
+    If *adapter_spec* is provided (single-adapter backward compat), the
+    initial adapter is installed at construction with ``adapter_int_id=1``
     on the spec's ``layer_indices``.  Otherwise layers are created with
     empty adapter dicts, ready for dynamic loading.
     """
-    if reft_spec is not None:
-        layer_indices_set = frozenset(reft_spec["layer_indices"])
-        position = reft_spec["position"]
-        sample_adapter: Optional[nn.Module] = reft_spec["sample_adapter"]
-        per_layer_adapters: dict = reft_spec.get("adapters", {})
-        debug_mask_enabled = bool(reft_spec.get("debug_mask", False))
+    if adapter_spec is not None:
+        layer_indices_set = frozenset(adapter_spec["layer_indices"])
+        position = adapter_spec["position"]
+        sample_adapter: Optional[nn.Module] = adapter_spec["sample_adapter"]
+        per_layer_adapters: dict = adapter_spec.get("adapters", {})
+        debug_mask_enabled = bool(adapter_spec.get("debug_mask", False))
     else:
         layer_indices_set = frozenset()
         position = "prefill"
@@ -1351,7 +1351,7 @@ def make_reft_decoder_layer(base_layer_cls: type,
                 return hidden
         return 4096
 
-    class ReFTDecoderLayer(base_layer_cls):
+    class AdapterDecoderLayer(base_layer_cls):
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -1366,35 +1366,35 @@ def make_reft_decoder_layer(base_layer_cls: type,
             hidden_size = _find_hidden_size(self, args, kwargs)
             model_dtype = _find_model_dtype(args, kwargs)
 
-            object.__setattr__(self, "_reft_layer_idx",
+            object.__setattr__(self, "_adapter_layer_idx",
                                layer_idx if layer_idx is not None else -1)
-            object.__setattr__(self, "_reft_debug_enabled",
+            object.__setattr__(self, "_adapter_debug_enabled",
                                debug_mask_enabled)
-            self.reft_adapter = None  # backward compat attribute
+            self.adapter_adapter = None  # backward compat attribute
 
-            _init_multi_reft_state(self, dev, hidden_size)
+            _init_multi_adapter_state(self, dev, hidden_size)
 
-            # Load initial adapter from reft_spec (backward compat, id=1)
+            # Load initial adapter from adapter_spec (backward compat, id=1)
             if (layer_idx is not None and layer_idx in layer_indices_set
                     and sample_adapter is not None):
                 source = per_layer_adapters.get(layer_idx, sample_adapter)
                 adapter_copy = _prepare_adapter(source, dev, model_dtype)
                 _add_adapter_to_layer(self, 1, adapter_copy, position, dev)
-                _REFT_ADAPTER_REGISTRY[layer_idx] = adapter_copy
+                _LEGACY_ADAPTER_REGISTRY[layer_idx] = adapter_copy
                 logger.debug(
-                    "[ReFT-vLLM] Attached initial adapter to %s layer %s "
+                    "[adapter-vLLM] Attached initial adapter to %s layer %s "
                     "(adapter_type=%s)", arch_name, layer_idx,
                     type(adapter_copy).__name__)
 
-            object.__setattr__(self, "_reft_position", position)
-            _maybe_log_reft_layer_init(
+            object.__setattr__(self, "_adapter_position", position)
+            _maybe_log_adapter_layer_init(
                 arch=arch_name,
-                layer_idx=getattr(self, "_reft_layer_idx", -1),
-                attached=getattr(self, "reft_adapter", None) is not None,
-                debug_enabled=bool(getattr(self, "_reft_debug_enabled",
+                layer_idx=getattr(self, "_adapter_layer_idx", -1),
+                attached=getattr(self, "adapter_adapter", None) is not None,
+                debug_enabled=bool(getattr(self, "_adapter_debug_enabled",
                                            False)),
                 position=position,
-                adapter=getattr(self, "reft_adapter", None),
+                adapter=getattr(self, "adapter_adapter", None),
             )
 
         def forward(self, positions, hidden_states, residual, **kwargs):
@@ -1407,36 +1407,36 @@ def make_reft_decoder_layer(base_layer_cls: type,
                 def super_forward(p, h, r):
                     return base_layer_cls.forward(self, p, h, r)
 
-            return _multi_reft_forward(self, positions, hidden_states,
+            return _multi_adapter_forward(self, positions, hidden_states,
                                        residual,
                                        super_forward=super_forward)
 
-        def get_reft_debug_stats(self) -> Optional[dict]:
-            return _collect_layer_reft_debug_stats(self)
+        def get_adapter_debug_stats(self) -> Optional[dict]:
+            return _collect_layer_adapter_debug_stats(self)
 
-    ReFTDecoderLayer.__name__ = f"ReFT{base_layer_cls.__name__}"
-    ReFTDecoderLayer.__qualname__ = ReFTDecoderLayer.__name__
-    return ReFTDecoderLayer
+    AdapterDecoderLayer.__name__ = f"adapter{base_layer_cls.__name__}"
+    AdapterDecoderLayer.__qualname__ = AdapterDecoderLayer.__name__
+    return AdapterDecoderLayer
 
 
-def maybe_reft_layer_type(vllm_config, default_cls: type,
+def maybe_adapter_layer_type(vllm_config, default_cls: type,
                           arch: Optional[str] = None) -> type:
-    """Resolve the decoder-layer class for a model given its ReFT config.
+    """Resolve the decoder-layer class for a model given its adapter config.
 
-    Returns a ReFT-aware subclass of *default_cls* when ``reft_config``
-    is set (baked adapter) or ``enable_reft`` is on (dynamic loading);
+    Returns a adapter-aware subclass of *default_cls* when ``adapter_config``
+    is set (baked adapter) or ``enable_adapters`` is on (dynamic loading);
     otherwise returns *default_cls* unchanged.  This is the one-line
     hook new architectures use.
     """
-    from vllm.reft import get_reft_spec, reft_config_to_spec
-    reft_spec = reft_config_to_spec(getattr(vllm_config, "reft_config",
+    from vllm.adapter import get_adapter_spec, adapter_config_to_spec
+    adapter_spec = adapter_config_to_spec(getattr(vllm_config, "adapter_config",
                                             None))
-    if reft_spec is None:
-        reft_spec = get_reft_spec()
-    if reft_spec is not None:
-        return make_reft_decoder_layer(default_cls, reft_spec, arch=arch)
-    if getattr(vllm_config, "enable_reft", False):
-        return make_reft_decoder_layer(default_cls, None, arch=arch)
+    if adapter_spec is None:
+        adapter_spec = get_adapter_spec()
+    if adapter_spec is not None:
+        return make_adapter_decoder_layer(default_cls, adapter_spec, arch=arch)
+    if getattr(vllm_config, "enable_adapters", False):
+        return make_adapter_decoder_layer(default_cls, None, arch=arch)
     return default_cls
 
 
@@ -1444,19 +1444,19 @@ def maybe_reft_layer_type(vllm_config, default_cls: type,
 # Per-architecture factories (backward-compat wrappers)
 # ---------------------------------------------------------------------------
 
-def make_reft_qwen2_layer(reft_spec: Optional[dict] = None) -> type:
+def make_adapter_qwen2_layer(adapter_spec: Optional[dict] = None) -> type:
     from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer
-    return make_reft_decoder_layer(Qwen2DecoderLayer, reft_spec,
+    return make_adapter_decoder_layer(Qwen2DecoderLayer, adapter_spec,
                                    arch="qwen2")
 
 
-def make_reft_llama_layer(reft_spec: Optional[dict] = None) -> type:
+def make_adapter_llama_layer(adapter_spec: Optional[dict] = None) -> type:
     from vllm.model_executor.models.llama import LlamaDecoderLayer
-    return make_reft_decoder_layer(LlamaDecoderLayer, reft_spec,
+    return make_adapter_decoder_layer(LlamaDecoderLayer, adapter_spec,
                                    arch="llama")
 
 
-def make_reft_qwen3_moe_layer(reft_spec: Optional[dict] = None) -> type:
+def make_adapter_qwen3_moe_layer(adapter_spec: Optional[dict] = None) -> type:
     from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
-    return make_reft_decoder_layer(Qwen3MoeDecoderLayer, reft_spec,
+    return make_adapter_decoder_layer(Qwen3MoeDecoderLayer, adapter_spec,
                                    arch="qwen3_moe")

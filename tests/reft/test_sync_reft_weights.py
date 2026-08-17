@@ -14,7 +14,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm.reft.layer import _add_adapter_to_layer, _init_multi_reft_state
+from vllm.adaptation.layer import _add_adapter_to_layer, _init_multi_reft_state
 from vllm.worker.worker_base import WorkerBase
 
 HIDDEN = 4
@@ -74,8 +74,8 @@ class TestSyncPinsAgainstEviction:
     silently revert training.  Syncing must pin the adapter."""
 
     def _manager_setup(self, monkeypatch, max_refts):
-        import vllm.reft as vllm_reft
-        from vllm.reft.models import ReFTModel, ReFTModelManager
+        import vllm.adaptation.specs as vllm_reft
+        from vllm.adaptation.manager import ReFTModel, ReFTModelManager
         monkeypatch.setattr(
             vllm_reft, "reft_config_to_spec", lambda cfg: {
                 "layer_indices": [0],

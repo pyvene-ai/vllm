@@ -12,7 +12,7 @@ a decode-adapter request shares cached prefills with the base model.
 from types import SimpleNamespace
 
 from vllm.lora.request import LoRARequest
-from vllm.reft.request import ReFTRequest
+from vllm.adaptation.request import ReFTRequest
 from vllm.v1.core.kv_cache_utils import (generate_block_hash_extra_keys,
                                          need_extra_keys)
 

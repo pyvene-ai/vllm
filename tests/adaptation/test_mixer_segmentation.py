@@ -16,9 +16,9 @@ import torch
 import torch.nn as nn
 
 from vllm.adaptation import needs_sequence_segmentation
-from vllm.reft.layer import (_add_adapter_to_layer, _init_multi_reft_state,
-                             _multi_reft_forward,
-                             update_multi_reft_position_masks)
+from vllm.adapter.layer import (_add_adapter_to_layer, _init_multi_adapter_state,
+                             _multi_adapter_forward,
+                             update_adapter_position_masks)
 
 HIDDEN = 4
 
@@ -87,7 +87,7 @@ def _run(layer, num_tokens, meta, token_ids=None, positions=None,
         token_ids = torch.ones(num_tokens, dtype=torch.int32)
     if positions is None:
         positions = torch.arange(num_tokens)
-    update_multi_reft_position_masks([layer], token_ids, positions, meta,
+    update_adapter_position_masks([layer], token_ids, positions, meta,
                                      num_tokens, graph_safe=graph_safe)
     hidden = torch.ones(num_tokens, HIDDEN)
     residual = torch.ones(num_tokens, HIDDEN)
@@ -95,7 +95,7 @@ def _run(layer, num_tokens, meta, token_ids=None, positions=None,
     def super_forward(positions, hidden_states, residual):
         return hidden_states, residual
 
-    h, r = _multi_reft_forward(layer, positions, hidden, residual,
+    h, r = _multi_adapter_forward(layer, positions, hidden, residual,
                                super_forward=super_forward)
     return h + r
 
@@ -109,7 +109,7 @@ class TestSegmentedApplication:
 
     def test_no_leakage_across_request_boundaries(self):
         layer = nn.Module()
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
         adapter = CumsumMixingAdapter()
         _add_adapter_to_layer(layer, 1, adapter, "all", torch.device("cpu"))
         positions = torch.tensor([5, 8, 0, 1, 2, 0, 1, 2, 3])
@@ -126,7 +126,7 @@ class TestSegmentedApplication:
 
     def test_token_local_adapter_unsegmented(self):
         layer = nn.Module()
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
         adapter = TokenLocalAdapter()
         _add_adapter_to_layer(layer, 1, adapter, "all", torch.device("cpu"))
         _run(layer, 9, self._mixed_batch_meta(),
@@ -135,7 +135,7 @@ class TestSegmentedApplication:
 
     def test_membership_mask_still_applies_per_segment(self):
         layer = nn.Module()
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
         adapter = CumsumMixingAdapter()
         _add_adapter_to_layer(layer, 1, adapter, "all", torch.device("cpu"))
         # Only the second prefill request belongs to adapter 1.
@@ -150,7 +150,7 @@ class TestSegmentedApplication:
 
     def test_single_request_batch_no_segmentation_needed(self):
         layer = nn.Module()
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
         adapter = CumsumMixingAdapter()
         _add_adapter_to_layer(layer, 1, adapter, "all", torch.device("cpu"))
         qsl = torch.tensor([0, 4])
@@ -161,10 +161,10 @@ class TestSegmentedApplication:
 
     def test_graph_safe_mode_does_not_segment(self):
         # Dynamic per-request segment counts are not graph-representable;
-        # graph mode keeps the flattened application (and dynamic reft
+        # graph mode keeps the flattened application (and dynamic adapter
         # is eager-only anyway).
         layer = nn.Module()
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
         adapter = CumsumMixingAdapter()
         _add_adapter_to_layer(layer, 1, adapter, "all", torch.device("cpu"))
         _run(layer, 9, self._mixed_batch_meta(),

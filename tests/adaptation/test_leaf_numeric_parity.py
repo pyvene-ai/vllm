@@ -25,12 +25,12 @@ adapters_registry = pytest.importorskip(
     reason="requires the adapters library (shared-contract branch)")
 from adapters.registry import LEAF_REGISTRY  # noqa: E402
 
-from vllm.reft import (_adapter_to_blueprint,  # noqa: E402
+from vllm.adapter import (_adapter_to_blueprint,  # noqa: E402
                        _blueprint_to_adapter)
 
 HIDDEN = 64
 # one leaf per mechanism family (steering / storage / recurrent)
-FAMILIES = ["direft_gelusq", "pkmem_open_k8", "gated_delta_cap",
+FAMILIES = ["diadapter_gelusq", "pkmem_open_k8", "gated_delta_cap",
             "gated_delta_fast", "gated_delta_wmfast"]
 
 

@@ -15,7 +15,7 @@ import torch
 from vllm.adaptation import (PhaseInfo, get_position_mask,
                              position_active_in_decode,
                              register_position_mask, registered_positions)
-from vllm.reft.layer import _compute_position_mask
+from vllm.adapter.layer import _compute_position_mask
 
 
 def _meta(num_prefill_tokens, num_decodes, num_prefills):

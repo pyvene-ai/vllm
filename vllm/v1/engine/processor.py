@@ -12,7 +12,7 @@ from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.reft.request import ReFTRequest
+from vllm.adapter.request import AdapterRequest
 from vllm.multimodal.cache import processor_cache_from_config
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
 from vllm.multimodal.processing import EncDecMultiModalProcessor
@@ -220,16 +220,16 @@ class Processor:
                 "with its own tokenizer, consider specifying `--tokenizer "
                 "[lora_path]` to use the LoRA tokenizer.")
 
-    def _validate_reft_members(
-            self, reft_requests: Optional[list["ReFTRequest"]]) -> None:
+    def _validate_adapter_members(
+            self, adapter_requests: Optional[list["AdapterRequest"]]) -> None:
         """N-member adapter lists: ids must be unique — duplicate ids
         would double-apply one adapter through two slots."""
-        if not reft_requests:
+        if not adapter_requests:
             return
-        ids = [r.reft_int_id for r in reft_requests]
+        ids = [r.adapter_int_id for r in adapter_requests]
         if len(set(ids)) != len(ids):
             raise ValueError(
-                f"reft_requests carries duplicate reft_int_ids: {ids}")
+                f"adapter_requests carries duplicate adapter_int_ids: {ids}")
 
     def _validate_decode_lora(
             self, lora_request: Optional[LoRARequest],
@@ -369,16 +369,16 @@ class Processor:
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
-        reft_request: Optional[ReFTRequest] = None,
+        adapter_request: Optional[AdapterRequest] = None,
         decode_lora_request: Optional[LoRARequest] = None,
-        decode_reft_request: Optional[ReFTRequest] = None,
-        reft_requests: Optional[list[ReFTRequest]] = None,
+        decode_adapter_request: Optional[AdapterRequest] = None,
+        adapter_requests: Optional[list[AdapterRequest]] = None,
     ) -> tuple[Optional[str], EngineCoreRequest]:
 
         # TODO(woosuk): Support pooling models.
         self._validate_lora(lora_request)
         self._validate_decode_lora(lora_request, decode_lora_request)
-        self._validate_reft_members(reft_requests)
+        self._validate_adapter_members(adapter_requests)
         self._validate_params(params)
 
         data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
@@ -493,10 +493,10 @@ class Processor:
             eos_token_id=eos_token_id,
             arrival_time=arrival_time,
             lora_request=lora_request,
-            reft_request=reft_request,
+            adapter_request=adapter_request,
             decode_lora_request=decode_lora_request,
-            decode_reft_request=decode_reft_request,
-            reft_requests=reft_requests,
+            decode_adapter_request=decode_adapter_request,
+            adapter_requests=adapter_requests,
             cache_salt=decoder_inputs.get("cache_salt"),
             priority=priority,
             data_parallel_rank=data_parallel_rank,

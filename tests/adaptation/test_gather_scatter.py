@@ -16,9 +16,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm.reft.layer import (_add_adapter_to_layer, _init_multi_reft_state,
-                             _multi_reft_forward,
-                             update_multi_reft_position_masks)
+from vllm.adapter.layer import (_add_adapter_to_layer, _init_multi_adapter_state,
+                             _multi_adapter_forward,
+                             update_adapter_position_masks)
 
 HIDDEN = 8
 
@@ -63,7 +63,7 @@ class RecordingReplacer(nn.Module):
 
 def _make_layer():
     layer = nn.Module()
-    _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+    _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
     return layer
 
 
@@ -76,7 +76,7 @@ def _forward_stream(layer, num_tokens, positions=None):
     def super_forward(positions, hidden_states, residual):
         return hidden_states, residual
 
-    h, r = _multi_reft_forward(layer, positions, hidden, residual,
+    h, r = _multi_adapter_forward(layer, positions, hidden, residual,
                                super_forward=super_forward)
     return h + r
 
@@ -91,7 +91,7 @@ class TestGatherEquivalence:
         token_ids = torch.tensor([0, 1, 0, 0, 1, 0, 0, 0, 1, 0],
                                  dtype=torch.int32)
         positions = torch.arange(10)
-        update_multi_reft_position_masks([layer], token_ids, positions,
+        update_adapter_position_masks([layer], token_ids, positions,
                                          _meta(10, 0, 1), 10,
                                          use_gather=use_gather)
         return _forward_stream(layer, 10), adapter
@@ -131,7 +131,7 @@ class TestGatherEdgeCases:
         _add_adapter_to_layer(layer, 2, ShapeRecordingAdapter(0.25), "all",
                               torch.device("cpu"))
         token_ids = torch.full((4, ), 2, dtype=torch.int32)
-        update_multi_reft_position_masks([layer], token_ids,
+        update_adapter_position_masks([layer], token_ids,
                                          torch.arange(4), _meta(4, 0, 1), 4,
                                          use_gather=True)
         stream = _forward_stream(layer, 4)
@@ -146,7 +146,7 @@ class TestGatherEdgeCases:
         _add_adapter_to_layer(layer, 1, adapter, "decode",
                               torch.device("cpu"))
         token_ids = torch.ones(4, dtype=torch.int32)
-        update_multi_reft_position_masks([layer], token_ids,
+        update_adapter_position_masks([layer], token_ids,
                                          torch.arange(4), _meta(4, 0, 1), 4,
                                          use_gather=True)
         stream = _forward_stream(layer, 4)
@@ -159,7 +159,7 @@ class TestGatherEdgeCases:
         _add_adapter_to_layer(layer, 1, ShapeRecordingAdapter(0.5), "all",
                               torch.device("cpu"))
         token_ids = torch.ones(4, dtype=torch.int32)  # 4 real tokens
-        update_multi_reft_position_masks([layer], token_ids,
+        update_adapter_position_masks([layer], token_ids,
                                          torch.arange(4), _meta(4, 0, 1), 4,
                                          use_gather=True)
         stream = _forward_stream(layer, 6)  # padded to 6
@@ -171,7 +171,7 @@ class TestGatherEdgeCases:
         adapter = ShapeRecordingAdapter(0.5)
         _add_adapter_to_layer(layer, 1, adapter, "all", torch.device("cpu"))
         token_ids = torch.tensor([1, 0, 0, 0], dtype=torch.int32)
-        update_multi_reft_position_masks([layer], token_ids,
+        update_adapter_position_masks([layer], token_ids,
                                          torch.arange(4), _meta(4, 0, 1), 4)
         _forward_stream(layer, 4)
         assert adapter.seen_token_counts == [4]
@@ -181,12 +181,12 @@ class TestGatherEdgeCases:
         adapter = ShapeRecordingAdapter(0.5)
         _add_adapter_to_layer(layer, 1, adapter, "all", torch.device("cpu"))
         token_ids = torch.tensor([1, 1, 0, 0], dtype=torch.int32)
-        update_multi_reft_position_masks([layer], token_ids,
+        update_adapter_position_masks([layer], token_ids,
                                          torch.arange(4), _meta(4, 0, 1), 4,
                                          use_gather=True)
         _forward_stream(layer, 4)
         # Next step without gather: full path again, no stale indices.
-        update_multi_reft_position_masks([layer], token_ids,
+        update_adapter_position_masks([layer], token_ids,
                                          torch.arange(4), _meta(4, 0, 1), 4,
                                          use_gather=False)
         _forward_stream(layer, 4)
@@ -203,7 +203,7 @@ class TestGatherAtHookedSites:
                               site="post_attn")
         token_ids = torch.tensor([1, 1, 0, 0, 0], dtype=torch.int32)
         positions = torch.arange(5)
-        update_multi_reft_position_masks([layer], token_ids, positions,
+        update_adapter_position_masks([layer], token_ids, positions,
                                          _meta(5, 0, 1), 5, use_gather=True)
         hidden = torch.ones(5, HIDDEN)
         h, r = layer(positions, hidden, None)

@@ -595,22 +595,22 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
         self.config = config
         self.quant_config = quant_config
 
-        # If reft_config is set on VllmConfig, or enable_reft=True is set
+        # If adapter_config is set on VllmConfig, or enable_adapters=True is set
         # on EngineArgs (bench-driven multi-adapter path), swap in
-        # ReFT-aware decoder layers so CUDA graphs capture the adapter
-        # path. Falls back to the deprecated get_reft_spec() global state
+        # adapter-aware decoder layers so CUDA graphs capture the adapter
+        # path. Falls back to the deprecated get_adapter_spec() global state
         # used by TRL hooks.
-        from vllm.reft import reft_config_to_spec, get_reft_spec
-        from vllm.reft.layer import make_reft_qwen3_moe_layer
-        enable_reft = getattr(vllm_config, "enable_reft", False)
-        reft_spec = reft_config_to_spec(
-            getattr(vllm_config, "reft_config", None))
-        if reft_spec is None:
-            reft_spec = get_reft_spec()
-        if reft_spec is not None:
-            decoder_layer_type = make_reft_qwen3_moe_layer(reft_spec)
-        elif enable_reft:
-            decoder_layer_type = make_reft_qwen3_moe_layer(None)
+        from vllm.adapter import adapter_config_to_spec, get_adapter_spec
+        from vllm.adapter.layer import make_adapter_qwen3_moe_layer
+        enable_adapters = getattr(vllm_config, "enable_adapters", False)
+        adapter_spec = adapter_config_to_spec(
+            getattr(vllm_config, "adapter_config", None))
+        if adapter_spec is None:
+            adapter_spec = get_adapter_spec()
+        if adapter_spec is not None:
+            decoder_layer_type = make_adapter_qwen3_moe_layer(adapter_spec)
+        elif enable_adapters:
+            decoder_layer_type = make_adapter_qwen3_moe_layer(None)
         else:
             decoder_layer_type = Qwen3MoeDecoderLayer
 
@@ -712,10 +712,10 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
                                                    torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(weights)
-        # ReFT adapter params are not in the checkpoint; mark them loaded so
+        # adapter params are not in the checkpoint; mark them loaded so
         # the checkpoint validator does not flag them as missing.
         for name, _ in self.named_parameters():
-            if ".reft_adapter." in name:
+            if ".adapter_adapter." in name:
                 loaded.add(name)
         return loaded
 
@@ -723,31 +723,31 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
         return self.model.get_expert_mapping()
 
     # ------------------------------------------------------------------ #
-    # ReFT helpers (mirror qwen2.py / llama.py).  No-ops when no adapter. #
+    # adapter helpers (mirror qwen2.py / llama.py).  No-ops when no adapter. #
     # ------------------------------------------------------------------ #
 
-    def get_reft_debug_stats(self) -> dict:
-        """Return serializable per-layer ReFT debug stats, if enabled."""
+    def get_adapter_debug_stats(self) -> dict:
+        """Return serializable per-layer adapter debug stats, if enabled."""
         stats: dict = {}
         layers = list(self.model.layers)
         stats["__summary__"] = {
             "model_type": type(self).__name__,
             "num_layers": len(layers),
             "adapter_attr_layers": sum(
-                getattr(layer, "reft_adapter", None) is not None
+                getattr(layer, "adapter_adapter", None) is not None
                 for layer in layers),
             "debug_enabled_layers": sum(
-                bool(getattr(layer, "_reft_debug_enabled", False))
+                bool(getattr(layer, "_adapter_debug_enabled", False))
                 for layer in layers),
         }
         for layer_idx, layer in enumerate(layers):
-            if hasattr(layer, "get_reft_debug_stats"):
-                layer_stats = layer.get_reft_debug_stats()
+            if hasattr(layer, "get_adapter_debug_stats"):
+                layer_stats = layer.get_adapter_debug_stats()
                 if layer_stats is not None:
                     stats[layer_idx] = layer_stats
         return stats
 
-    def get_reft_weight_fingerprints(self, layer_indices=None) -> dict:
+    def get_adapter_weight_fingerprints(self, layer_indices=None) -> dict:
         """Per-layer adapter param/buffer fingerprints for sync diagnostics."""
         result = {}
         layers = list(self.model.layers)
@@ -755,7 +755,7 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
             n = len(layers)
             layer_indices = [0, n // 2, n - 1]
         for idx in layer_indices:
-            adapter = getattr(layers[idx], "reft_adapter", None)
+            adapter = getattr(layers[idx], "adapter_adapter", None)
             if adapter is None:
                 continue
             layer_fp = {"params": {}, "buffers": {}}
@@ -774,18 +774,18 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
             result[idx] = layer_fp
         return result
 
-    def refresh_reft_caches(self) -> None:
-        """Recompute derived ReFT caches after adapter weights are updated.
+    def refresh_adapter_caches(self) -> None:
+        """Recompute derived adapter caches after adapter weights are updated.
 
-        Called via ``collective_rpc("refresh_reft_caches")`` after TRL's
+        Called via ``collective_rpc("refresh_adapter_caches")`` after TRL's
         ``sync_weights()`` pushes new adapter parameters.
         """
         refreshed = []
         for idx, layer in enumerate(self.model.layers):
-            adapter = getattr(layer, "reft_adapter", None)
+            adapter = getattr(layer, "adapter_adapter", None)
             if adapter is not None and hasattr(adapter,
                                                "refresh_inference_caches"):
                 adapter.refresh_inference_caches()
                 refreshed.append(idx)
-        logger.debug("Refreshed %d ReFT adapter caches: %s",
+        logger.debug("Refreshed %d adapter caches: %s",
                      len(refreshed), refreshed)

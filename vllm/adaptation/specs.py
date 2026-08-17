@@ -1,26 +1,26 @@
-"""vllm.reft – first-class ReFT (Representation Fine-Tuning) support in vLLM.
+"""vllm.adapter – first-class adapter (Representation Fine-Tuning) support in vLLM.
 
-This package owns everything required to run ReFT-adapted models in vLLM:
+This package owns everything required to run adapter-adapted models in vLLM:
 
-  * ``VllmConfig.reft_config`` — serializable blueprint dict that flows from
+  * ``VllmConfig.adapter_config`` — serializable blueprint dict that flows from
     ``LLM()`` → ``EngineArgs`` → ``VllmConfig`` → model constructors.
     Multiprocess-safe — no global state required.
-  * ``spec_to_reft_config()`` / ``reft_config_to_spec()`` — convert between
-    live reft_spec (with nn.Module adapters) and serializable config dicts.
-  * ReFT-aware decoder layer factories (see layer.py).
+  * ``spec_to_adapter_config()`` / ``adapter_config_to_spec()`` — convert between
+    live adapter_spec (with nn.Module adapters) and serializable config dicts.
+  * adapter-aware decoder layer factories (see layer.py).
 
 Usage (preferred — via VllmConfig)::
 
-    from vllm.reft import spec_to_reft_config
+    from vllm.adapter import spec_to_adapter_config
 
-    reft_spec = reft_model.export_vllm_reft_spec()
-    llm = LLM(model=model_name, reft_config=spec_to_reft_config(reft_spec))
+    adapter_spec = adapter_model.export_vllm_adapter_spec()
+    llm = LLM(model=model_name, adapter_config=spec_to_adapter_config(adapter_spec))
 
 Or simply::
 
-    llm = reft_model.build_vllm(model_name, **kwargs)
+    llm = adapter_model.build_vllm(model_name, **kwargs)
 
-The deprecated ``set_reft_spec()`` / ``clear_reft_spec()`` global-state API
+The deprecated ``set_adapter_spec()`` / ``clear_adapter_spec()`` global-state API
 is still supported as a fallback (used by TRL training hooks) but should not
 be used in new code.
 """
@@ -31,32 +31,32 @@ import tempfile
 import threading
 from typing import Any, Optional
 
-logger = logging.getLogger("vllm.reft")
+logger = logging.getLogger("vllm.adapter")
 
-from vllm.reft.models import ReFTModel, ReFTModelManager
-from vllm.reft.request import ReFTRequest
+from vllm.adapter.models import ServedAdapter, AdapterManager
+from vllm.adapter.request import AdapterRequest
 
 __all__ = [
-    "ReFTModel",
-    "ReFTModelManager",
-    "ReFTRequest",
-    "reft_config_to_spec",
-    "spec_to_reft_config",
+    "ServedAdapter",
+    "AdapterManager",
+    "AdapterRequest",
+    "adapter_config_to_spec",
+    "spec_to_adapter_config",
     # Deprecated global-state API (backward compat only):
-    "set_reft_spec",
-    "get_reft_spec",
-    "clear_reft_spec",
+    "set_adapter_spec",
+    "get_adapter_spec",
+    "clear_adapter_spec",
 ]
 
 # ---------------------------------------------------------------------------
-# Thread-local ReFT spec storage (same-process / same-thread fast path)
+# Thread-local adapter spec storage (same-process / same-thread fast path)
 # ---------------------------------------------------------------------------
 
-_reft_spec_local = threading.local()
+_adapter_spec_local = threading.local()
 
 # Environment variable that holds the path to the pickled spec file.
-# Set by set_reft_spec() in the parent process; inherited by spawned workers.
-_SPEC_FILE_ENV_KEY = "_VLLM_REFT_SPEC_FILE"
+# Set by set_adapter_spec() in the parent process; inherited by spawned workers.
+_SPEC_FILE_ENV_KEY = "_VLLM_ADAPTER_SPEC_FILE"
 
 
 import warnings
@@ -65,7 +65,7 @@ import warnings
 def _serialize_state_dict(state_dict: dict) -> dict:
     """Convert a state_dict's tensors to a format safe for any serializer.
 
-    Each tensor becomes ``{"__reft_t": True, "data": <bytes>,
+    Each tensor becomes ``{"__adapter_t": True, "data": <bytes>,
     "dtype": "bfloat16", "shape": [...]}``.  This survives both pickle
     (used by VllmConfig) and msgspec (used by collective_rpc).
 
@@ -91,7 +91,7 @@ def _serialize_state_dict(state_dict: dict) -> dict:
                 wire = t
                 wire_dtype_np = str(t.dtype).split(".")[-1]
             out[k] = {
-                "__reft_t": True,
+                "__adapter_t": True,
                 "data": wire.numpy().tobytes(),
                 "dtype": saved_dtype,
                 "wire_dtype": wire_dtype_np,
@@ -117,7 +117,7 @@ def _deserialize_state_dict(state_dict: dict) -> dict:
     for k, v in state_dict.items():
         if isinstance(v, torch.Tensor):
             out[k] = v
-        elif isinstance(v, dict) and v.get("__reft_t"):
+        elif isinstance(v, dict) and v.get("__adapter_t"):
             target_dtype = getattr(torch, v["dtype"], torch.float32)
             data = v["data"]
             if isinstance(data, (bytes, bytearray, memoryview)):
@@ -138,26 +138,26 @@ def _deserialize_state_dict(state_dict: dict) -> dict:
 # VllmConfig-based API (preferred — multiprocess-safe, no global state)
 # ---------------------------------------------------------------------------
 
-def spec_to_reft_config(reft_spec: dict[str, Any]) -> dict[str, Any]:
-    """Convert a live *reft_spec* (with nn.Module adapters) to a serializable
-    dict suitable for ``VllmConfig.reft_config``.
+def spec_to_adapter_config(adapter_spec: dict[str, Any]) -> dict[str, Any]:
+    """Convert a live *adapter_spec* (with nn.Module adapters) to a serializable
+    dict suitable for ``VllmConfig.adapter_config``.
 
     The result contains only plain Python types and CPU tensors, so it can be
     pickled across processes by vLLM's multiprocessing machinery.
     """
     config: dict[str, Any] = {}
-    config["layer_indices"] = list(reft_spec["layer_indices"])
-    config["position"] = reft_spec["position"]
+    config["layer_indices"] = list(adapter_spec["layer_indices"])
+    config["position"] = adapter_spec["position"]
 
     # Serialize sample_adapter → blueprint
-    adapter = reft_spec.get("sample_adapter")
+    adapter = adapter_spec.get("sample_adapter")
     if adapter is not None and not isinstance(adapter, dict):
         config["sample_adapter"] = _adapter_to_blueprint(adapter)
     elif adapter is not None:
         config["sample_adapter"] = adapter  # already a blueprint
 
     # Serialize per-layer adapters → portable state_dicts
-    adapters = reft_spec.get("adapters")
+    adapters = adapter_spec.get("adapters")
     if adapters is not None:
         config["adapter_states"] = {
             idx: _serialize_state_dict(a.state_dict())
@@ -165,26 +165,26 @@ def spec_to_reft_config(reft_spec: dict[str, Any]) -> dict[str, Any]:
         }
 
     # Pass through any extra keys (e.g. debug_mask)
-    for k in reft_spec:
+    for k in adapter_spec:
         if k not in ("layer_indices", "position", "sample_adapter", "adapters"):
-            config[k] = reft_spec[k]
+            config[k] = adapter_spec[k]
 
     return config
 
 
-def reft_config_to_spec(reft_config: Optional[dict[str, Any]],
+def adapter_config_to_spec(adapter_config: Optional[dict[str, Any]],
                         ) -> Optional[dict[str, Any]]:
-    """Convert a serialized ``VllmConfig.reft_config`` back into a live
-    *reft_spec* with reconstructed nn.Module adapters.
+    """Convert a serialized ``VllmConfig.adapter_config`` back into a live
+    *adapter_spec* with reconstructed nn.Module adapters.
 
-    Returns ``None`` if *reft_config* is ``None``.
+    Returns ``None`` if *adapter_config* is ``None``.
     """
-    if reft_config is None:
+    if adapter_config is None:
         return None
 
     import copy
 
-    spec: dict[str, Any] = dict(reft_config)
+    spec: dict[str, Any] = dict(adapter_config)
 
     # Reconstruct sample_adapter from blueprint
     adapter = spec.get("sample_adapter")
@@ -211,33 +211,33 @@ def reft_config_to_spec(reft_config: Optional[dict[str, Any]],
 # Deprecated global-state API (kept for backward compatibility)
 # ---------------------------------------------------------------------------
 
-def set_reft_spec(spec: Optional[dict[str, Any]]) -> None:
-    """**Deprecated.** Use ``LLM(model=..., reft_config=spec_to_reft_config(spec))``
+def set_adapter_spec(spec: Optional[dict[str, Any]]) -> None:
+    """**Deprecated.** Use ``LLM(model=..., adapter_config=spec_to_adapter_config(spec))``
     and let VllmConfig carry the config to model constructors instead.
     """
-    _reft_spec_local.spec = spec
+    _adapter_spec_local.spec = spec
     if spec is not None:
         _write_spec_file(spec)
     else:
         _remove_spec_file()
 
 
-def get_reft_spec() -> Optional[dict[str, Any]]:
-    """Return the active ReFT spec for this thread, or ``None``.
+def get_adapter_spec() -> Optional[dict[str, Any]]:
+    """Return the active adapter spec for this thread, or ``None``.
 
     Falls back to deserialising from the temp file when called from a spawned
     worker process that did not inherit the thread-local.
     """
-    spec = getattr(_reft_spec_local, "spec", None)
+    spec = getattr(_adapter_spec_local, "spec", None)
     if spec is not None:
         return spec
     # Cross-process fallback: spawned workers inherit env vars.
     return _read_spec_file()
 
 
-def clear_reft_spec() -> None:
-    """**Deprecated.** No longer needed when using VllmConfig.reft_config."""
-    _reft_spec_local.spec = None
+def clear_adapter_spec() -> None:
+    """**Deprecated.** No longer needed when using VllmConfig.adapter_config."""
+    _adapter_spec_local.spec = None
     _remove_spec_file()
 
 
@@ -249,7 +249,7 @@ _SENTINEL = object()
 
 
 def _adapter_to_blueprint(adapter) -> dict:
-    """Extract a serializable blueprint from any ReFT adapter instance.
+    """Extract a serializable blueprint from any adapter instance.
 
     Stores the class path and constructor kwargs so the adapter can be
     re-instantiated fresh in spawned worker processes.  This avoids two
@@ -259,7 +259,7 @@ def _adapter_to_blueprint(adapter) -> dict:
        ``torch.nn.utils.parametrizations.orthogonal`` (or ``weight_norm``)
        applied.
     2. De-parametrizing before saving causes a key-name mismatch when
-       ``sync_reft_state`` loads the HF state dict: the HF checkpoint stores
+       ``sync_adapter_state`` loads the HF state dict: the HF checkpoint stores
        ``rotate_layer.parametrizations.weight.original`` but a de-parametrized
        adapter only has ``rotate_layer.weight``, so the trained R matrix is
        silently skipped and the adapter runs with the wrong rotation.
@@ -277,7 +277,7 @@ def _adapter_to_blueprint(adapter) -> dict:
     cls = type(adapter)
 
     # Walk the MRO and accumulate explicit named parameters from every
-    # __init__ in the chain.  Subclasses like LoReFTRidgeAdapter define
+    # __init__ in the chain.  Subclasses like LoadapterRidgeAdapter define
     # ``def __init__(self, *args, lam=1e-3, **kwargs)`` — the old code
     # stopped at the first __init__ with *any* explicit param (``lam``)
     # and never reached W2Adapter.__init__ which defines ``hidden_size``,
@@ -335,7 +335,7 @@ def _adapter_to_blueprint(adapter) -> dict:
     # Save trained weights alongside the blueprint so that worker processes
     # start with correct weights *before* CUDA graph capture / torch.compile
     # warmup.  Without this, the blueprint adapter is constructed with random
-    # init weights, and post-init sync_reft_state() updates them in-place —
+    # init weights, and post-init sync_adapter_state() updates them in-place —
     # but compiled/captured graphs may not reflect the in-place updates.
     adapter_state = _serialize_state_dict(adapter.state_dict())
 
@@ -359,7 +359,7 @@ def _mixer_instance_to_name(mixer_instance) -> Optional[str]:
     if mixer_instance is None:
         return None
     try:
-        from pyreft.adapters._mixer import MIXER_REGISTRY
+        from pyadapter.adapters._mixer import MIXER_REGISTRY
         for name, mixer_cls in MIXER_REGISTRY.items():
             if isinstance(mixer_instance, mixer_cls):
                 return name
@@ -382,7 +382,7 @@ def _blueprint_to_adapter(blueprint: dict):
     mod_name = blueprint["__module__"]
     # Backward compat: old blueprints stored "adaptors.*" module paths
     if mod_name.startswith("adaptors."):
-        mod_name = mod_name.replace("adaptors.", "pyreft.adapters.", 1)
+        mod_name = mod_name.replace("adaptors.", "pyadapter.adapters.", 1)
     qual_name = blueprint["__qualname__"]
     has_state = "state_dict" in blueprint and blueprint["state_dict"]
     logger.debug(
@@ -430,7 +430,7 @@ def _write_spec_file(spec: dict) -> None:
             idx: a.state_dict() for idx, a in adapters.items()
         }
 
-    fd, path = tempfile.mkstemp(suffix=".pt", prefix="vllm_reft_spec_")
+    fd, path = tempfile.mkstemp(suffix=".pt", prefix="vllm_adapter_spec_")
     os.close(fd)
     try:
         torch.save(saveable_spec, path)

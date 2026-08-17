@@ -26,9 +26,9 @@ import torch.nn as nn
 
 from vllm.compilation.cuda_graph import _lazy_capture_context
 from vllm.distributed import parallel_state
-from vllm.reft.layer import (_add_adapter_to_layer, _init_multi_reft_state,
-                             _multi_reft_forward,
-                             update_multi_reft_position_masks)
+from vllm.adapter.layer import (_add_adapter_to_layer, _init_multi_adapter_state,
+                             _multi_adapter_forward,
+                             update_adapter_position_masks)
 
 HIDDEN = 8
 
@@ -98,7 +98,7 @@ class ShapeRecordingAdapter(nn.Module):
 
 def _make_layer():
     layer = nn.Module()
-    _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+    _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
     return layer
 
 
@@ -111,7 +111,7 @@ def _forward_stream(layer, num_tokens, positions=None):
     def super_forward(positions, hidden_states, residual):
         return hidden_states, residual
 
-    h, r = _multi_reft_forward(layer, positions, hidden, residual,
+    h, r = _multi_adapter_forward(layer, positions, hidden, residual,
                                super_forward=super_forward)
     return h + r
 
@@ -129,10 +129,10 @@ class TestGraphSafeMaskUpdate:
                               torch.device("cpu"))
         token_ids = torch.ones(3, dtype=torch.int32)
         positions = torch.tensor([5, 6, 7])
-        update_multi_reft_position_masks([layer], token_ids, positions,
+        update_adapter_position_masks([layer], token_ids, positions,
                                          _meta(0, 3, 0), 3, graph_safe=True)
-        assert layer._reft_all_masks_zero is False
-        assert layer._reft_active_ids is None
+        assert layer._adapter_all_masks_zero is False
+        assert layer._adapter_active_ids is None
         stream = _forward_stream(layer, 3, positions)
         # Adapter computed (control flow is batch-agnostic)...
         assert adapter.seen_token_counts == [3]
@@ -148,19 +148,19 @@ class TestGraphSafeMaskUpdate:
 
         # Step 1: batch references adapter 1 -> its buffer is nonzero.
         token_ids = torch.ones(4, dtype=torch.int32)
-        update_multi_reft_position_masks([layer], token_ids,
+        update_adapter_position_masks([layer], token_ids,
                                          torch.arange(4), _meta(4, 0, 1), 4,
                                          graph_safe=True)
-        assert layer._reft_combined_masks[1][:4].sum() > 0
+        assert layer._adapter_combined_masks[1][:4].sum() > 0
 
         # Step 2: batch references adapter 2 only.  Adapter 1's stale
         # mask must be zeroed, else the (batch-agnostic) forward would
         # keep applying it.
         token_ids = torch.full((4, ), 2, dtype=torch.int32)
-        update_multi_reft_position_masks([layer], token_ids,
+        update_adapter_position_masks([layer], token_ids,
                                          torch.arange(4), _meta(4, 0, 1), 4,
                                          graph_safe=True)
-        assert layer._reft_combined_masks[1][:4].sum() == 0
+        assert layer._adapter_combined_masks[1][:4].sum() == 0
         stream = _forward_stream(layer, 4)
         assert torch.allclose(stream, torch.full((4, HIDDEN), 2.25))
 
@@ -181,9 +181,9 @@ class TestGraphSafeMaskUpdate:
         streams = []
         for graph_safe in (False, True):
             layer = build()
-            update_multi_reft_position_masks(
+            update_adapter_position_masks(
                 [layer], token_ids, positions, meta, 4,
-                decode_token_reft_ids=decode_slot, graph_safe=graph_safe)
+                decode_token_adapter_ids=decode_slot, graph_safe=graph_safe)
             streams.append(_forward_stream(layer, 4, positions))
         assert torch.allclose(streams[0], streams[1])
 
@@ -194,14 +194,14 @@ class TestGraphSafeMaskUpdate:
         _add_adapter_to_layer(layer, 1, ShapeRecordingAdapter(0.5),
                               "prefill", torch.device("cpu"))
         # Make the buffer dirty first.
-        update_multi_reft_position_masks([layer],
+        update_adapter_position_masks([layer],
                                          torch.ones(4, dtype=torch.int32),
                                          torch.arange(4), _meta(4, 0, 1), 4,
                                          graph_safe=True)
-        assert layer._reft_combined_masks[1][:4].sum() > 0
-        update_multi_reft_position_masks([layer],
+        assert layer._adapter_combined_masks[1][:4].sum() > 0
+        update_adapter_position_masks([layer],
                                          torch.ones(2, dtype=torch.int32),
                                          torch.tensor([5, 6]), _meta(0, 2, 0),
                                          2, graph_safe=True)
-        assert layer._reft_all_masks_zero is False
-        assert layer._reft_combined_masks[1].sum() == 0
+        assert layer._adapter_all_masks_zero is False
+        assert layer._adapter_combined_masks[1].sum() == 0

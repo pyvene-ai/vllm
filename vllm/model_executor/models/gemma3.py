@@ -365,8 +365,8 @@ class Gemma3Model(nn.Module):
             config.hidden_size,
             prefix=f"{prefix}.embed_tokens",
         )
-        from vllm.reft.layer import maybe_reft_layer_type
-        layer_cls = maybe_reft_layer_type(vllm_config, Gemma3DecoderLayer,
+        from vllm.adapter.layer import maybe_adapter_layer_type
+        layer_cls = maybe_adapter_layer_type(vllm_config, Gemma3DecoderLayer,
                                           arch="gemma3")
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,

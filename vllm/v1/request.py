@@ -20,7 +20,7 @@ from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
-    from vllm.reft.request import ReFTRequest
+    from vllm.adapter.request import AdapterRequest
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
@@ -38,10 +38,10 @@ class Request:
         prompt_embeds: Optional[torch.Tensor] = None,
         mm_features: Optional[list[MultiModalFeatureSpec]] = None,
         lora_request: Optional["LoRARequest"] = None,
-        reft_request: Optional["ReFTRequest"] = None,
+        adapter_request: Optional["AdapterRequest"] = None,
         decode_lora_request: Optional["LoRARequest"] = None,
-        decode_reft_request: Optional["ReFTRequest"] = None,
-        reft_requests: Optional[list["ReFTRequest"]] = None,
+        decode_adapter_request: Optional["AdapterRequest"] = None,
+        adapter_requests: Optional[list["AdapterRequest"]] = None,
         structured_output_request: Optional["StructuredOutputRequest"] = None,
         cache_salt: Optional[str] = None,
         priority: int = 0,
@@ -57,13 +57,13 @@ class Request:
         # Because of LoRA, the eos token id can be different for each request.
         self.eos_token_id = eos_token_id
         self.lora_request = lora_request
-        self.reft_request = reft_request
+        self.adapter_request = adapter_request
         self.decode_lora_request = decode_lora_request
-        self.decode_reft_request = decode_reft_request
+        self.decode_adapter_request = decode_adapter_request
         # canonical N-member list; falls back to the legacy slot pair
-        self.reft_requests: list["ReFTRequest"] = (
-            list(reft_requests) if reft_requests
-            else [r for r in (reft_request, decode_reft_request)
+        self.adapter_requests: list["AdapterRequest"] = (
+            list(adapter_requests) if adapter_requests
+            else [r for r in (adapter_request, decode_adapter_request)
                   if r is not None])
         self.structured_output_request = structured_output_request
         self.arrival_time = arrival_time if arrival_time is not None else \
@@ -151,10 +151,10 @@ class Request:
             eos_token_id=request.eos_token_id,
             arrival_time=request.arrival_time,
             lora_request=request.lora_request,
-            reft_request=request.reft_request,
+            adapter_request=request.adapter_request,
             decode_lora_request=request.decode_lora_request,
-            decode_reft_request=request.decode_reft_request,
-            reft_requests=request.reft_requests,
+            decode_adapter_request=request.decode_adapter_request,
+            adapter_requests=request.adapter_requests,
             structured_output_request=StructuredOutputRequest(
                 sampling_params=request.sampling_params) \
                     if request.sampling_params else None,

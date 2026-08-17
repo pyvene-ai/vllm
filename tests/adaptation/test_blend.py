@@ -4,7 +4,7 @@
 combined with the hidden stream.
 
 Default blend is additive (`h + mask * delta`, matching all existing
-ReFT adapters).  An adaptation can instead define
+adapters).  An adaptation can instead define
 ``apply_masked(h, mask) -> h'`` for replacement/gating semantics; the
 phase machinery still supplies the same per-token mask.
 """
@@ -15,9 +15,9 @@ import torch
 import torch.nn as nn
 
 from vllm.adaptation import apply_adaptation
-from vllm.reft.layer import (_add_adapter_to_layer, _init_multi_reft_state,
-                             _multi_reft_forward,
-                             update_multi_reft_position_masks)
+from vllm.adapter.layer import (_add_adapter_to_layer, _init_multi_adapter_state,
+                             _multi_adapter_forward,
+                             update_adapter_position_masks)
 
 HIDDEN = 8
 
@@ -78,7 +78,7 @@ class TestApplyAdaptation:
 
 def _make_layer():
     layer = nn.Module()
-    _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+    _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
     return layer
 
 
@@ -90,7 +90,7 @@ def _forward(layer, num_tokens):
     def super_forward(positions, hidden_states, residual):
         return hidden_states, residual
 
-    h, r = _multi_reft_forward(layer, positions, hidden, residual,
+    h, r = _multi_adapter_forward(layer, positions, hidden, residual,
                                super_forward=super_forward)
     return h + r  # the value of the residual stream
 
@@ -104,7 +104,7 @@ class TestForwardBlend:
         # 2 decode tokens, 2 prefill tokens.
         token_ids = torch.tensor([1, 1, 1, 1], dtype=torch.int32)
         positions = torch.tensor([5, 8, 0, 1])
-        update_multi_reft_position_masks([layer], token_ids, positions,
+        update_adapter_position_masks([layer], token_ids, positions,
                                          _meta(2, 2, 1), 4)
         stream = _forward(layer, 4)
         # h_full = 2.0 everywhere; decode tokens replaced by 2*h = 4.0.
@@ -119,7 +119,7 @@ class TestForwardBlend:
                               torch.device("cpu"))
         token_ids = torch.tensor([2, 1, 1], dtype=torch.int32)
         positions = torch.tensor([6, 0, 1])
-        update_multi_reft_position_masks([layer], token_ids, positions,
+        update_adapter_position_masks([layer], token_ids, positions,
                                          _meta(2, 1, 1), 3)
         stream = _forward(layer, 3)
         assert torch.allclose(stream[0], torch.full((HIDDEN, ), 2.25))

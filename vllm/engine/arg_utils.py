@@ -470,10 +470,10 @@ class EngineArgs:
     additional_config: dict[str, Any] = \
         get_field(VllmConfig, "additional_config")
 
-    reft_config: Optional[dict] = None
-    enable_reft: bool = False
-    max_refts: int = 256
-    max_cpu_refts: int = 1024
+    adapter_config: Optional[dict] = None
+    enable_adapters: bool = False
+    max_adapters: int = 256
+    max_cpu_adapters: int = 1024
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str = LoadConfig.pt_load_map_location
@@ -1448,10 +1448,10 @@ class EngineArgs:
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
             additional_config=self.additional_config,
-            reft_config=self.reft_config,
-            enable_reft=self.enable_reft,
-            max_refts=self.max_refts,
-            max_cpu_refts=self.max_cpu_refts,
+            adapter_config=self.adapter_config,
+            enable_adapters=self.enable_adapters,
+            max_adapters=self.max_adapters,
+            max_cpu_adapters=self.max_cpu_adapters,
         )
 
         return config

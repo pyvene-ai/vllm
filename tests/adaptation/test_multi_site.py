@@ -22,9 +22,9 @@ import torch
 import torch.nn as nn
 
 from vllm.adaptation import (resolve_site_submodule_path, validate_site)
-from vllm.reft.layer import (_add_adapter_to_layer, _init_multi_reft_state,
-                             _multi_reft_forward, _remove_adapter_from_layer,
-                             update_multi_reft_position_masks)
+from vllm.adapter.layer import (_add_adapter_to_layer, _init_multi_adapter_state,
+                             _multi_adapter_forward, _remove_adapter_from_layer,
+                             update_adapter_position_masks)
 
 HIDDEN = 8
 
@@ -80,7 +80,7 @@ class TinyDecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = TinyAttn()
         self.mlp = TinyMLP()
-        _init_multi_reft_state(self, torch.device("cpu"), HIDDEN)
+        _init_multi_adapter_state(self, torch.device("cpu"), HIDDEN)
 
     def _inner_forward(self, positions, hidden_states, residual):
         if residual is None:
@@ -95,7 +95,7 @@ class TinyDecoderLayer(nn.Module):
         return hidden_states, residual
 
     def forward(self, positions, hidden_states, residual):
-        return _multi_reft_forward(self, positions, hidden_states, residual,
+        return _multi_adapter_forward(self, positions, hidden_states, residual,
                                    super_forward=self._inner_forward)
 
 
@@ -107,7 +107,7 @@ def _run(layer, num_tokens=4, meta=None, token_ids=None,
         meta = _meta(num_tokens, 0, 1)
     if token_ids is None:
         token_ids = torch.ones(num_tokens, dtype=torch.int32)
-    update_multi_reft_position_masks([layer], token_ids, positions, meta,
+    update_adapter_position_masks([layer], token_ids, positions, meta,
                                      num_tokens)
     hidden = torch.ones(num_tokens, HIDDEN)
     h, r = layer(positions, hidden, None)
@@ -195,9 +195,9 @@ class TestSiteApplication:
         positions = torch.tensor([7, 8, 0, 1, 2])
         primary = torch.ones(num_tokens, dtype=torch.int32)
         decode_slot = torch.full((num_tokens, ), 2, dtype=torch.int32)
-        update_multi_reft_position_masks([layer], primary, positions,
+        update_adapter_position_masks([layer], primary, positions,
                                          _meta(3, 2, 1), num_tokens,
-                                         decode_token_reft_ids=decode_slot)
+                                         decode_token_adapter_ids=decode_slot)
         hidden = torch.ones(num_tokens, HIDDEN)
         h, r = layer(positions, hidden, None)
         stream = h + r
@@ -240,29 +240,29 @@ class TestPhaseGatingAtSites:
 class TestManagerSiteFlow:
 
     def test_site_flows_through_manager(self, monkeypatch):
-        import vllm.reft as vllm_reft
-        from vllm.reft.models import ReFTModel, ReFTModelManager
+        import vllm.adapter as vllm_adapter
+        from vllm.adapter.models import ServedAdapter, AdapterManager
 
         layer = TinyDecoderLayer()
-        layer._reft_layer_idx = 0
+        layer._adapter_layer_idx = 0
         monkeypatch.setattr(
-            vllm_reft, "reft_config_to_spec", lambda cfg: {
+            vllm_adapter, "adapter_config_to_spec", lambda cfg: {
                 "layer_indices": [0],
                 "sample_adapter": ConstDelta(0.3),
                 "position": "all",
             })
-        manager = ReFTModelManager([layer], max_refts=4, max_cpu_refts=4,
+        manager = AdapterManager([layer], max_adapters=4, max_cpu_adapters=4,
                                    device=torch.device("cpu"),
                                    model_dtype=torch.float32)
         manager.add_adapter(
-            ReFTModel(id=1, position="all", adapter_config={},
+            ServedAdapter(id=1, position="all", adapter_config={},
                       layer_indices=frozenset([0]), site="post_attn"))
         manager.activate_adapter(1)
-        assert layer._reft_adapter_sites[1] == "post_attn"
+        assert layer._adapter_adapter_sites[1] == "post_attn"
         assert len(layer.self_attn._forward_hooks) == 1
 
         manager.remove_adapter(1)
-        assert 1 not in layer._reft_adapter_sites
+        assert 1 not in layer._adapter_adapter_sites
         assert len(layer.self_attn._forward_hooks) == 0
 
 
@@ -305,7 +305,7 @@ class TestHookLifecycle:
                               torch.device("cpu"),
                               site="linear:mlp.down_proj")
         _remove_adapter_from_layer(layer, 1)
-        assert "1" not in layer.reft_adapters
-        assert 1 not in layer._reft_adapter_sites
-        assert 1 not in layer._reft_adapter_positions
-        assert 1 not in layer._reft_combined_masks
+        assert "1" not in layer.served_adapters
+        assert 1 not in layer._adapter_adapter_sites
+        assert 1 not in layer._adapter_adapter_positions
+        assert 1 not in layer._adapter_combined_masks

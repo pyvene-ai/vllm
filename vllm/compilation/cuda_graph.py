@@ -27,7 +27,7 @@ logger = init_logger(__name__)
 # runner, PIECEWISE wrappers inside the split fx.GraphModule, ubatch
 # wrappers, ...).  Used by invalidate_all_cudagraphs() when the set of
 # modules participating in the forward changes after capture (e.g. a
-# ReFT adapter is loaded or unloaded) — replayed graphs would otherwise
+# adapter is loaded or unloaded) — replayed graphs would otherwise
 # silently keep executing the old module set.
 _cudagraph_wrappers: "weakref.WeakSet[CUDAGraphWrapper]" = weakref.WeakSet()
 
@@ -62,7 +62,7 @@ def warn_if_dynamic_adaptation_under_cudagraphs(action: str) -> int:
     """Warn when the adapter *structure* changes after graphs were captured.
 
     vLLM's torch.compile wrapper bypasses Dynamo guards after the first
-    compilation, so a ReFT adapter loaded post-warmup is absent from the
+    compilation, so a adapter loaded post-warmup is absent from the
     compiled forward regardless of any CUDA-graph re-capture (the
     re-captured graph replays the same compiled code).  Re-capturing is
     not only useless here but harmful: a capture taken during a real
@@ -70,8 +70,8 @@ def warn_if_dynamic_adaptation_under_cudagraphs(action: str) -> int:
     no-active-LoRA skip), silently breaking unrelated adapters.
 
     Supported configurations:
-      - dynamic ReFT adapter loading  -> enforce_eager=True
-      - construction-baked ReFT (reft_config=) + in-place weight sync
+      - dynamic adapter loading  -> enforce_eager=True
+      - construction-baked adapter (adapter_config=) + in-place weight sync
         -> works under compiled/captured execution
       - LoRA load/sync -> always works (buffer-driven, captured with
         dummy LoRAs at warmup)
@@ -83,11 +83,11 @@ def warn_if_dynamic_adaptation_under_cudagraphs(action: str) -> int:
         len(w.concrete_cudagraph_entries) for w in _cudagraph_wrappers)
     if captured:
         logger.warning(
-            "ReFT adapter %s happened after %d CUDA graph(s) were "
-            "captured. Dynamically loaded ReFT adaptations DO NOT take "
+            "adapter %s happened after %d CUDA graph(s) were "
+            "captured. Dynamically loaded adapter adaptations DO NOT take "
             "effect in compiled/captured execution — use "
-            "enforce_eager=True for dynamic ReFT serving, or bake "
-            "adapters at engine construction (reft_config=) and update "
+            "enforce_eager=True for dynamic adapter serving, or bake "
+            "adapters at engine construction (adapter_config=) and update "
             "them via weight sync.", action, captured)
     return captured
 

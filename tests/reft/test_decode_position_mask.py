@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vllm.reft.layer import (_add_adapter_to_layer, _compute_position_mask,
+from vllm.adaptation.layer import (_add_adapter_to_layer, _compute_position_mask,
                              _init_multi_reft_state, _multi_reft_forward,
                              update_multi_reft_position_masks)
 

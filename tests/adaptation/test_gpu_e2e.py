@@ -9,7 +9,7 @@ Runs a real engine (tiny-random Llama) and validates the full stack:
     change the first sampled token — that token is produced by the
     final prefill chunk),
   - in-memory weight sync (training loop) actually changing outputs,
-  - ReFT adaptations via the blueprint path, including decode position,
+  - adapter adaptations via the blueprint path, including decode position,
   - CUDA graph mode: adapters loaded AFTER warmup must take effect
     (invalidation + lazy re-capture), and re-syncs must show up in
     replayed graphs without re-capture.
@@ -88,7 +88,7 @@ def _lora_req(idx: int, position: str):
 
 
 class BigDeltaAdapter(nn.Module):
-    """Blueprint-compatible ReFT adapter with a large constant delta."""
+    """Blueprint-compatible adapter with a large constant delta."""
 
     def __init__(self, hidden_size=16, value=1.0, device=None, dtype=None):
         super().__init__()
@@ -101,19 +101,19 @@ class BigDeltaAdapter(nn.Module):
         return torch.ones_like(h) * self.scale.to(h.dtype)
 
 
-def _reft_config(hidden: int, value: float):
-    from vllm.reft import spec_to_reft_config
-    return spec_to_reft_config({
+def _adapter_config(hidden: int, value: float):
+    from vllm.adapter import spec_to_adapter_config
+    return spec_to_adapter_config({
         "layer_indices": [0, 1],
         "position": "prefill",  # per-adapter position given at load
         "sample_adapter": BigDeltaAdapter(hidden_size=hidden, value=value),
     })
 
 
-def _reft_req(idx: int):
-    from vllm.reft.request import ReFTRequest
-    return ReFTRequest(reft_name=f"r{idx}", reft_int_id=idx,
-                       reft_path=f"/synced/{idx}")
+def _adapter_req(idx: int):
+    from vllm.adapter.request import AdapterRequest
+    return AdapterRequest(adapter_name=f"r{idx}", adapter_int_id=idx,
+                       adapter_path=f"/synced/{idx}")
 
 
 @pytest.fixture(scope="module")
@@ -124,8 +124,8 @@ def eager_llm():
               enable_lora=True,
               max_loras=4,
               max_lora_rank=RANK,
-              enable_reft=True,
-              max_refts=8,
+              enable_adapters=True,
+              max_adapters=8,
               gpu_memory_utilization=0.3,
               max_model_len=256)
     yield llm
@@ -190,52 +190,52 @@ class TestLoraPhaseServingE2E:
             args=(_lora_state_dict(hidden, 0.5), PEFT_CONFIG, 1))
 
 
-class TestReftServingE2E:
+class TestAdapterServingE2E:
 
     @pytest.fixture(scope="class", autouse=True)
     def loaded_adapters(self, eager_llm):
         hidden = _hidden_size()
         eager_llm.collective_rpc(
-            "load_reft_adapter",
-            args=(11, _reft_config(hidden, 5.0), "prefill"))
+            "load_adapter",
+            args=(11, _adapter_config(hidden, 5.0), "prefill"))
         eager_llm.collective_rpc(
-            "load_reft_adapter",
-            args=(12, _reft_config(hidden, -5.0), "decode"))
+            "load_adapter",
+            args=(12, _adapter_config(hidden, -5.0), "decode"))
 
-    def test_prefill_reft_changes_outputs(self, eager_llm):
+    def test_prefill_adapter_changes_outputs(self, eager_llm):
         base = _gen_ids(eager_llm)
-        out = _gen_ids(eager_llm, reft_request=_reft_req(11))
+        out = _gen_ids(eager_llm, adapter_request=_adapter_req(11))
         assert out != base
 
-    def test_decode_reft_preserves_first_token(self, eager_llm):
+    def test_decode_adapter_preserves_first_token(self, eager_llm):
         base = _gen_ids(eager_llm)
-        out = _gen_ids(eager_llm, reft_request=_reft_req(12))
+        out = _gen_ids(eager_llm, adapter_request=_adapter_req(12))
         assert out[0] == base[0]
         assert out != base
 
-    def test_reft_pair_on_same_prompt(self, eager_llm):
-        prefill_only = _gen_ids(eager_llm, reft_request=_reft_req(11))
+    def test_adapter_pair_on_same_prompt(self, eager_llm):
+        prefill_only = _gen_ids(eager_llm, adapter_request=_adapter_req(11))
         paired = _gen_ids(eager_llm,
-                          reft_request=_reft_req(11),
-                          decode_reft_request=_reft_req(12))
+                          adapter_request=_adapter_req(11),
+                          decode_adapter_request=_adapter_req(12))
         assert paired[0] == prefill_only[0]
         assert paired != prefill_only
 
     def test_every_k_position(self, eager_llm):
         hidden = _hidden_size()
         eager_llm.collective_rpc(
-            "load_reft_adapter",
-            args=(13, _reft_config(hidden, 7.0), "every_2"))
+            "load_adapter",
+            args=(13, _adapter_config(hidden, 7.0), "every_2"))
         base = _gen_ids(eager_llm)
-        out = _gen_ids(eager_llm, reft_request=_reft_req(13))
+        out = _gen_ids(eager_llm, adapter_request=_adapter_req(13))
         assert out != base
 
-    def test_reft_weight_sync_changes_outputs(self, eager_llm):
-        before = _gen_ids(eager_llm, reft_request=_reft_req(11))
+    def test_adapter_weight_sync_changes_outputs(self, eager_llm):
+        before = _gen_ids(eager_llm, adapter_request=_adapter_req(11))
         new_sd = {"scale": torch.full((_hidden_size(), ), 0.25)}
-        eager_llm.collective_rpc("sync_reft_weights",
+        eager_llm.collective_rpc("sync_adapter_weights",
                                  args=({0: new_sd, 1: new_sd}, True, 11))
-        after = _gen_ids(eager_llm, reft_request=_reft_req(11))
+        after = _gen_ids(eager_llm, adapter_request=_adapter_req(11))
         assert after != before
 
 
@@ -247,8 +247,8 @@ def graph_llm():
               enable_lora=True,
               max_loras=4,
               max_lora_rank=RANK,
-              enable_reft=True,
-              max_refts=8,
+              enable_adapters=True,
+              max_adapters=8,
               gpu_memory_utilization=0.3,
               max_model_len=256)
     yield llm
@@ -261,11 +261,11 @@ class TestCudaGraphModeE2E:
     - LoRA is fully dynamic under CUDA graphs: warmup captures with
       dummy LoRAs, so punica kernels are in the graphs and driven only
       by buffers/metadata.
-    - Dynamically loaded ReFT adapters CANNOT take effect (the compiled
+    - Dynamically loaded adapters CANNOT take effect (the compiled
       forward was traced without them); loading one must warn and must
-      not disturb anything else — dynamic ReFT serving is eager-only.
-    - Construction-baked ReFT + weight sync is the graph-mode training
-      path (covered by TestGraphBakedReftE2E).
+      not disturb anything else — dynamic adapter serving is eager-only.
+    - Construction-baked adapter + weight sync is the graph-mode training
+      path (covered by TestGraphBakedAdapterE2E).
     """
 
     def test_synced_lora_after_warmup_takes_effect(self, graph_llm):
@@ -288,31 +288,31 @@ class TestCudaGraphModeE2E:
         after = _gen_ids(graph_llm, lora_request=_lora_req(3, "all"))
         assert after != before
 
-    def test_dynamic_reft_load_is_inert_and_harmless(self, graph_llm):
-        """Loading a ReFT adapter post-warmup warns; it must neither
+    def test_dynamic_adapter_load_is_inert_and_harmless(self, graph_llm):
+        """Loading a adapter post-warmup warns; it must neither
         corrupt base generations nor break LoRA serving."""
         hidden = _hidden_size()
         base = _gen_ids(graph_llm)
         lora_before = _gen_ids(graph_llm, lora_request=_lora_req(3, "all"))
 
         graph_llm.collective_rpc(
-            "load_reft_adapter",
-            args=(21, _reft_config(hidden, -5.0), "decode"))
+            "load_adapter",
+            args=(21, _adapter_config(hidden, -5.0), "decode"))
 
         # Base generations are untouched...
         assert _gen_ids(graph_llm) == base
         # ...LoRA keeps working (captured graphs were left alone)...
         assert _gen_ids(graph_llm,
                         lora_request=_lora_req(3, "all")) == lora_before
-        # ...and the dynamic ReFT adapter is documented-inert here.
-        assert _gen_ids(graph_llm, reft_request=_reft_req(21)) == base
+        # ...and the dynamic adapter is documented-inert here.
+        assert _gen_ids(graph_llm, adapter_request=_adapter_req(21)) == base
 
 
 @pytest.fixture(scope="module")
 def tp2_llm():
     """Tensor-parallel engine (eager) for multi-GPU adapter validation.
 
-    Workers run as separate processes; the ReFT blueprint class must be
+    Workers run as separate processes; the adapter blueprint class must be
     importable there (run with PYTHONPATH including the tests root)."""
     from vllm import LLM
     llm = LLM(model=MODEL,
@@ -321,8 +321,8 @@ def tp2_llm():
               enable_lora=True,
               max_loras=4,
               max_lora_rank=RANK,
-              enable_reft=True,
-              max_refts=8,
+              enable_adapters=True,
+              max_adapters=8,
               gpu_memory_utilization=0.3,
               max_model_len=256)
     yield llm
@@ -359,62 +359,62 @@ class TestTensorParallelE2E:
         assert decode[0] == base[0]
         assert decode != base
 
-    def test_reft_decode_adapter_under_tp2(self, tp2_llm):
+    def test_adapter_decode_adapter_under_tp2(self, tp2_llm):
         hidden = _hidden_size()
         base = _gen_ids(tp2_llm)
         tp2_llm.collective_rpc(
-            "load_reft_adapter",
-            args=(21, _reft_config(hidden, -5.0), "decode"))
-        out = _gen_ids(tp2_llm, reft_request=_reft_req(21))
+            "load_adapter",
+            args=(21, _adapter_config(hidden, -5.0), "decode"))
+        out = _gen_ids(tp2_llm, adapter_request=_adapter_req(21))
         assert out[0] == base[0]
         assert out != base
 
-    def test_reft_weight_sync_under_tp2(self, tp2_llm):
-        before = _gen_ids(tp2_llm, reft_request=_reft_req(21))
+    def test_adapter_weight_sync_under_tp2(self, tp2_llm):
+        before = _gen_ids(tp2_llm, adapter_request=_adapter_req(21))
         new_sd = {"scale": torch.full((_hidden_size(), ), 2.5)}
-        tp2_llm.collective_rpc("sync_reft_weights",
+        tp2_llm.collective_rpc("sync_adapter_weights",
                                args=({0: new_sd, 1: new_sd}, True, 21))
-        after = _gen_ids(tp2_llm, reft_request=_reft_req(21))
+        after = _gen_ids(tp2_llm, adapter_request=_adapter_req(21))
         assert after != before
 
 
 @pytest.fixture(scope="module")
-def graph_baked_reft_llm():
-    """CUDA graphs + a ReFT adapter baked at construction (the
+def graph_baked_adapter_llm():
+    """CUDA graphs + a adapter baked at construction (the
     graph-mode training configuration): the compiled forward includes
     the adapter, masks stay batch-agnostic, weight sync is in-place."""
     from vllm import LLM
     hidden = _hidden_size()
     llm = LLM(model=MODEL,
-              reft_config=_reft_config(hidden, -5.0),
-              max_refts=8,
+              adapter_config=_adapter_config(hidden, -5.0),
+              max_adapters=8,
               gpu_memory_utilization=0.3,
               max_model_len=256)
     yield llm
     del llm
 
 
-class TestGraphBakedReftE2E:
+class TestGraphBakedAdapterE2E:
 
     def test_weight_sync_visible_in_replayed_graphs(
-            self, graph_baked_reft_llm):
-        llm = graph_baked_reft_llm
+            self, graph_baked_adapter_llm):
+        llm = graph_baked_adapter_llm
         before = _gen_ids(llm)
         new_sd = {"scale": torch.full((_hidden_size(), ), 2.5)}
-        llm.collective_rpc("sync_reft_weights",
+        llm.collective_rpc("sync_adapter_weights",
                            args=({0: new_sd, 1: new_sd}, True, 1))
         after = _gen_ids(llm)
         assert after != before
 
-    def test_repeated_sync_round_trips(self, graph_baked_reft_llm):
+    def test_repeated_sync_round_trips(self, graph_baked_adapter_llm):
         """Alternating weight syncs (a training loop) keep taking
         effect — in-place updates read by the same captured graphs."""
-        llm = graph_baked_reft_llm
+        llm = graph_baked_adapter_llm
         hidden = _hidden_size()
 
         def sync(v):
             sd = {"scale": torch.full((hidden, ), v)}
-            llm.collective_rpc("sync_reft_weights",
+            llm.collective_rpc("sync_adapter_weights",
                                args=({0: sd, 1: sd}, True, 1))
 
         sync(3.0)

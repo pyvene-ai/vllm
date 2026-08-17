@@ -11,9 +11,9 @@ from typing_extensions import deprecated
 
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItems
-from vllm.reft.request import ReFTRequest
+from vllm.adapter.request import AdapterRequest
 
-MAX_REFT_SLOTS = 8
+MAX_ADAPTER_SLOTS = 8
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import length_from_prompt_token_ids_or_embeds, swap_dict_values
@@ -51,18 +51,18 @@ class CachedRequestState:
 
     lora_request: Optional[LoRARequest] = None
     decode_lora_request: Optional[LoRARequest] = None
-    reft_request: Optional[ReFTRequest] = None
-    decode_reft_request: Optional[ReFTRequest] = None
-    reft_requests: Optional[list[ReFTRequest]] = None
+    adapter_request: Optional[AdapterRequest] = None
+    decode_adapter_request: Optional[AdapterRequest] = None
+    adapter_requests: Optional[list[AdapterRequest]] = None
     prompt_embeds: Optional[torch.Tensor] = None
 
     @property
-    def reft_members(self) -> list[ReFTRequest]:
+    def adapter_members(self) -> list[AdapterRequest]:
         """Canonical member list: the N-member field when set, else the
         legacy slot pair."""
-        if self.reft_requests:
-            return list(self.reft_requests)
-        return [r for r in (self.reft_request, self.decode_reft_request)
+        if self.adapter_requests:
+            return list(self.adapter_requests)
+        return [r for r in (self.adapter_request, self.decode_adapter_request)
                 if r is not None]
 
     def __post_init__(self):
@@ -261,12 +261,12 @@ class InputBatch:
         self.lora_id_to_request_ids: dict[int, set[str]] = {}
         self.lora_id_to_lora_request: dict[int, LoRARequest] = {}
 
-        # reft related: N member slots per request (0 = empty).
+        # adapter related: N member slots per request (0 = empty).
         # Columns 0/1 correspond to the legacy primary/decode pair.
-        self.request_reft_slots = np.zeros(
-            (self.max_num_reqs, MAX_REFT_SLOTS), dtype=np.int32)
-        self.reft_id_to_request_ids: dict[int, set[str]] = {}
-        self.reft_id_to_reft_request: dict[int, ReFTRequest] = {}
+        self.request_adapter_slots = np.zeros(
+            (self.max_num_reqs, MAX_ADAPTER_SLOTS), dtype=np.int32)
+        self.adapter_id_to_request_ids: dict[int, set[str]] = {}
+        self.adapter_id_to_request: dict[int, AdapterRequest] = {}
 
         # req_index -> generator
         # NOTE(woosuk): The indices of the requests that do not have their own
@@ -513,20 +513,20 @@ class InputBatch:
         else:
             self.request_decode_lora_mapping[req_index] = 0
 
-        # Add request reft ID(s): every member gets a slot.
-        members = request.reft_members
-        if len(members) > MAX_REFT_SLOTS:
+        # Add request adapter ID(s): every member gets a slot.
+        members = request.adapter_members
+        if len(members) > MAX_ADAPTER_SLOTS:
             raise ValueError(
                 f"request {request.req_id} carries {len(members)} adapter "
-                f"members; MAX_REFT_SLOTS={MAX_REFT_SLOTS}")
-        self.request_reft_slots[req_index] = 0
+                f"members; MAX_ADAPTER_SLOTS={MAX_ADAPTER_SLOTS}")
+        self.request_adapter_slots[req_index] = 0
         for j, member in enumerate(members):
-            reft_id = member.reft_int_id
-            if reft_id not in self.reft_id_to_request_ids:
-                self.reft_id_to_request_ids[reft_id] = set()
-            self.request_reft_slots[req_index, j] = reft_id
-            self.reft_id_to_request_ids[reft_id].add(request.req_id)
-            self.reft_id_to_reft_request[reft_id] = member
+            adapter_id = member.adapter_int_id
+            if adapter_id not in self.adapter_id_to_request_ids:
+                self.adapter_id_to_request_ids[adapter_id] = set()
+            self.request_adapter_slots[req_index, j] = adapter_id
+            self.adapter_id_to_request_ids[adapter_id].add(request.req_id)
+            self.adapter_id_to_request[adapter_id] = member
 
         return req_index
 
@@ -561,15 +561,15 @@ class InputBatch:
         self.request_lora_position[req_index] = 0
         self.request_decode_lora_mapping[req_index] = 0
 
-        # ReFT (the set dedupes ids shared across member slots)
-        for reft_id in set(self.request_reft_slots[req_index].tolist()):
-            if reft_id != 0:
-                reft_req_ids = self.reft_id_to_request_ids[reft_id]
-                reft_req_ids.discard(req_id)
-                if not reft_req_ids:
-                    del self.reft_id_to_request_ids[reft_id]
-                    del self.reft_id_to_reft_request[reft_id]
-        self.request_reft_slots[req_index] = 0
+        # adapter (the set dedupes ids shared across member slots)
+        for adapter_id in set(self.request_adapter_slots[req_index].tolist()):
+            if adapter_id != 0:
+                adapter_req_ids = self.adapter_id_to_request_ids[adapter_id]
+                adapter_req_ids.discard(req_id)
+                if not adapter_req_ids:
+                    del self.adapter_id_to_request_ids[adapter_id]
+                    del self.adapter_id_to_request[adapter_id]
+        self.request_adapter_slots[req_index] = 0
 
         if self.is_pooling_model:
             self.pooling_params.pop(req_id, None)
@@ -648,8 +648,8 @@ class InputBatch:
             self.request_decode_lora_mapping[i2], \
             self.request_decode_lora_mapping[i1]
 
-        self.request_reft_slots[[i1, i2]] = \
-            self.request_reft_slots[[i2, i1]]
+        self.request_adapter_slots[[i1, i2]] = \
+            self.request_adapter_slots[[i2, i1]]
 
         if self.is_pooling_model:
             # Sampling and logits parameters don't apply to pooling models.
@@ -756,8 +756,8 @@ class InputBatch:
             self.request_decode_lora_mapping[empty_index] = \
                 self.request_decode_lora_mapping[last_req_index]
 
-            self.request_reft_slots[empty_index] = \
-                self.request_reft_slots[last_req_index]
+            self.request_adapter_slots[empty_index] = \
+                self.request_adapter_slots[last_req_index]
 
             if self.is_pooling_model:
                 last_req_index -= 1
@@ -971,10 +971,10 @@ class InputBatch:
 
         return prompt_lora_mapping, token_lora_mapping, active_lora_requests
 
-    def make_reft_inputs(
+    def make_adapter_inputs(
         self, num_scheduled_tokens: np.ndarray
     ) -> list[np.ndarray]:
-        """Build per-token reft_int_id mappings, one array per member
+        """Build per-token adapter_int_id mappings, one array per member
         slot that is populated anywhere in the batch.
 
         Returns a list of 1-D int32 arrays of shape
@@ -983,7 +983,7 @@ class InputBatch:
         restriction happens via the adapters' position masks.
         """
         num_reqs = self.num_reqs
-        slots = self.request_reft_slots[:num_reqs]
+        slots = self.request_adapter_slots[:num_reqs]
         used = int((slots != 0).any(axis=0).sum()) if num_reqs else 0
         n_cols = max(used, 1)
         return [slots[:, j].repeat(num_scheduled_tokens)

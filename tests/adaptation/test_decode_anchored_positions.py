@@ -23,8 +23,8 @@ import torch.nn as nn
 
 from vllm.adaptation import PhaseInfo, get_position_mask
 from vllm.adaptation.positions import position_active_in_decode
-from vllm.reft.layer import (_add_adapter_to_layer, _init_multi_reft_state,
-                             update_multi_reft_position_masks)
+from vllm.adapter.layer import (_add_adapter_to_layer, _init_multi_adapter_state,
+                             update_adapter_position_masks)
 
 HIDDEN = 8
 
@@ -139,7 +139,7 @@ class TestMaskUpdateIntegration:
 
     def test_prompt_lens_flow_through_mask_update(self):
         layer = nn.Module()
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
         _add_adapter_to_layer(layer, 1, ConstAdapter(0.5), "first_1_decode",
                               torch.device("cpu"))
         # Two decoding requests: gen indices [0, 3].
@@ -148,14 +148,14 @@ class TestMaskUpdateIntegration:
         meta = SimpleNamespace(num_prefill_tokens=0, num_decodes=2,
                                num_prefills=0, query_start_loc=None,
                                seq_lens=None)
-        update_multi_reft_position_masks(
+        update_adapter_position_masks(
             [layer], token_ids, positions, meta, 2,
             prompt_lens=torch.tensor([4, 6]))
-        assert layer._reft_combined_masks[1][:2].tolist() == [1, 0]
+        assert layer._adapter_combined_masks[1][:2].tolist() == [1, 0]
 
     def test_without_prompt_lens_mask_is_zero(self):
         layer = nn.Module()
-        _init_multi_reft_state(layer, torch.device("cpu"), HIDDEN)
+        _init_multi_adapter_state(layer, torch.device("cpu"), HIDDEN)
         _add_adapter_to_layer(layer, 1, ConstAdapter(0.5), "first_1_decode",
                               torch.device("cpu"))
         token_ids = torch.ones(2, dtype=torch.int32)
@@ -163,6 +163,6 @@ class TestMaskUpdateIntegration:
         meta = SimpleNamespace(num_prefill_tokens=0, num_decodes=2,
                                num_prefills=0, query_start_loc=None,
                                seq_lens=None)
-        update_multi_reft_position_masks([layer], token_ids, positions,
+        update_adapter_position_masks([layer], token_ids, positions,
                                          meta, 2)
-        assert layer._reft_combined_masks[1][:2].tolist() == [0, 0]
+        assert layer._adapter_combined_masks[1][:2].tolist() == [0, 0]

@@ -51,14 +51,14 @@ def _request_lora_ids(request: Request) -> set[int]:
     return ids
 
 
-def _request_reft_ids(request: Request) -> set[int]:
-    """All ReFT adapter ids a request needs (every member)."""
-    members = getattr(request, "reft_requests", None)
+def _request_adapter_ids(request: Request) -> set[int]:
+    """All adapter ids a request needs (every member)."""
+    members = getattr(request, "adapter_requests", None)
     if members is None:
-        members = [r for r in (request.reft_request,
-                               getattr(request, "decode_reft_request",
+        members = [r for r in (request.adapter_request,
+                               getattr(request, "decode_adapter_request",
                                        None)) if r is not None]
-    return {r.reft_int_id for r in members if r.reft_int_id > 0}
+    return {r.adapter_int_id for r in members if r.adapter_int_id > 0}
 
 
 class Scheduler(SchedulerInterface):
@@ -349,13 +349,13 @@ class Scheduler(SchedulerInterface):
                 for lora_id in _request_lora_ids(req))
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Record the ReFT adapters in scheduled_running_reqs
-        scheduled_refts: set[int] = set()
-        if self.vllm_config.enable_reft:
-            scheduled_refts = set(
-                reft_id for req in scheduled_running_reqs
-                for reft_id in _request_reft_ids(req))
-            assert len(scheduled_refts) <= self.vllm_config.max_refts
+        # Record the adapters in scheduled_running_reqs
+        scheduled_adapters: set[int] = set()
+        if self.vllm_config.enable_adapters:
+            scheduled_adapters = set(
+                adapter_id for req in scheduled_running_reqs
+                for adapter_id in _request_adapter_ids(req))
+            assert len(scheduled_adapters) <= self.vllm_config.max_adapters
 
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
@@ -403,12 +403,12 @@ class Scheduler(SchedulerInterface):
                     skipped_waiting_requests.prepend_request(request)
                     continue
 
-                # Check that adding the request still respects the max_refts
+                # Check that adding the request still respects the max_adapters
                 # constraint (counting both phase adapters).
-                if self.vllm_config.enable_reft and (
-                        len(scheduled_refts | _request_reft_ids(request))
-                        > self.vllm_config.max_refts):
-                    # Scheduling would exceed max_refts, skip.
+                if self.vllm_config.enable_adapters and (
+                        len(scheduled_adapters | _request_adapter_ids(request))
+                        > self.vllm_config.max_adapters):
+                    # Scheduling would exceed max_adapters, skip.
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
@@ -558,8 +558,8 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config:
                     scheduled_loras.update(_request_lora_ids(request))
-                if self.vllm_config.enable_reft:
-                    scheduled_refts.update(_request_reft_ids(request))
+                if self.vllm_config.enable_adapters:
+                    scheduled_adapters.update(_request_adapter_ids(request))
                 req_to_new_blocks[request.request_id] = (
                     self.kv_cache_manager.get_blocks(request.request_id))
                 num_scheduled_tokens[request.request_id] = num_new_tokens
