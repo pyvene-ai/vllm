@@ -60,7 +60,7 @@ def _nan_check_enabled() -> bool:
     return _adapter_nan_check
 
 
-def _readout_delta(adapter, h2d: torch.Tensor) -> torch.Tensor:
+def _readout_correction(adapter, h2d: torch.Tensor) -> torch.Tensor:
     """R_phi spoken natively (v3 contract): a member's correction is
     readout(h) - h. Phase masking blends h + mask * (R(h) - h) — exact
     for additive members and the correct phase-gated blend for any R
@@ -302,7 +302,7 @@ def _compute_position_mask(
 
 
 def _apply_position_mask(
-    delta: torch.Tensor,
+    correction: torch.Tensor,
     positions: torch.Tensor,
     position: str,
     dtype: torch.dtype,
@@ -312,8 +312,8 @@ def _apply_position_mask(
     """Mask a readout displacement; blending downstream is lerp(h, R(h), mask)."""
     mask = _compute_position_mask(positions, position, dtype, num_tokens, attn_metadata)
     if mask is None:
-        return delta, None
-    return (delta * mask.unsqueeze(-1)).contiguous(), mask
+        return correction, None
+    return (correction * mask.unsqueeze(-1)).contiguous(), mask
 
 
 # ---------------------------------------------------------------------------
@@ -367,35 +367,35 @@ def _adapter_apply_adapter_op(
         num_decode_tokens = num_tokens - num_prefill_tokens
         h_prefill = h_full[num_decode_tokens:]
         _check_nan(h_prefill, "h_prefill_input", layer_idx)
-        delta_prefill = _readout_delta(adapter, h_prefill)
-        _check_nan(delta_prefill, "delta_after_readout(mixed)", layer_idx)
+        correction_prefill = _readout_correction(adapter, h_prefill)
+        _check_nan(correction_prefill, "correction_after_readout(mixed)", layer_idx)
 
         if position == "prefill":
-            delta = torch.zeros_like(h_full)
-            delta[num_decode_tokens:] = delta_prefill
-            return delta
+            correction = torch.zeros_like(h_full)
+            correction[num_decode_tokens:] = correction_prefill
+            return correction
 
         # first/last: apply mask within the prefill region.
         mask = _compute_position_mask(
             positions, position, h_full.dtype, num_tokens, attn_metadata)
         if mask is not None:
-            delta_prefill = (
-                delta_prefill * mask[num_decode_tokens:].unsqueeze(-1)
+            correction_prefill = (
+                correction_prefill * mask[num_decode_tokens:].unsqueeze(-1)
             ).contiguous()
-        delta = torch.zeros_like(h_full)
-        delta[num_decode_tokens:] = delta_prefill
-        _check_nan(delta, "delta_after_mask(mixed)", layer_idx)
-        return delta
+        correction = torch.zeros_like(h_full)
+        correction[num_decode_tokens:] = correction_prefill
+        _check_nan(correction, "delta_after_mask(mixed)", layer_idx)
+        return correction
 
     # Full batch (all prefill, or position="all").
-    delta = _readout_delta(adapter, h_full)
-    _check_nan(delta, "delta_after_readout(full)", layer_idx)
+    correction = _readout_correction(adapter, h_full)
+    _check_nan(correction, "correction_after_readout(full)", layer_idx)
     mask = _compute_position_mask(
         positions, position, h_full.dtype, num_tokens, attn_metadata)
     if mask is not None:
-        delta = (delta * mask.unsqueeze(-1)).contiguous()
-    _check_nan(delta, "delta_final(full)", layer_idx)
-    return delta
+        correction = (correction * mask.unsqueeze(-1)).contiguous()
+    _check_nan(correction, "delta_final(full)", layer_idx)
+    return correction
 
 
 def _adapter_apply_adapter_fake(
@@ -546,7 +546,7 @@ def update_single_adapter_position_masks(
 
 def _init_adapter_capture_buffers(module: nn.Module, hidden_size: int,
                                device: torch.device) -> None:
-    """Pre-allocate buffers for per-token h_full/delta capture.
+    """Pre-allocate buffers for per-token h_full/correction capture.
 
     Buffers are (max_tokens, hidden_size) — we always write to the full
     buffer and track the actual token count separately.  All operations
@@ -589,10 +589,10 @@ def _capture_last_token(
     module: nn.Module,
     *,
     h_full: torch.Tensor,
-    delta: torch.Tensor,
+    correction: torch.Tensor,
     mask: Optional[torch.Tensor],  # noqa: ARG001 — kept for call-site compat
 ) -> None:
-    """Capture all tokens' h_full/delta into pre-allocated buffers.
+    """Capture all tokens' h_full/correction into pre-allocated buffers.
 
     Pure tensor ops only — no data-dependent indexing, no Python scalars
     from tensor values. Fully compatible with TorchDynamo and CUDA graphs.
@@ -615,7 +615,7 @@ def _capture_last_token(
     module._adapter_cap_delta_norms.zero_()
 
     module._adapter_cap_h[:write_n].copy_(h_full[:write_n].detach())
-    module._adapter_cap_delta[:write_n].copy_(delta[:write_n].detach())
+    module._adapter_cap_delta[:write_n].copy_(correction[:write_n].detach())
     module._adapter_cap_h_norms[:write_n].copy_(
         module._adapter_cap_h[:write_n].norm(dim=-1))
     module._adapter_cap_delta_norms[:write_n].copy_(
@@ -659,7 +659,7 @@ def _init_adapter_debug_buffers(module: nn.Module, device: torch.device) -> None
 def _record_mask_debug_stats(
     module: nn.Module,
     *,
-    delta: torch.Tensor,
+    correction: torch.Tensor,
     hidden_states: torch.Tensor,
     mask: Optional[torch.Tensor],
     positions: torch.Tensor,
@@ -708,7 +708,7 @@ def _record_mask_debug_stats(
         torch.where((prefill_tokens > 0) & (decode_tokens > 0), one, zero)
     )
 
-    delta_f = delta.detach().to(device=stats_device, dtype=torch.float32)
+    delta_f = correction.detach().to(device=stats_device, dtype=torch.float32)
     hidden_f = hidden_states.detach().to(device=stats_device, dtype=torch.float32)
     module._adapter_debug_delta_l2_sum.add_(delta_f.norm(dim=-1).sum())
     module._adapter_debug_delta_abs_sum.add_(delta_f.abs().sum())
@@ -848,7 +848,7 @@ def _blend_one_adaptation(layer: nn.Module, int_id: int, adapter: nn.Module,
             mbuf = comp_masks.get((int_id, j))
             if mbuf is None:
                 # Never seen a batch (e.g. first graph-mode step for an
-                # inactive adapter): all-zero mask, delta contributes 0.
+                # inactive adapter): all-zero mask, correction contributes 0.
                 mbuf = torch.zeros(
                     max(num_tokens, _MASK_FALLBACK_SIZE),
                     dtype=torch.float32, device=hidden.device)
@@ -1046,7 +1046,7 @@ def _multi_adapter_forward(
 
     # Sequentially blend each active block_output adaptation into the
     # stream (insertion order).  For the additive default this matches
-    # the historical sum-of-masked-deltas whenever masks are disjoint
+    # the historical sum-of-masked-corrections whenever masks are disjoint
     # (which membership ∧ phase masks guarantee for paired adapters).
     adapter_sites = getattr(layer_self, "_adapter_adapter_sites", None)
     for str_id, adapter in layer_self.served_adapters.items():

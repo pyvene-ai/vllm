@@ -53,7 +53,7 @@ def apply_adaptation(adaptation: nn.Module, hidden: torch.Tensor,
     If the adaptation defines ``apply_masked(h, mask) -> h'`` that wins;
     otherwise the general interpolation blend runs:
     ``lerp(h, R(h), mask)`` — written as ``h + mask*(R(h)-h)``. R is a
-    MAP, not a delta: replacement and multiplicative readouts are
+    MAP, not a correction: replacement and multiplicative readouts are
     first-class (mask=1 yields exactly R(h), whatever R is).
 
     Args:
@@ -69,8 +69,8 @@ def apply_adaptation(adaptation: nn.Module, hidden: torch.Tensor,
     if apply_masked is not None:
         return apply_masked(hidden, mask)
     out = adaptation.readout(hidden.unsqueeze(0)).squeeze(0)
-    delta = out - hidden
-    return hidden + delta * mask.unsqueeze(-1).to(delta.dtype)
+    correction = out - hidden
+    return hidden + correction * mask.unsqueeze(-1).to(correction.dtype)
 
 
 def needs_sequence_segmentation(adaptation: nn.Module) -> bool:
@@ -79,7 +79,7 @@ def needs_sequence_segmentation(adaptation: nn.Module) -> bool:
     Sequence-mixing computations (cnn/bigram mixers, chunked adapters)
     must run per request span — vLLM's flattened batch concatenates
     unrelated requests, and mixing across the boundary leaks one
-    request's hiddens into another's delta.
+    request's hiddens into another's correction.
 
     An explicit ``sequence_mixing`` attribute wins; otherwise the
     presence of a ``mixer`` implies sequence mixing.
