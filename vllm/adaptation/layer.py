@@ -60,6 +60,15 @@ def _nan_check_enabled() -> bool:
     return _adapter_nan_check
 
 
+def _readout_delta(adapter, h2d: torch.Tensor) -> torch.Tensor:
+    """R_phi spoken natively (v3 contract): a member's correction is
+    readout(h) - h. Phase masking blends h + mask * (R(h) - h) — exact
+    for additive members and the correct phase-gated blend for any R
+    (multiplicative readouts included). The additive _compute_delta
+    dialect is gone; leaves need only T/R."""
+    return (adapter.readout(h2d.unsqueeze(0)) - h2d.unsqueeze(0)).squeeze(0)
+
+
 def _check_nan(tensor: torch.Tensor, label: str, layer_idx: int) -> bool:
     """If tensor has NaN/Inf, log details and return True.
 
@@ -310,7 +319,7 @@ def _apply_position_mask(
 # ---------------------------------------------------------------------------
 # Adapter registry & custom op (Dynamo splitting op)
 # ---------------------------------------------------------------------------
-# The custom op wraps both adapter._compute_delta() AND position masking
+# The custom op wraps both the adapter readout (R_phi) AND position masking
 # in a single cudagraph_unsafe boundary.  This prevents CUDA graph capture
 # from baking in stale adapter weights — after sync_weights() updates the
 # adapter parameters, the custom op always uses the current weights.
@@ -358,9 +367,8 @@ def _adapter_apply_adapter_op(
         num_decode_tokens = num_tokens - num_prefill_tokens
         h_prefill = h_full[num_decode_tokens:]
         _check_nan(h_prefill, "h_prefill_input", layer_idx)
-        delta_prefill = adapter._compute_delta(
-            h_prefill.unsqueeze(0)).squeeze(0)
-        _check_nan(delta_prefill, "delta_after_compute_delta(mixed)", layer_idx)
+        delta_prefill = _readout_delta(adapter, h_prefill)
+        _check_nan(delta_prefill, "delta_after_readout(mixed)", layer_idx)
 
         if position == "prefill":
             delta = torch.zeros_like(h_full)
@@ -380,8 +388,8 @@ def _adapter_apply_adapter_op(
         return delta
 
     # Full batch (all prefill, or position="all").
-    delta = adapter._compute_delta(h_full.unsqueeze(0)).squeeze(0)
-    _check_nan(delta, "delta_after_compute_delta(full)", layer_idx)
+    delta = _readout_delta(adapter, h_full)
+    _check_nan(delta, "delta_after_readout(full)", layer_idx)
     mask = _compute_position_mask(
         positions, position, h_full.dtype, num_tokens, attn_metadata)
     if mask is not None:
@@ -402,7 +410,7 @@ def _adapter_apply_adapter_fake(
 
 # NOTE: The adapter_apply_adapter custom op was removed.  Position masking
 # now uses a pre-computed buffer updated by the model runner before each
-# forward pass.  The adapter's _compute_delta runs inline in the compiled
+# forward pass.  The adapter's readout runs inline in the compiled
 # forward — no splitting ops, no graph breaks.
 _LEGACY_CUSTOM_OP_AVAILABLE = False
 
@@ -989,7 +997,7 @@ def _multi_adapter_forward(
 
     Only iterates adapters that are active in the current batch (set by
     ``update_adapter_position_masks`` before each forward).  Inactive
-    adapters are skipped entirely — no ``_compute_delta``, no masking.
+    adapters are skipped entirely — no readout, no masking.
 
     Pure-decode optimisation: if ``_adapter_all_masks_zero`` is set (e.g.
     decode-only batch with prefill adapters), skip everything.

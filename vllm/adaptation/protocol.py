@@ -52,7 +52,7 @@ def apply_adaptation(adaptation: nn.Module, hidden: torch.Tensor,
 
     If the adaptation defines ``apply_masked(h, mask) -> h'`` that wins;
     otherwise the default additive blend runs:
-    ``h + mask * _compute_delta(h)``.
+    ``h + mask * (readout(h) - h)``.
 
     Args:
         adaptation: The adaptation module.
@@ -66,7 +66,8 @@ def apply_adaptation(adaptation: nn.Module, hidden: torch.Tensor,
     apply_masked = getattr(adaptation, "apply_masked", None)
     if apply_masked is not None:
         return apply_masked(hidden, mask)
-    delta = adaptation._compute_delta(hidden.unsqueeze(0)).squeeze(0)
+    out = adaptation.readout(hidden.unsqueeze(0)).squeeze(0)
+    delta = out - hidden
     return hidden + delta * mask.unsqueeze(-1).to(delta.dtype)
 
 
