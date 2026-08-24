@@ -276,6 +276,21 @@ def _adapter_to_blueprint(adapter) -> dict:
 
     cls = type(adapter)
 
+    # Shared-view adapters (a per-layer wrapper holding one shared core +
+    # a depth embedding) have no ctor-kwarg identity of their own: blueprint
+    # the core recursively and carry layer_idx + the embedding tensor.
+    _core = getattr(adapter, "core", None)
+    if _core is not None and hasattr(adapter, "layer_emb"):
+        return {
+            "__type__": "SharedViewBlueprint",
+            "__module__": cls.__module__,
+            "__qualname__": cls.__qualname__,
+            "layer_idx": adapter.layer_idx,
+            "layer_emb": _serialize_state_dict(
+                {"layer_emb": adapter.layer_emb}),
+            "core": _adapter_to_blueprint(_core),
+        }
+
     # Walk the MRO and accumulate explicit named parameters from every
     # __init__ in the chain.  Subclasses like LoadapterRidgeAdapter define
     # ``def __init__(self, *args, lam=1e-3, **kwargs)`` — the old code
@@ -378,6 +393,13 @@ def _blueprint_to_adapter(blueprint: dict):
     """
     import importlib
     import torch
+
+    if blueprint.get("__type__") == "SharedViewBlueprint":
+        core = _blueprint_to_adapter(blueprint["core"])
+        emb = _deserialize_state_dict(blueprint["layer_emb"])["layer_emb"]
+        vmod = importlib.import_module(blueprint["__module__"])
+        vcls = getattr(vmod, blueprint["__qualname__"])
+        return vcls(core, blueprint["layer_idx"], emb)
 
     mod_name = blueprint["__module__"]
     # Backward compat: old blueprints stored "adaptors.*" module paths
