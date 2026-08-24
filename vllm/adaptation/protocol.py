@@ -51,8 +51,10 @@ def apply_adaptation(adaptation: nn.Module, hidden: torch.Tensor,
     """Blend one adaptation's computation into *hidden*.
 
     If the adaptation defines ``apply_masked(h, mask) -> h'`` that wins;
-    otherwise the default additive blend runs:
-    ``h + mask * (readout(h) - h)``.
+    otherwise the general interpolation blend runs:
+    ``lerp(h, R(h), mask)`` — written as ``h + mask*(R(h)-h)``. R is a
+    MAP, not a delta: replacement and multiplicative readouts are
+    first-class (mask=1 yields exactly R(h), whatever R is).
 
     Args:
         adaptation: The adaptation module.

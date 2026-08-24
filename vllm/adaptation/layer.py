@@ -2,7 +2,7 @@
 
 Overview
 --------
-For GRPO training we need vLLM to apply the adapter delta during
+For GRPO training we need vLLM to apply the adapter readout during
 inference (prefill) while staying on-policy with the HF training model.
 
 This module provides two things:
@@ -13,7 +13,7 @@ This module provides two things:
 
   2. Layer factory functions (make_adapter_qwen2_layer, make_adapter_llama_layer) –
      return nn.Module *classes* (not instances) that subclass the standard
-     vLLM decoder layer and run the adapter delta in their forward pass.
+     vLLM decoder layer and run the adapter readout in their forward pass.
 
 The factories are called by Qwen2ForCausalLM / LlamaForCausalLM when a
 ``_adapter_spec`` is present (see vllm.adaptation.specs for the thread-local API).
@@ -309,7 +309,7 @@ def _apply_position_mask(
     num_tokens: int,
     attn_metadata,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Apply the adapter position mask to *delta* and return ``(delta, mask)``."""
+    """Mask a readout displacement; blending downstream is lerp(h, R(h), mask)."""
     mask = _compute_position_mask(positions, position, dtype, num_tokens, attn_metadata)
     if mask is None:
         return delta, None
@@ -334,7 +334,7 @@ def _adapter_apply_adapter_op(
     num_tokens: int,
     layer_idx: int,
 ) -> torch.Tensor:
-    """Compute adapter delta and apply position mask (runs eagerly)."""
+    """Readout displacement R(h)-h with position mask (in-process GRPO path)."""
     # CUDA graph capture is decode-only; adapter is a no-op for decode tokens.
     if torch.cuda.is_current_stream_capturing():
         return torch.zeros_like(h_full)
