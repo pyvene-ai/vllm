@@ -159,9 +159,16 @@ def spec_to_adapter_config(adapter_spec: dict[str, Any]) -> dict[str, Any]:
     # Serialize per-layer adapters → portable state_dicts
     adapters = adapter_spec.get("adapters")
     if adapters is not None:
+        def _portable_state(a):
+            sd = dict(a.state_dict())
+            # shared views: layer_emb is a non-persistent buffer, and the
+            # per-layer embedding is the ONLY state a view owns — carry it
+            if getattr(a, "core", None) is not None and hasattr(a, "layer_emb"):
+                sd["layer_emb"] = a.layer_emb
+            return _serialize_state_dict(sd)
+
         config["adapter_states"] = {
-            idx: _serialize_state_dict(a.state_dict())
-            for idx, a in adapters.items()
+            idx: _portable_state(a) for idx, a in adapters.items()
         }
 
     # Pass through any extra keys (e.g. debug_mask)
@@ -188,7 +195,8 @@ def adapter_config_to_spec(adapter_config: Optional[dict[str, Any]],
 
     # Reconstruct sample_adapter from blueprint
     adapter = spec.get("sample_adapter")
-    if isinstance(adapter, dict) and adapter.get("__type__") == "AdapterBlueprint":
+    if isinstance(adapter, dict) and adapter.get("__type__") in (
+            "AdapterBlueprint", "SharedViewBlueprint"):
         spec["sample_adapter"] = _blueprint_to_adapter(adapter)
 
     # Reconstruct per-layer adapters from saved state dicts
@@ -196,9 +204,18 @@ def adapter_config_to_spec(adapter_config: Optional[dict[str, Any]],
     sample = spec.get("sample_adapter")
     if adapter_states is not None and sample is not None:
         adapters: dict[int, Any] = {}
+        shared_core = getattr(sample, "core", None)
         for idx, sd in adapter_states.items():
-            a = copy.deepcopy(sample)
-            a.load_state_dict(_deserialize_state_dict(sd), strict=False)
+            state = _deserialize_state_dict(sd)
+            if shared_core is not None and "layer_emb" in state:
+                # rebuild the view around the ONE shared core with its
+                # own per-layer embedding (deepcopy would fork the core
+                # and stamp every layer with the sample's embedding)
+                a = type(sample)(shared_core, int(idx),
+                                 state["layer_emb"])
+            else:
+                a = copy.deepcopy(sample)
+                a.load_state_dict(state, strict=False)
             if hasattr(a, "install_inference_caches"):
                 a.install_inference_caches()
             adapters[int(idx)] = a
