@@ -85,25 +85,34 @@ class PrefixInjectionConnector(SharedStorageConnector):
                         is_store=False,
                         mm_hashes=mm_hashes))
 
-        total_need_load = 0
+        served: list[str] = []
         for new_req in scheduler_output.scheduled_new_reqs:
             if new_req.req_id in self._requests_need_load:
                 add_load(new_req.req_id, new_req.prompt_token_ids,
                          new_req.block_ids[0],
                          [f.identifier for f in new_req.mm_features])
-                total_need_load += 1
+                served.append(new_req.req_id)
 
+        # Resumed-from-preemption requests may appear anywhere in
+        # scheduled_cached_reqs — scan them all (the parent's
+        # break-on-first-non-resumed assumption does not survive
+        # heavy preemption under large prefixes).
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached_reqs.req_ids):
             if not cached_reqs.resumed_from_preemption[i]:
-                break
+                continue
             if req_id in self._requests_need_load:
                 request = self._requests_need_load[req_id]
+                new_ids = cached_reqs.new_block_ids[i]
+                if new_ids is None:
+                    continue
                 add_load(req_id, list(request.prompt_token_ids),
-                         cached_reqs.new_block_ids[i][0],
+                         new_ids[0],
                          [f.identifier for f in request.mm_features])
-                total_need_load += 1
+                served.append(req_id)
 
-        assert total_need_load == len(self._requests_need_load)
-        self._requests_need_load.clear()
+        # Entries not scheduled this step stay pending for a later
+        # step instead of tripping an assert.
+        for req_id in served:
+            self._requests_need_load.pop(req_id, None)
         return meta
