@@ -43,6 +43,37 @@ class PrefixInjectionConnector(SharedStorageConnector):
             raise ValueError(
                 f"prefix_len {self._prefix_len} must be a multiple of "
                 f"the cache block size {self._block_size}")
+        self._pending_age: dict[str, int] = {}
+        self._max_pending_steps = int(
+            transfer_config.get_from_extra_config(
+                "max_pending_steps", 100000))
+
+    def start_load_kv(self, forward_context, **kwargs) -> None:
+        # Validate the store before the parent injects: fail with
+        # request context instead of a bare safetensors error, and
+        # never let a wrong-sized store write partial rows.
+        import safetensors.torch
+        metadata = self._get_connector_metadata()
+        for request in metadata.requests:
+            if request.is_store:
+                continue
+            folder = self._generate_foldername_debug(
+                request.token_ids, request.mm_hashes,
+                create_folder=False)
+            if not os.path.exists(folder):
+                raise FileNotFoundError(
+                    f"prefix injection: row store folder missing at "
+                    f"load time: {folder}")
+            n_rows = len(request.slot_mapping)
+            probe = os.path.join(
+                folder, "model.layers.0.self_attn.attn.safetensors")
+            kv = safetensors.torch.load_file(probe)["kv_cache"]
+            if kv.shape[1] != n_rows:
+                raise RuntimeError(
+                    f"prefix injection: store {folder} has "
+                    f"{kv.shape[1]} rows; request needs {n_rows} "
+                    "(prefix_len mismatch between store and config)")
+        super().start_load_kv(forward_context, **kwargs)
 
     def _found_match_for_request(self, request: "Request") -> bool:
         n = self._prefix_len
@@ -88,6 +119,11 @@ class PrefixInjectionConnector(SharedStorageConnector):
         served: list[str] = []
         for new_req in scheduler_output.scheduled_new_reqs:
             if new_req.req_id in self._requests_need_load:
+                if len(new_req.block_ids[0]) < nblk:
+                    raise RuntimeError(
+                        f"prefix injection: request {new_req.req_id} "
+                        f"scheduled with {len(new_req.block_ids[0])} "
+                        f"blocks; prefix needs {nblk}")
                 add_load(new_req.req_id, new_req.prompt_token_ids,
                          new_req.block_ids[0],
                          [f.identifier for f in new_req.mm_features])
@@ -104,15 +140,42 @@ class PrefixInjectionConnector(SharedStorageConnector):
             if req_id in self._requests_need_load:
                 request = self._requests_need_load[req_id]
                 new_ids = cached_reqs.new_block_ids[i]
-                if new_ids is None:
-                    continue
+                if new_ids is None or len(new_ids[0]) < nblk:
+                    raise RuntimeError(
+                        f"prefix injection: resumed request {req_id} "
+                        f"has block ids {new_ids and len(new_ids[0])} "
+                        f"< prefix blocks {nblk}")
                 add_load(req_id, list(request.prompt_token_ids),
                          new_ids[0],
                          [f.identifier for f in request.mm_features])
                 served.append(req_id)
 
-        # Entries not scheduled this step stay pending for a later
-        # step instead of tripping an assert.
         for req_id in served:
             self._requests_need_load.pop(req_id, None)
+            self._pending_age.pop(req_id, None)
+
+        # Strict accounting for what remains: a pending entry is
+        # legitimate ONLY if this step's schedule did not mention it
+        # at all (its allocation was registered but it runs in a
+        # later step, or it awaits resumption). Anything mentioned
+        # but unserved is an inconsistency; anything pending
+        # "forever" is starvation. Both fail loudly.
+        if self._requests_need_load:
+            mentioned = ({r.req_id for r in
+                          scheduler_output.scheduled_new_reqs}
+                         | set(cached_reqs.req_ids))
+            for req_id in self._requests_need_load:
+                if req_id in mentioned:
+                    raise RuntimeError(
+                        f"prefix injection: request {req_id} was "
+                        "scheduled this step but its prefix load "
+                        "could not be built — scheduler/connector "
+                        "state is inconsistent")
+                age = self._pending_age.get(req_id, 0) + 1
+                self._pending_age[req_id] = age
+                if age > self._max_pending_steps:
+                    raise RuntimeError(
+                        f"prefix injection: request {req_id} pending "
+                        f"for {age} scheduler steps without being "
+                        "scheduled — starvation or leaked state")
         return meta
