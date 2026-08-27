@@ -172,10 +172,16 @@ class WorkerBase:
             if adapter is None:
                 continue
             device = next(adapter.parameters()).device
-            # spawn-mode RPC serializes tensors as lists: coerce before .to
+            # spawn-mode RPC serializes tensors as lists: coerce
+            # tensor-like values before .to; metadata entries
+            # (strings etc.) are not loadable state — skip them.
             import torch as _t
-            sd = {k: (v if _t.is_tensor(v) else _t.tensor(v)).to(device)
-                  for k, v in state_dict.items()}
+            sd = {}
+            for k, v in state_dict.items():
+                if _t.is_tensor(v):
+                    sd[k] = v.to(device)
+                elif isinstance(v, (list, int, float, bool)):
+                    sd[k] = _t.tensor(v).to(device)
             adapter.load_state_dict(sd, strict=False)
             count += 1
         if refresh_caches and count:
