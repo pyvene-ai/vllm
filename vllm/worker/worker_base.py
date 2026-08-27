@@ -172,7 +172,10 @@ class WorkerBase:
             if adapter is None:
                 continue
             device = next(adapter.parameters()).device
-            sd = {k: v.to(device) for k, v in state_dict.items()}
+            # spawn-mode RPC serializes tensors as lists: coerce before .to
+            import torch as _t
+            sd = {k: (v if _t.is_tensor(v) else _t.tensor(v)).to(device)
+                  for k, v in state_dict.items()}
             adapter.load_state_dict(sd, strict=False)
             count += 1
         if refresh_caches and count:
