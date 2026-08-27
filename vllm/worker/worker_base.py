@@ -176,6 +176,11 @@ class WorkerBase:
             # tensor-like values before .to; metadata entries
             # (strings etc.) are not loadable state — skip them.
             import torch as _t
+            from vllm.adaptation.specs import _deserialize_state_dict
+            if any(isinstance(v, dict) and v.get("__adapter_t")
+                   for v in state_dict.values()):
+                # canonical adaptation-serializer payload (bytes blobs)
+                state_dict = _deserialize_state_dict(state_dict)
             sd = {}
             for k, v in state_dict.items():
                 if _t.is_tensor(v):
