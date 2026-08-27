@@ -185,8 +185,13 @@ class WorkerBase:
             for k, v in state_dict.items():
                 if _t.is_tensor(v):
                     sd[k] = v.to(device)
-                elif isinstance(v, (list, int, float, bool)):
+                elif isinstance(v, (int, float, bool)):
                     sd[k] = _t.tensor(v).to(device)
+                elif isinstance(v, list):
+                    try:
+                        sd[k] = _t.tensor(v).to(device)
+                    except (ValueError, TypeError):
+                        pass  # non-numeric metadata list, not state
             adapter.load_state_dict(sd, strict=False)
             count += 1
         if refresh_caches and count:
